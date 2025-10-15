@@ -197,47 +197,54 @@ if "df_original" in st.session_state:
             df_init["hint"] = ""
             st.session_state["df_edited"] = df_init
 
-        df_render = st.session_state["df_edited"].copy()
+        df_edit = st.session_state["df_edited"].copy()
 
         editor_state = st.session_state.get("editor_key_main")
         if isinstance(editor_state, pd.DataFrame):
-            df_render = editor_state.copy()
+            df_edit = editor_state.copy()
 
-        if "selected" not in df_render.columns:
-            df_render.insert(0, "selected", False)
-        elif df_render.columns[0] != "selected":
-            selected_col = df_render.pop("selected")
-            df_render.insert(0, "selected", selected_col)
+        if "selected" not in df_edit.columns:
+            df_edit.insert(0, "selected", False)
+        elif df_edit.columns[0] != "selected":
+            selected_col = df_edit.pop("selected")
+            df_edit.insert(0, "selected", selected_col)
 
-        if "hint" not in df_render.columns:
-            df_render["hint"] = ""
+        if "hint" not in df_edit.columns:
+            df_edit["hint"] = ""
 
         df_orig = st.session_state["df_original"]
-        for idx in df_render.index:
-            if (
-                idx in df_orig.index
-                and df_render.at[idx, "attribute set"]
-                != df_orig.at[idx, "attribute set"]
-            ):
-                df_render.at[idx, "selected"] = True
 
-        st.session_state["df_edited"] = df_render.copy()
+        def _normalize_attr_value(value):
+            if pd.isna(value):
+                return ""
+            return str(value).strip().lower()
+
+        for idx in df_edit.index:
+            if idx not in df_orig.index:
+                continue
+            orig_value = _normalize_attr_value(df_orig.at[idx, "attribute set"])
+            current_value = _normalize_attr_value(df_edit.at[idx, "attribute set"])
+            if current_value != orig_value:
+                df_edit.at[idx, "selected"] = True
+
+        st.session_state["df_edited"] = df_edit.copy()
+        st.session_state["df_render"] = df_edit.copy()
 
         options = list(attribute_sets.keys())
         options.extend(
             name
-            for name in df_render["attribute set"].dropna().unique()
+            for name in df_edit["attribute set"].dropna().unique()
             if name not in attribute_sets
         )
         options = list(dict.fromkeys(options))
 
         edited_df = st.data_editor(
-            df_render,
+            df_edit,
             column_config={
                 "selected": st.column_config.CheckboxColumn(
                     "✓",
                     default=False,
-                    width=32,
+                    width=28,
                     help="Mark items for bulk actions",
                 ),
                 "attribute set": st.column_config.SelectboxColumn(
