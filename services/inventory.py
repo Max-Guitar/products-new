@@ -48,6 +48,31 @@ def get_attr_set_id(
     return int(items[0]["attribute_set_id"])
 
 
+def list_attribute_sets(
+    session: requests.Session, base_url: str, page_size: int = 200
+) -> Dict[str, int]:
+    """Return a mapping of attribute set name to ID."""
+
+    page = 1
+    results: Dict[str, int] = {}
+    while True:
+        params = {
+            "searchCriteria[pageSize]": page_size,
+            "searchCriteria[currentPage]": page,
+        }
+        data = magento_get(session, base_url, "/products/attribute-sets/sets/list", params=params)
+        items = data.get("items", []) or []
+        for item in items:
+            name = (item.get("attribute_set_name") or "").strip()
+            attr_id = item.get("attribute_set_id")
+            if name and attr_id is not None:
+                results[name] = int(attr_id)
+        if not items or len(items) < page_size:
+            break
+        page += 1
+    return results
+
+
 def iter_products_by_attr_set(
     session: requests.Session,
     base_url: str,
@@ -157,6 +182,19 @@ def get_backorders_parallel(
                 except Exception:
                     pass
     return results
+
+
+def update_product_attribute_set(
+    session: requests.Session, base_url: str, sku: str, attribute_set_id: int
+) -> None:
+    """Update the attribute set of a product identified by ``sku``."""
+
+    encoded = quote(sku, safe="")
+    url = f"{base_url.rstrip('/')}/rest/V1/products/{encoded}"
+    payload = {"product": {"attribute_set_id": attribute_set_id}}
+    headers = session.headers
+    resp = session.put(url, json=payload, headers=headers)
+    resp.raise_for_status()
 
 
 def load_default_items(session: requests.Session, base_url: str) -> pd.DataFrame:
