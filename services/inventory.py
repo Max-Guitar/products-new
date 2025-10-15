@@ -93,6 +93,27 @@ def get_source_items(
     return collected
 
 
+def detect_default_source_code(session: requests.Session, base_url: str) -> str:
+    try:
+        data = magento_get(
+            session,
+            base_url,
+            "/inventory/sources",
+            {
+                "searchCriteria[pageSize]": 500,
+                "searchCriteria[currentPage]": 1,
+            },
+        )
+        for source in data.get("items", []) or []:
+            code = (source.get("source_code") or "").strip()
+            name = (source.get("name") or "").strip().lower()
+            if code.lower() == "default" or name in {"default", "default source"}:
+                return code or "default"
+    except Exception:
+        pass
+    return "default"
+
+
 def _fetch_backorder(session: requests.Session, base_url: str, sku: str) -> int:
     encoded = quote(sku, safe="")
     try:
@@ -156,15 +177,21 @@ def load_default_items(session: requests.Session, base_url: str) -> pd.DataFrame
     if df.empty:
         return pd.DataFrame(columns=["sku", "name", "attribute set", "date created"])
 
-    source_items = get_source_items(session, base_url, source_code="default")
+    source_code = detect_default_source_code(session, base_url)
+    source_items = get_source_items(session, base_url, source_code=source_code)
     qty_map = {item.get("sku"): float(item.get("quantity", 0)) for item in source_items}
     df["qty"] = df["sku"].map(qty_map).fillna(0.0)
 
     zero_qty_skus = df.loc[df["qty"] <= 0, "sku"].tolist()
     backorders_map = get_backorders_parallel(session, base_url, zero_qty_skus)
-    df["backorders"] = df["sku"].map(backorders_map).fillna(0).astype(int)
+    df_pos = df[df["qty"] > 0].copy()
+    df_pos["backorders"] = 0
 
-    df = df[(df["qty"] > 0) | (df["backorders"] == 2)].copy()
+    df_zero = df[df["qty"] <= 0].copy()
+    df_zero["backorders"] = df_zero["sku"].map(backorders_map).fillna(0).astype(int)
+    df_bo2 = df_zero[df_zero["backorders"] == 2]
+
+    df = pd.concat([df_pos, df_bo2], ignore_index=True)
     if df.empty:
         return pd.DataFrame(columns=["sku", "name", "attribute set", "date created"])
 
