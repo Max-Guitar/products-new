@@ -186,22 +186,28 @@ def load_default_items(session: requests.Session, base_url: str) -> pd.DataFrame
         return pd.DataFrame(columns=["sku", "name", "attribute set", "date created"])
 
     df = df[(df["status"] == 1) & (df["type_id"].isin(_ALLOWED_TYPES))].copy()
+    df = df[~((df["type_id"] == "configurable") & (df["visibility"] == 1))].copy()
     if df.empty:
         return pd.DataFrame(columns=["sku", "name", "attribute set", "date created"])
 
-    simple_skus = set(df.loc[df["type_id"] == "simple", "sku"])
-    config_skus = df.loc[df["type_id"] == "configurable", "sku"].tolist()
+    config_skus = df.loc[df["type_id"] == "configurable", "sku"].dropna().tolist()
 
     child_skus: set[str] = set()
     for parent_sku in config_skus:
         child_skus.update(get_config_children(session, base_url, parent_sku))
+    child_skus = {sku for sku in child_skus if sku}
 
     def _norm(s: str) -> str:
         return str(s).strip().lower()
 
     source_code = detect_default_source_code(session, base_url)
     src_items = get_source_items(session, base_url, source_code=source_code)
-    qty_map = {_norm(item.get("sku")): float(item.get("quantity", 0)) for item in src_items}
+    qty_map = {}
+    for item in src_items:
+        sku = item.get("sku")
+        if not sku:
+            continue
+        qty_map[_norm(sku)] = float(item.get("quantity", 0) or 0.0)
 
     df["qty"] = df["sku"].apply(_norm).map(qty_map).fillna(0.0)
 
@@ -210,12 +216,6 @@ def load_default_items(session: requests.Session, base_url: str) -> pd.DataFrame
         df_children["qty"] = df_children["sku"].apply(_norm).map(qty_map).fillna(0.0)
     else:
         df_children = pd.DataFrame(columns=["sku", "qty"])
-
-    matched = int((df["qty"] > 0).sum())
-    matched_children = int((df_children["qty"] > 0).sum()) if not df_children.empty else 0
-    print(
-        f"[DEBUG] MSI qty>0 matches: simple/config rows={matched}, children rows={matched_children}, MSI total={len(src_items)}"
-    )
 
     zero_main = df.loc[df["qty"] <= 0, "sku"].tolist()
     zero_child = df_children.loc[df_children["qty"] <= 0, "sku"].tolist()
@@ -264,5 +264,24 @@ def load_default_items(session: requests.Session, base_url: str) -> pd.DataFrame
 
     out = out.drop_duplicates(subset=["sku"])
     out["attribute set"] = _DEF_ATTR_SET_NAME
-    out["date created"] = out.get("created_at", "")
-    return out[["sku", "name", "attribute set", "date created"]]
+
+    out["_sort_ts"] = pd.to_datetime(out.get("created_at"), errors="coerce")
+    out = out.sort_values("_sort_ts", ascending=False)
+    out["date created"] = out["_sort_ts"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    mask_nat = out["_sort_ts"].isna()
+    if mask_nat.any():
+        out.loc[mask_nat, "date created"] = out.loc[mask_nat, "created_at"].astype(str)
+    out = out.drop(columns=["_sort_ts", "created_at"])
+
+    in_stock_skus = set(df_main_pos["sku"]) | set(df_child_pos["sku"])
+    backorder_skus = set(df_bo2["sku"])
+    total_count = len(out)
+    print(
+        "Всего товаров: {total}; с qty>0: {in_stock}; добавлено по backorders: {backorder}".format(
+            total=total_count,
+            in_stock=len(in_stock_skus),
+            backorder=len(backorder_skus),
+        )
+    )
+
+    return out[["sku", "name", "attribute set", "date created"]].reset_index(drop=True)
