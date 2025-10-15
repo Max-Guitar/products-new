@@ -185,6 +185,7 @@ def load_default_items(session: requests.Session, base_url: str) -> pd.DataFrame
     if df.empty:
         return pd.DataFrame(columns=["sku", "name", "attribute set", "date created"])
 
+    # Allow all statuses; only filter by supported product types
     df = df[df["type_id"].isin(_ALLOWED_TYPES)].copy()
     df = df[~((df["type_id"] == "configurable") & (df["visibility"] == 1))].copy()
     if df.empty:
