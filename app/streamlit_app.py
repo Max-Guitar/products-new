@@ -47,7 +47,7 @@ def load_items(session, base_url):
             or 4
         )
         type_id = product.get("type_id", "simple")
-        if status != 1 or visibility == 1 or type_id not in _ALLOWED_TYPES:
+        if visibility == 1 or type_id not in _ALLOWED_TYPES:
             continue
 
         rows.append(
