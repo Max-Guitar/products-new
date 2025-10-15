@@ -57,11 +57,9 @@ def iter_products_by_attr_set(
         if total_count is None:
             total_count = int(data.get("total_count", 0) or 0)
         items = data.get("items", []) or []
-        if not items:
-            break
         for item in items:
             yield item, total_count or 0
-        if len(items) < page_size:
+        if not items or len(items) < page_size:
             break
         page += 1
 
@@ -84,10 +82,8 @@ def get_source_items(
         }
         data = magento_get(session, base_url, "/inventory/source-items", params=params)
         items = data.get("items", []) or []
-        if not items:
-            break
         collected.extend(items)
-        if len(items) < page_size:
+        if not items or len(items) < page_size:
             break
         page += 1
     return collected
@@ -163,7 +159,9 @@ def load_default_items(session: requests.Session, base_url: str) -> pd.DataFrame
             _get_custom_attr(product, "visibility", product.get("visibility", 4)) or 4
         )
         type_id = product.get("type_id", "simple")
-        if status != 1 or visibility == 1 or type_id not in _ALLOWED_TYPES:
+        if status != 1 or type_id not in _ALLOWED_TYPES:
+            continue
+        if type_id == "configurable" and visibility == 1:
             continue
         rows.append(
             {
