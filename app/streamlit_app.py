@@ -148,6 +148,9 @@ if st.button("Load items", type="primary"):
         df_items = load_items(session, base_url)
         if df_items.empty:
             st.warning("No items match the Default set filter criteria.")
+            st.session_state.pop("df_original", None)
+            st.session_state.pop("df_edited", None)
+            st.session_state.pop("attribute_sets", None)
         else:
             df_ui = df_items.copy()
             df_ui["date created"] = pd.to_datetime(
@@ -157,74 +160,86 @@ if st.button("Load items", type="primary"):
             st.success(
                 f"Found {len(df_ui)} products (Default; qty>0 OR backorders=2)"
             )
+            st.session_state["df_original"] = df_ui.copy()
+            st.session_state["df_edited"] = df_ui.copy()
             try:
                 attribute_sets = list_attribute_sets(session, base_url)
             except Exception as exc:  # pragma: no cover - UI error handling
                 st.error(f"Failed to fetch attribute sets: {exc}")
                 attribute_sets = {}
-
-            if not attribute_sets:
-                st.warning("Unable to load attribute sets for editing.")
-                st.dataframe(df_ui, use_container_width=True)
-            else:
-                options = list(attribute_sets.keys())
-                options.extend(
-                    name
-                    for name in df_ui["attribute set"].dropna().unique()
-                    if name not in attribute_sets
-                )
-                # Preserve insertion order while removing duplicates.
-                options = list(dict.fromkeys(options))
-
-                edited_df = st.data_editor(
-                    df_ui,
-                    column_config={
-                        "attribute set": st.column_config.SelectboxColumn(
-                            "Attribute Set",
-                            help="Change attribute set",
-                            options=options,
-                            required=True,
-                        )
-                    },
-                    num_rows="fixed",
-                    use_container_width=True,
-                    key="editable_attribute_sets",
-                )
-
-                if st.button("Apply changes"):
-                    mask = edited_df["attribute set"] != df_ui["attribute set"]
-                    changed_rows = edited_df.loc[mask]
-                    if changed_rows.empty:
-                        st.info("No attribute set changes detected.")
-                    else:
-                        for _, row in changed_rows.iterrows():
-                            sku = row.get("sku", "")
-                            new_attr_set_name = str(row.get("attribute set") or "")
-                            if not sku:
-                                continue
-                            if not new_attr_set_name:
-                                st.error("Attribute set name is empty.")
-                                continue
-                            attr_set_id = attribute_sets.get(new_attr_set_name)
-                            if attr_set_id is None:
-                                st.error(
-                                    f"Attribute set ID not found for {new_attr_set_name!r}."
-                                )
-                                continue
-                            try:
-                                update_product_attribute_set(
-                                    session, base_url, sku, attr_set_id
-                                )
-                            except Exception as exc:  # pragma: no cover - UI error handling
-                                st.error(
-                                    f"Failed to update {sku} to set {new_attr_set_name}: {exc}"
-                                )
-                            else:
-                                st.success(
-                                    f"Updated {sku} to set {new_attr_set_name}"
-                                )
+            st.session_state["attribute_sets"] = attribute_sets
     except Exception as exc:  # pragma: no cover - UI error handling
         st.error(f"Error: {exc}")
+
+if "df_original" in st.session_state:
+    df_ui = st.session_state["df_original"]
+    attribute_sets = st.session_state.get("attribute_sets", {})
+
+    if df_ui.empty:
+        st.warning("No items match the Default set filter criteria.")
+    elif not attribute_sets:
+        st.warning("Unable to load attribute sets for editing.")
+        st.dataframe(df_ui, use_container_width=True)
+    else:
+        if "df_edited" not in st.session_state:
+            st.session_state["df_edited"] = df_ui.copy()
+        options = list(attribute_sets.keys())
+        options.extend(
+            name
+            for name in st.session_state["df_edited"]["attribute set"].dropna().unique()
+            if name not in attribute_sets
+        )
+        # Preserve insertion order while removing duplicates.
+        options = list(dict.fromkeys(options))
+
+        edited_df = st.data_editor(
+            st.session_state["df_edited"],
+            column_config={
+                "attribute set": st.column_config.SelectboxColumn(
+                    "Attribute Set",
+                    help="Change attribute set",
+                    options=options,
+                    required=True,
+                )
+            },
+            num_rows="fixed",
+            use_container_width=True,
+            key="editable_attribute_sets",
+        )
+        st.session_state["df_edited"] = edited_df
+
+        if st.button("Apply changes"):
+            mask = edited_df["attribute set"] != df_ui["attribute set"]
+            changed_rows = edited_df.loc[mask]
+            if changed_rows.empty:
+                st.info("No attribute set changes detected.")
+            else:
+                for _, row in changed_rows.iterrows():
+                    sku = row.get("sku", "")
+                    new_attr_set_name = str(row.get("attribute set") or "")
+                    if not sku:
+                        continue
+                    if not new_attr_set_name:
+                        st.error("Attribute set name is empty.")
+                        continue
+                    attr_set_id = attribute_sets.get(new_attr_set_name)
+                    if attr_set_id is None:
+                        st.error(
+                            f"Attribute set ID not found for {new_attr_set_name!r}."
+                        )
+                        continue
+                    try:
+                        update_product_attribute_set(
+                            session, base_url, sku, attr_set_id
+                        )
+                    except Exception as exc:  # pragma: no cover - UI error handling
+                        st.error(
+                            f"Failed to update {sku} to set {new_attr_set_name}: {exc}"
+                        )
+                    else:
+                        st.success(
+                            f"Updated {sku} to set {new_attr_set_name}"
+                        )
 else:
     st.info("Нажми **Load items** для загрузки и отображения товаров.")
 
