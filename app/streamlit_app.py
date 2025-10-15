@@ -161,13 +161,24 @@ if st.button("Load items", type="primary"):
                 f"Found {len(df_ui)} products (Default; qty>0 OR backorders=2)"
             )
             st.session_state["df_original"] = df_ui.copy()
-            st.session_state["df_edited"] = df_ui.copy()
             try:
                 attribute_sets = list_attribute_sets(session, base_url)
             except Exception as exc:  # pragma: no cover - UI error handling
                 st.error(f"Failed to fetch attribute sets: {exc}")
                 attribute_sets = {}
             st.session_state["attribute_sets"] = attribute_sets
+            st.session_state.pop("df_edited", None)
+            if "df_edited" not in st.session_state:
+                df_init = df_ui.copy()
+                if "selected" not in df_init.columns:
+                    df_init.insert(0, "selected", False)
+                else:
+                    df_init = df_init.copy()
+                    if df_init.columns[0] != "selected":
+                        selected_col = df_init.pop("selected")
+                        df_init.insert(0, "selected", selected_col)
+                    df_init["selected"] = False
+                st.session_state["df_edited"] = df_init
     except Exception as exc:  # pragma: no cover - UI error handling
         st.error(f"Error: {exc}")
 
@@ -182,7 +193,10 @@ if "df_original" in st.session_state:
         st.dataframe(df_ui, use_container_width=True)
     else:
         if "df_edited" not in st.session_state:
-            st.session_state["df_edited"] = df_ui.copy()
+            df_init = df_ui.copy()
+            df_init.insert(0, "selected", False)
+            st.session_state["df_edited"] = df_init
+
         df_current = st.session_state["df_edited"]
 
         if "selected" not in df_current.columns:
@@ -222,10 +236,12 @@ if "df_original" in st.session_state:
             },
             num_rows="fixed",
             use_container_width=True,
-            key="editable_attribute_sets",
+            key="data_editor_items",
         )
-        if not edited_df.equals(st.session_state["df_edited"]):
+
+        if st.button("Сохранить изменения"):
             st.session_state["df_edited"] = edited_df.copy()
+            st.success("Изменения сохранены")
 
         if st.button("Apply changes"):
             mask = edited_df["attribute set"] != df_ui["attribute set"]
