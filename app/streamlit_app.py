@@ -197,7 +197,17 @@ if "df_original" in st.session_state:
             df_init["hint"] = ""
             st.session_state["df_edited"] = df_init
 
-        df_base = st.session_state["df_edited"]
+        if "editor_key_main" in st.session_state and st.session_state[
+            "editor_key_main"
+        ] is not None:
+            editor_state = st.session_state["editor_key_main"]
+            if isinstance(editor_state, pd.DataFrame):
+                df_base = editor_state.copy()
+            else:
+                df_base = pd.DataFrame(editor_state).copy()
+            st.session_state["df_edited"] = df_base.copy()
+        else:
+            df_base = st.session_state["df_edited"]
 
         if "selected" not in df_base.columns:
             df_base = df_base.copy()
@@ -239,6 +249,7 @@ if "df_original" in st.session_state:
             column_config={
                 "selected": st.column_config.CheckboxColumn(
                     "✓",
+                    default=False,
                     width="small",
                     help="Mark items for bulk actions",
                 ),
