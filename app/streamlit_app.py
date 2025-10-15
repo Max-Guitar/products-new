@@ -13,6 +13,7 @@ from services.attributes import build_attributes_table_for_sku
 from services.inventory import (
     get_attr_set_id,
     get_backorders_parallel,
+    detect_default_source_code,
     get_source_items,
     iter_products_by_attr_set,
 )
@@ -68,14 +69,28 @@ def load_items(session, base_url):
     if df.empty:
         return pd.DataFrame(columns=["sku", "name", "attribute set", "date created"])
 
-    prog2 = st.progress(0.0, text="Fetching MSI (default)…")
-    source_items = get_source_items(session, base_url, source_code="default")
-    prog2.progress(1.0, text=f"MSI fetched: {len(source_items)} rows")
+    st.info(
+        f"STEP A — products in 'Default' after status/visibility/type: {len(df)}"
+    )
 
-    qty_map = {item.get("sku"): float(item.get("quantity", 0)) for item in source_items}
+    source_code = detect_default_source_code(session, base_url)
+    prog2 = st.progress(0.0, text=f"Fetching MSI ({source_code})…")
+    src_items = get_source_items(session, base_url, source_code=source_code)
+    prog2.progress(1.0, text=f"MSI fetched ({source_code}): {len(src_items)} rows")
+    st.info(f"STEP B — MSI source_items rows: {len(src_items)}")
+    pos_qty = sum(1 for s in src_items if float(s.get("quantity", 0)) > 0)
+    st.info(f"STEP B+ — MSI items with qty>0: {pos_qty}")
+
+    qty_map = {item.get("sku"): float(item.get("quantity", 0)) for item in src_items}
     df["qty"] = df["sku"].map(qty_map).fillna(0.0)
+    have_qty = int((df["qty"] > 0).sum())
+    st.info(f"STEP C — products in set having qty>0: {have_qty}")
+
+    df_pos = df[df["qty"] > 0].copy()
+    df_pos["backorders"] = 0
 
     zero_qty_skus = df.loc[df["qty"] <= 0, "sku"].tolist()
+    st.info(f"STEP D — zero-qty skus to check backorders: {len(zero_qty_skus)}")
     total_backorder_tasks = len(zero_qty_skus)
     prog3 = st.progress(0.0, text=f"Checking backorders… 0/{total_backorder_tasks}")
 
@@ -99,15 +114,20 @@ def load_items(session, base_url):
 
     prog3.progress(1.0, text="Backorders complete")
 
-    df["backorders"] = df["sku"].map(backorders_map).fillna(0).astype(int)
+    df_zero = df[df["qty"] <= 0].copy()
+    df_zero["backorders"] = df_zero["sku"].map(backorders_map).fillna(0).astype(int)
+    df_bo2 = df_zero[df_zero["backorders"] == 2]
+    st.info(f"STEP E — backorders==2 count: {len(df_bo2)}")
 
-    df = df[(df["qty"] > 0) | (df["backorders"] == 2)].copy()
-    if df.empty:
+    out = pd.concat([df_pos, df_bo2], ignore_index=True)
+    st.success(f"STEP F — final rows (qty>0 OR bo=2): {len(out)}")
+
+    if out.empty:
         return pd.DataFrame(columns=["sku", "name", "attribute set", "date created"])
 
-    df["attribute set"] = _DEF_ATTR_SET_NAME
-    df["date created"] = df["created_at"]
-    return df[["sku", "name", "attribute set", "date created"]]
+    out["attribute set"] = _DEF_ATTR_SET_NAME
+    out["date created"] = out["created_at"]
+    return out[["sku", "name", "attribute set", "date created"]]
 
 
 st.set_page_config(page_title="Default Set In-Stock Browser", layout="wide")
