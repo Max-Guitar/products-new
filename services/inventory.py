@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, Iterator, List, Sequence
+from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 import pandas as pd
@@ -42,9 +42,9 @@ def iter_products_by_attr_set(
     base_url: str,
     attr_id: int,
     page_size: int = 200,
-) -> Iterator[dict]:
+) -> Iterator[Tuple[dict, int]]:
     page = 1
-    total_count = None
+    total_count: Optional[int] = None
     while True:
         params = {
             "searchCriteria[filter_groups][0][filters][0][field]": "attribute_set_id",
@@ -55,13 +55,13 @@ def iter_products_by_attr_set(
         }
         data = magento_get(session, base_url, "/products", params=params)
         if total_count is None:
-            total_count = int(data.get("total_count", 0))
-        items = data.get("items", [])
+            total_count = int(data.get("total_count", 0) or 0)
+        items = data.get("items", []) or []
         if not items:
             break
         for item in items:
-            yield item
-        if total_count and page * page_size >= total_count:
+            yield item, total_count or 0
+        if len(items) < page_size:
             break
         page += 1
 
@@ -73,7 +73,6 @@ def get_source_items(
     page_size: int = 500,
 ) -> List[dict]:
     page = 1
-    total_count = None
     collected: List[dict] = []
     while True:
         params = {
@@ -84,13 +83,11 @@ def get_source_items(
             "searchCriteria[currentPage]": page,
         }
         data = magento_get(session, base_url, "/inventory/source-items", params=params)
-        if total_count is None:
-            total_count = int(data.get("total_count", 0))
-        items = data.get("items", [])
+        items = data.get("items", []) or []
         if not items:
             break
         collected.extend(items)
-        if page * page_size >= total_count:
+        if len(items) < page_size:
             break
         page += 1
     return collected
@@ -110,11 +107,13 @@ def get_backorders_parallel(
     base_url: str,
     skus: Sequence[str],
     max_workers: int = 16,
+    progress_cb: Optional[Callable[[int], None]] = None,
 ) -> Dict[str, int]:
     if not skus:
         return {}
     max_workers = max(1, min(max_workers, len(skus)))
     results: Dict[str, int] = {}
+    completed = 0
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {executor.submit(_fetch_backorder, session, base_url, sku): sku for sku in skus}
         for future in as_completed(future_map):
@@ -123,12 +122,18 @@ def get_backorders_parallel(
                 results[sku] = int(future.result())
             except Exception:
                 results[sku] = 0
+            completed += 1
+            if progress_cb is not None:
+                try:
+                    progress_cb(completed)
+                except Exception:
+                    pass
     return results
 
 
 def load_default_items(session: requests.Session, base_url: str) -> pd.DataFrame:
     attr_set_id = get_attr_set_id(session, base_url, name=_DEF_ATTR_SET_NAME)
-    products = list(iter_products_by_attr_set(session, base_url, attr_set_id))
+    products = [item for item, _ in iter_products_by_attr_set(session, base_url, attr_set_id)]
 
     rows = []
     for product in products:
