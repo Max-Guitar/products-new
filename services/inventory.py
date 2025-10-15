@@ -15,6 +15,17 @@ _DEF_ATTR_SET_NAME = "Default"
 _ALLOWED_TYPES = {"simple", "configurable"}
 
 
+def get_config_children(
+    session: requests.Session, base_url: str, parent_sku: str
+) -> List[str]:
+    data = magento_get(
+        session,
+        base_url,
+        f"/configurable-products/{quote(parent_sku, safe='')}/children",
+    )
+    return [child.get("sku", "") for child in data or []]
+
+
 def _get_custom_attr(item: dict, code: str, default=None):
     for attr in item.get("custom_attributes", []) or []:
         if attr.get("attribute_code") == code:
@@ -159,15 +170,14 @@ def load_default_items(session: requests.Session, base_url: str) -> pd.DataFrame
             _get_custom_attr(product, "visibility", product.get("visibility", 4)) or 4
         )
         type_id = product.get("type_id", "simple")
-        if status != 1 or type_id not in _ALLOWED_TYPES:
-            continue
-        if type_id == "configurable" and visibility == 1:
-            continue
         rows.append(
             {
                 "sku": product.get("sku", ""),
                 "name": product.get("name", ""),
                 "created_at": product.get("created_at", ""),
+                "status": status,
+                "visibility": visibility,
+                "type_id": type_id,
             }
         )
 
@@ -175,37 +185,84 @@ def load_default_items(session: requests.Session, base_url: str) -> pd.DataFrame
     if df.empty:
         return pd.DataFrame(columns=["sku", "name", "attribute set", "date created"])
 
-    source_code = detect_default_source_code(session, base_url)
-    source_items = get_source_items(session, base_url, source_code=source_code)
-    # Normalize SKU values so they can be matched regardless of casing/spacing differences
-    def _norm_sku(s: str) -> str:
-        return str(s).strip().lower()
-
-    qty_map = {
-        _norm_sku(item.get("sku")): float(item.get("quantity", 0))
-        for item in source_items
-    }
-    df["qty"] = df["sku"].apply(_norm_sku).map(qty_map).fillna(0.0)
-
-    if source_items:
-        matched = int((df["qty"] > 0).sum())
-        print(
-            f"[DEBUG] Matched {matched}/{len(df)} SKUs with MSI source_items ({len(source_items)} rows)"
-        )
-
-    zero_qty_skus = df.loc[df["qty"] <= 0, "sku"].tolist()
-    backorders_map = get_backorders_parallel(session, base_url, zero_qty_skus)
-    df_pos = df[df["qty"] > 0].copy()
-    df_pos["backorders"] = 0
-
-    df_zero = df[df["qty"] <= 0].copy()
-    df_zero["backorders"] = df_zero["sku"].map(backorders_map).fillna(0).astype(int)
-    df_bo2 = df_zero[df_zero["backorders"] == 2]
-
-    df = pd.concat([df_pos, df_bo2], ignore_index=True)
+    df = df[(df["status"] == 1) & (df["type_id"].isin(_ALLOWED_TYPES))].copy()
     if df.empty:
         return pd.DataFrame(columns=["sku", "name", "attribute set", "date created"])
 
-    df["attribute set"] = _DEF_ATTR_SET_NAME
-    df["date created"] = df["created_at"]
-    return df[["sku", "name", "attribute set", "date created"]]
+    simple_skus = set(df.loc[df["type_id"] == "simple", "sku"])
+    config_skus = df.loc[df["type_id"] == "configurable", "sku"].tolist()
+
+    child_skus: set[str] = set()
+    for parent_sku in config_skus:
+        child_skus.update(get_config_children(session, base_url, parent_sku))
+
+    def _norm(s: str) -> str:
+        return str(s).strip().lower()
+
+    source_code = detect_default_source_code(session, base_url)
+    src_items = get_source_items(session, base_url, source_code=source_code)
+    qty_map = {_norm(item.get("sku")): float(item.get("quantity", 0)) for item in src_items}
+
+    df["qty"] = df["sku"].apply(_norm).map(qty_map).fillna(0.0)
+
+    if child_skus:
+        df_children = pd.DataFrame({"sku": list(child_skus)})
+        df_children["qty"] = df_children["sku"].apply(_norm).map(qty_map).fillna(0.0)
+    else:
+        df_children = pd.DataFrame(columns=["sku", "qty"])
+
+    matched = int((df["qty"] > 0).sum())
+    matched_children = int((df_children["qty"] > 0).sum()) if not df_children.empty else 0
+    print(
+        f"[DEBUG] MSI qty>0 matches: simple/config rows={matched}, children rows={matched_children}, MSI total={len(src_items)}"
+    )
+
+    zero_main = df.loc[df["qty"] <= 0, "sku"].tolist()
+    zero_child = df_children.loc[df_children["qty"] <= 0, "sku"].tolist()
+    zero_skus = list(set(zero_main + zero_child))
+    back_map = get_backorders_parallel(session, base_url, zero_skus)
+
+    df_main_pos = df[df["qty"] > 0].copy()
+    df_child_pos = df_children[df_children["qty"] > 0].copy()
+
+    df_main_zero = df[df["qty"] <= 0].copy()
+    df_main_zero["backorders"] = df_main_zero["sku"].map(back_map).fillna(0).astype(int)
+    df_child_zero = df_children[df_children["qty"] <= 0].copy()
+    df_child_zero["backorders"] = (
+        df_child_zero["sku"].map(back_map).fillna(0).astype(int)
+    )
+
+    df_bo2 = pd.concat(
+        [
+            df_main_zero[df_main_zero["backorders"] == 2][["sku"]],
+            df_child_zero[df_child_zero["backorders"] == 2][["sku"]],
+        ],
+        ignore_index=True,
+    ).drop_duplicates()
+
+    result_skus = (
+        set(df_main_pos["sku"])
+        | set(df_child_pos["sku"])
+        | set(df_bo2["sku"])
+    )
+
+    if not result_skus:
+        return pd.DataFrame(columns=["sku", "name", "attribute set", "date created"])
+
+    out = df[df["sku"].isin(result_skus)].copy()
+    missing_children = (result_skus - set(out["sku"])) & child_skus
+    if missing_children:
+        missing_list = list(missing_children)
+        child_rows = pd.DataFrame(
+            {
+                "sku": missing_list,
+                "name": ["" for _ in missing_list],
+                "created_at": ["" for _ in missing_list],
+            }
+        )
+        out = pd.concat([out, child_rows], ignore_index=True, sort=False)
+
+    out = out.drop_duplicates(subset=["sku"])
+    out["attribute set"] = _DEF_ATTR_SET_NAME
+    out["date created"] = out.get("created_at", "")
+    return out[["sku", "name", "attribute set", "date created"]]
