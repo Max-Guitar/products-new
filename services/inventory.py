@@ -179,8 +179,21 @@ def load_default_items(session: requests.Session, base_url: str) -> pd.DataFrame
 
     source_code = detect_default_source_code(session, base_url)
     source_items = get_source_items(session, base_url, source_code=source_code)
-    qty_map = {item.get("sku"): float(item.get("quantity", 0)) for item in source_items}
-    df["qty"] = df["sku"].map(qty_map).fillna(0.0)
+    # Normalize SKU values so they can be matched regardless of casing/spacing differences
+    def _norm_sku(s: str) -> str:
+        return str(s).strip().lower()
+
+    qty_map = {
+        _norm_sku(item.get("sku")): float(item.get("quantity", 0))
+        for item in source_items
+    }
+    df["qty"] = df["sku"].apply(_norm_sku).map(qty_map).fillna(0.0)
+
+    if source_items:
+        matched = int((df["qty"] > 0).sum())
+        print(
+            f"[DEBUG] Matched {matched}/{len(df)} SKUs with MSI source_items ({len(source_items)} rows)"
+        )
 
     zero_qty_skus = df.loc[df["qty"] <= 0, "sku"].tolist()
     backorders_map = get_backorders_parallel(session, base_url, zero_qty_skus)
