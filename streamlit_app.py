@@ -180,6 +180,8 @@ def load_items():
         "date created": df["created_at"],
     })
     st.success(f"Found {len(df_ui)} products (Default; qty>0 OR backorders=2)")
+    df_ui["date created"] = pd.to_datetime(df_ui["date created"], errors="coerce")
+    df_ui = df_ui.sort_values("date created", ascending=False).reset_index(drop=True)
     st.dataframe(df_ui, use_container_width=True)
     return df_ui
 
