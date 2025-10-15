@@ -183,6 +183,19 @@ if "df_original" in st.session_state:
     else:
         if "df_edited" not in st.session_state:
             st.session_state["df_edited"] = df_ui.copy()
+        df_current = st.session_state["df_edited"]
+
+        if "selected" not in df_current.columns:
+            df_current = df_current.copy()
+            df_current.insert(0, "selected", False)
+            st.session_state["df_edited"] = df_current
+        elif df_current.columns[0] != "selected":
+            df_current = df_current.copy()
+            selected_col = df_current.pop("selected")
+            df_current.insert(0, "selected", selected_col)
+            st.session_state["df_edited"] = df_current
+
+        df_for_editor = st.session_state["df_edited"]
         options = list(attribute_sets.keys())
         options.extend(
             name
@@ -193,8 +206,13 @@ if "df_original" in st.session_state:
         options = list(dict.fromkeys(options))
 
         edited_df = st.data_editor(
-            st.session_state["df_edited"],
+            df_for_editor,
             column_config={
+                "selected": st.column_config.CheckboxColumn(
+                    "✓",
+                    default=False,
+                    help="Mark items for bulk actions",
+                ),
                 "attribute set": st.column_config.SelectboxColumn(
                     "Attribute Set",
                     help="Change attribute set",
@@ -206,7 +224,8 @@ if "df_original" in st.session_state:
             use_container_width=True,
             key="editable_attribute_sets",
         )
-        st.session_state["df_edited"] = edited_df
+        if not edited_df.equals(st.session_state["df_edited"]):
+            st.session_state["df_edited"] = edited_df.copy()
 
         if st.button("Apply changes"):
             mask = edited_df["attribute set"] != df_ui["attribute set"]
