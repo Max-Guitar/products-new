@@ -210,6 +210,7 @@ if "df_original" in st.session_state:
             st.session_state["df_edited"] = df_current
 
         df_for_editor = st.session_state["df_edited"]
+        original_df = df_for_editor.copy()
         options = list(attribute_sets.keys())
         options.extend(
             name
@@ -238,6 +239,26 @@ if "df_original" in st.session_state:
             use_container_width=True,
             key="data_editor_items",
         )
+
+        if (
+            "attribute set" in edited_df.columns
+            and "attribute set" in original_df.columns
+            and "selected" in edited_df.columns
+        ):
+            changed_indices = []
+            for idx in edited_df.index:
+                if idx in original_df.index and (
+                    edited_df.at[idx, "attribute set"]
+                    != original_df.at[idx, "attribute set"]
+                ):
+                    edited_df.at[idx, "selected"] = True
+                    changed_indices.append(idx)
+
+            if changed_indices:
+                df_state = st.session_state["df_edited"]
+                for idx in changed_indices:
+                    if idx in df_state.index:
+                        df_state.at[idx, "selected"] = True
 
         if st.button("Сохранить изменения"):
             st.session_state["df_edited"] = edited_df.copy()
