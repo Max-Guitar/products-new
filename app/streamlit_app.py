@@ -860,9 +860,7 @@ if "df_original" in st.session_state:
                                                 deep=True
                                             )
 
-                                        base_df_session = st.session_state[
-                                            editor_key
-                                        ].copy(deep=True)
+                                        base_df_session = st.session_state[editor_key]
 
                                         edited_df = st.data_editor(
                                             base_df_session,
