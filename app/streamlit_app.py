@@ -849,13 +849,23 @@ if "df_original" in st.session_state:
 
                                         base_df = entry.get("data")
                                         if isinstance(base_df, pd.DataFrame):
-                                            display_df = base_df.copy(deep=True)
+                                            base_df = base_df.copy(deep=True)
                                         else:
-                                            display_df = pd.DataFrame()
+                                            base_df = pd.DataFrame()
 
                                         column_config = entry.get("column_config", {})
                                         column_order = entry.get("column_order")
                                         editor_key = f"step2_editor_{idx}_{attr_title}"
+
+                                        editor_state = st.session_state.setdefault(
+                                            "editor_state", {}
+                                        )
+                                        state_df = editor_state.get(editor_key)
+                                        if isinstance(state_df, pd.DataFrame):
+                                            display_df = state_df.copy(deep=True)
+                                        else:
+                                            display_df = base_df.copy(deep=True)
+
                                         edited_df = st.data_editor(
                                             display_df,
                                             column_config=column_config,
@@ -867,11 +877,16 @@ if "df_original" in st.session_state:
                                         )
 
                                         if isinstance(edited_df, pd.DataFrame):
-                                            entry["data"] = edited_df.copy(deep=True)
-                                            if entry_id is not None:
-                                                step2_edits[entry_id] = edited_df.copy(
-                                                    deep=True
-                                                )
+                                            edited_copy = edited_df.copy(deep=True)
+                                            editor_state[editor_key] = edited_copy
+                                            has_changes = not (
+                                                isinstance(display_df, pd.DataFrame)
+                                                and display_df.equals(edited_df)
+                                            )
+                                            if has_changes:
+                                                entry["data"] = edited_copy
+                                                if entry_id is not None:
+                                                    step2_edits[entry_id] = edited_copy
                                         save_key = f"step2_save_{idx}_{entry.get('title','')}"
                                         if st.button("💾 Save", key=save_key):
                                             if isinstance(edited_df, pd.DataFrame):
