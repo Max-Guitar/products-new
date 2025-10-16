@@ -8,7 +8,19 @@ if str(ROOT) not in sys.path:
 
 import pandas as pd
 import streamlit as st
+from typing import Optional
 
+from services.ai_fill import (
+    ALWAYS_ATTRS,
+    SET_ATTRS,
+    collect_attributes_table,
+    compute_allowed_attrs,
+    get_attribute_sets_map,
+    get_product_by_sku,
+    infer_missing,
+    probe_api_base,
+    show_scrollable_ai,
+)
 from services.attributes import build_attributes_table_for_sku
 from services.inventory import (
     get_attr_set_id,
@@ -270,23 +282,94 @@ if "df_original" in st.session_state:
                     df_changed = df_changed.rename(
                         columns={"attribute set_new": "attribute set"}
                     )
-                    for attr_set_name in df_changed["attribute set"].dropna().unique():
-                        st.markdown(f"#### 🎯 Attribute Set: {attr_set_name}")
-                        st.dataframe(
-                            df_changed[df_changed["attribute set"] == attr_set_name][
-                                ["sku", "attribute set"]
-                            ],
-                            use_container_width=True,
-                        )
 
-                    if df_changed["attribute set"].isna().any():
-                        st.markdown("#### 🎯 Attribute Set: —")
-                        st.dataframe(
-                            df_changed[df_changed["attribute set"].isna()][
-                                ["sku", "attribute set"]
-                            ],
-                            use_container_width=True,
-                        )
+                    openai_key = st.secrets.get("OPENAI_API_KEY")
+                    ai_error: Optional[str] = None
+                    ai_ready = False
+                    ai_api_base = st.session_state.get("ai_api_base")
+                    ai_sets_map = st.session_state.get("ai_attr_sets_map")
+
+                    if not openai_key:
+                        ai_error = "AI подсказки недоступны: отсутствует OPENAI_API_KEY."
+                    else:
+                        try:
+                            if not ai_api_base:
+                                with st.spinner("🔌 Подключение к Magento…"):
+                                    ai_api_base = probe_api_base(session, base_url)
+                                st.session_state["ai_api_base"] = ai_api_base
+                            if not ai_sets_map:
+                                with st.spinner("📚 Загрузка attribute sets…"):
+                                    ai_sets_map = get_attribute_sets_map(session, ai_api_base)
+                                st.session_state["ai_attr_sets_map"] = ai_sets_map
+                            ai_ready = bool(ai_api_base and ai_sets_map)
+                        except Exception as exc:  # pragma: no cover - UI interaction
+                            ai_error = f"AI подсказки недоступны: {exc}"
+
+                    grouped = df_changed.groupby("attribute set", dropna=False)
+
+                    for attr_set_value, group in grouped:
+                        attr_title = attr_set_value if pd.notna(attr_set_value) else "—"
+                        st.markdown(f"#### 🎯 Attribute Set: {attr_title}")
+                        st.dataframe(group[["sku", "attribute set"]], use_container_width=True)
+
+                        if not ai_ready:
+                            continue
+
+                        attr_set_id = None
+                        if pd.notna(attr_set_value):
+                            attr_set_id = attribute_sets.get(attr_set_value)
+                            if attr_set_id is None:
+                                st.warning(
+                                    f"Attribute set '{attr_set_value}' отсутствует в Magento, пропуск AI."
+                                )
+                                continue
+                        else:
+                            st.warning("Attribute set не указан, пропуск AI.")
+                            continue
+
+                        for _, row in group.iterrows():
+                            sku_value = str(row.get("sku", "")).strip()
+                            if not sku_value:
+                                continue
+                            st.markdown(f"**SKU: {sku_value}**")
+                            try:
+                                with st.spinner("🤖 AI подбирает атрибуты…"):
+                                    product = get_product_by_sku(session, ai_api_base, sku_value)
+                                    allowed = compute_allowed_attrs(
+                                        attr_set_id, SET_ATTRS, ai_sets_map, ALWAYS_ATTRS
+                                    )
+                                    if not allowed:
+                                        st.info("Нет атрибутов для отображения.")
+                                        continue
+                                    allowed_sorted = sorted(allowed)
+                                    df_full = collect_attributes_table(
+                                        product, allowed_sorted, session, ai_api_base
+                                    )
+                                    if df_full.empty:
+                                        st.warning("Нет данных по атрибутам, пропуск.")
+                                        continue
+                                    df_suggest = infer_missing(
+                                        product,
+                                        df_full,
+                                        session,
+                                        ai_api_base,
+                                        allowed_sorted,
+                                        openai_key,
+                                        model="gpt-5-mini",
+                                    )
+                            except Exception as exc:  # pragma: no cover - UI interaction
+                                st.warning(f"{sku_value}: не удалось получить AI-подсказки ({exc})")
+                                continue
+
+                            if df_suggest.empty:
+                                st.info("AI не предложил новых значений.")
+                                continue
+
+                            html_table = show_scrollable_ai(df_full, df_suggest)
+                            st.markdown(html_table, unsafe_allow_html=True)
+
+                    if ai_error:
+                        st.warning(ai_error)
             else:
                 st.info("Нет изменённых товаров.")
         else:
