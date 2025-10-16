@@ -855,13 +855,12 @@ if "df_original" in st.session_state:
                                         unique_id = entry_id or f"table::{idx}"
                                         editor_key = f"step2_editor_{unique_id}"
 
-                                        session_df = st.session_state.setdefault(
-                                            editor_key,
-                                            base_df.copy(deep=True),
-                                        )
+                                        if editor_key not in st.session_state:
+                                            st.session_state[editor_key] = (
+                                                base_df.copy(deep=True)
+                                            )
 
                                         edited_df = st.data_editor(
-                                            session_df,
                                             column_config=column_config,
                                             column_order=column_order,
                                             use_container_width=True,
