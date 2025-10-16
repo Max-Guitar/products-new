@@ -855,13 +855,17 @@ if "df_original" in st.session_state:
                                         unique_id = entry_id or f"table::{idx}"
                                         editor_key = f"step2_editor_{unique_id}"
 
-                                        if editor_key not in st.session_state:
-                                            st.session_state[editor_key] = (
+                                        state_key = f"{editor_key}__data"
+
+                                        if state_key not in st.session_state:
+                                            st.session_state[state_key] = (
                                                 base_df.copy(deep=True)
                                             )
 
+                                        current_df = st.session_state[state_key]
+
                                         edited_df = st.data_editor(
-                                            data=st.session_state[editor_key],
+                                            data=current_df,
                                             column_config=column_config,
                                             column_order=column_order,
                                             use_container_width=True,
@@ -871,11 +875,11 @@ if "df_original" in st.session_state:
                                         )
 
                                         if isinstance(edited_df, pd.DataFrame):
-                                            st.session_state[editor_key] = edited_df.copy(
+                                            st.session_state[state_key] = edited_df.copy(
                                                 deep=True
                                             )
 
-                                        current_df = st.session_state[editor_key]
+                                        current_df = st.session_state[state_key]
                                         edited_copy = current_df.copy(deep=True)
 
                                         editable_columns = entry.get(
