@@ -12,9 +12,9 @@ import streamlit as st
 from services.ai_fill import (
     ALWAYS_ATTRS,
     SET_ATTRS,
-    build_attributes_display_table,
     collect_attributes_table,
     compute_allowed_attrs,
+    get_attribute_meta,
     get_attribute_sets_map,
     get_product_by_sku,
     probe_api_base,
@@ -40,6 +40,299 @@ def _get_custom_attr_value(item: dict, code: str, default=None):
         if attr.get("attribute_code") == code:
             return attr.get("value", default)
     return default
+
+
+def _attr_label(meta: dict, code: str) -> str:
+    for key in ("default_frontend_label", "frontend_label", "store_label"):
+        label = meta.get(key)
+        if isinstance(label, str) and label.strip():
+            return label.strip()
+    if code == "sku":
+        return "SKU"
+    if code == "name":
+        return "Name"
+    return code.replace("_", " ").title()
+
+
+def _meta_options(meta: dict) -> list:
+    options = []
+    for opt in meta.get("options", []) or []:
+        label = opt.get("label")
+        if isinstance(label, str) and label.strip():
+            options.append(label.strip())
+    # preserve order but deduplicate while keeping first occurrence
+    seen = set()
+    unique = []
+    for item in options:
+        if item not in seen:
+            seen.add(item)
+            unique.append(item)
+    return unique
+
+
+def _value_for_editor(attr_row: dict, meta: dict):
+    frontend_input = (meta.get("frontend_input") or "").lower()
+    raw = attr_row.get("raw_value") if attr_row else None
+    label = attr_row.get("label") if attr_row else None
+
+    if frontend_input == "boolean":
+        if isinstance(raw, bool):
+            return raw
+        if raw in (None, ""):
+            return False
+        raw_str = str(raw).strip().lower()
+        return raw_str in {"1", "true", "yes", "y", "on"}
+
+    if frontend_input == "multiselect":
+        selected = []
+        values = []
+        if isinstance(raw, (list, tuple, set)):
+            values = [str(item) for item in raw]
+        elif raw not in (None, ""):
+            values = [item.strip() for item in str(raw).split(",")]
+        elif label:
+            values = [item.strip() for item in str(label).split(",")]
+
+        id_to_label = {}
+        for opt in meta.get("options", []) or []:
+            opt_value = opt.get("value")
+            opt_label = opt.get("label")
+            if opt_value is not None and opt_label:
+                id_to_label[str(opt_value)] = str(opt_label)
+
+        for value in values:
+            if not value:
+                continue
+            selected.append(id_to_label.get(str(value), str(value)))
+        return selected
+
+    if frontend_input == "select":
+        id_to_label = {}
+        for opt in meta.get("options", []) or []:
+            opt_value = opt.get("value")
+            opt_label = opt.get("label")
+            if opt_value is not None and opt_label:
+                id_to_label[str(opt_value)] = str(opt_label)
+
+        if raw not in (None, "") and str(raw) in id_to_label:
+            return id_to_label[str(raw)]
+        if label:
+            return str(label)
+        if raw not in (None, ""):
+            return str(raw)
+        return ""
+
+    value = label if label not in (None, "") else raw
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _normalize_editor_value(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (list, tuple, set)):
+        return tuple(str(item).strip() for item in value if str(item).strip())
+    if value is None:
+        return ""
+    if isinstance(value, float) and pd.isna(value):
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return value
+
+
+def _sanitize_for_storage(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (list, tuple, set)):
+        sanitized = [str(item).strip() for item in value if str(item).strip()]
+        return sanitized
+    if value is None:
+        return ""
+    if isinstance(value, float) and pd.isna(value):
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return value
+
+
+def _build_column_config(column_order, column_meta):
+    config = {}
+    for column in column_order:
+        if column == "sku":
+            config[column] = st.column_config.TextColumn("SKU", disabled=True)
+            continue
+        if column == "name":
+            config[column] = st.column_config.TextColumn("Name", disabled=True)
+            continue
+        meta = column_meta.get(column, {})
+        label = _attr_label(meta, column)
+        frontend_input = (meta.get("frontend_input") or "").lower()
+        options = _meta_options(meta)
+        if frontend_input == "boolean":
+            config[column] = st.column_config.CheckboxColumn(label)
+        elif frontend_input == "select" and options:
+            config[column] = st.column_config.SelectboxColumn(
+                label=label,
+                options=options,
+                required=False,
+            )
+        elif frontend_input == "multiselect":
+            config[column] = st.column_config.MultiSelectColumn(
+                label=label,
+                options=options,
+                required=False,
+            )
+        else:
+            config[column] = st.column_config.TextColumn(label)
+    return config
+
+
+def _update_step2_edits(step2_edits, original_df, edited_df, editable_columns):
+    if original_df.empty or edited_df.empty:
+        return
+
+    original_idx = original_df.set_index("sku")
+    edited_idx = edited_df.set_index("sku")
+
+    for sku, orig_row in original_idx.iterrows():
+        if sku not in edited_idx.index:
+            continue
+        edited_row = edited_idx.loc[sku]
+        changes = {}
+        for column in editable_columns:
+            if column not in original_idx.columns or column not in edited_idx.columns:
+                continue
+            orig_value = orig_row[column]
+            edited_value = edited_row[column]
+            if _normalize_editor_value(orig_value) != _normalize_editor_value(
+                edited_value
+            ):
+                changes[column] = _sanitize_for_storage(edited_value)
+        if changes:
+            step2_edits[sku] = changes
+        elif sku in step2_edits:
+            step2_edits.pop(sku, None)
+
+
+def _prepare_step2_tables(df_changed, session, api_base, attribute_sets, attr_sets_map):
+    tables = []
+    core_codes = ["sku", "name", "brand", "condition"]
+    meta_cache = {}
+
+    grouped = df_changed.groupby("attribute set", dropna=False)
+    for attr_set_value, group in grouped:
+        rows = []
+        column_meta = {}
+        attr_codes_seen = set()
+        attr_title = attr_set_value if pd.notna(attr_set_value) else "—"
+
+        for _, row in group.iterrows():
+            sku_value = str(row.get("sku", "")).strip()
+            if not sku_value:
+                continue
+
+            name_value = row.get("name")
+            try:
+                with st.spinner("Получение данных из Magento…"):
+                    product = get_product_by_sku(session, api_base, sku_value)
+            except Exception as exc:  # pragma: no cover - UI interaction
+                st.warning(f"{sku_value}: не удалось получить атрибуты ({exc})")
+                continue
+
+            attr_set_id = None
+            if pd.notna(attr_set_value):
+                attr_set_id = attribute_sets.get(attr_set_value)
+            if attr_set_id is None:
+                attr_set_id = product.get("attribute_set_id")
+
+            allowed = compute_allowed_attrs(
+                attr_set_id,
+                SET_ATTRS,
+                attr_sets_map or {},
+                ALWAYS_ATTRS,
+            )
+
+            editor_codes = []
+            for code in core_codes:
+                if code not in editor_codes:
+                    editor_codes.append(code)
+            for code in sorted(allowed):
+                if code not in editor_codes:
+                    editor_codes.append(code)
+
+            df_full = collect_attributes_table(
+                product,
+                editor_codes,
+                session,
+                api_base,
+            )
+            attr_rows = df_full.to_dict(orient="index") if not df_full.empty else {}
+
+            row_data = {
+                "sku": sku_value,
+                "name": str(name_value).strip()
+                if isinstance(name_value, str) and name_value.strip()
+                else str(product.get("name", "")),
+            }
+
+            for code in editor_codes:
+                if code in {"sku", "name"}:
+                    continue
+                meta = meta_cache.get(code)
+                if meta is None:
+                    meta = get_attribute_meta(session, api_base, code) or {}
+                    meta_cache[code] = meta
+                column_meta.setdefault(code, meta)
+                value = _value_for_editor(attr_rows.get(code, {}), meta)
+                row_data[code] = value
+                attr_codes_seen.add(code)
+
+            rows.append(row_data)
+
+        if not rows:
+            continue
+
+        df_table = pd.DataFrame(rows)
+        if "sku" not in df_table.columns:
+            df_table["sku"] = ""
+        if "name" not in df_table.columns:
+            df_table["name"] = ""
+
+        df_table["sku"] = df_table["sku"].astype(str)
+
+        for code in core_codes:
+            if code not in df_table.columns:
+                df_table[code] = ""
+
+        other_columns = sorted(
+            code
+            for code in set(column_meta.keys()) | attr_codes_seen
+            if code not in {"brand", "condition", "sku", "name"}
+        )
+
+        column_order = [col for col in core_codes if col in df_table.columns]
+        column_order.extend([col for col in other_columns if col in df_table.columns])
+
+        df_table = df_table[column_order]
+
+        column_meta_with_base = {code: column_meta.get(code, {}) for code in column_order}
+        column_config = _build_column_config(column_order, column_meta_with_base)
+        editable_columns = [col for col in column_order if col not in {"sku", "name"}]
+
+        tables.append(
+            {
+                "title": attr_title,
+                "data": df_table,
+                "original_df": df_table.copy(deep=True),
+                "column_config": column_config,
+                "column_order": column_order,
+                "editable_columns": editable_columns,
+            }
+        )
+
+    return tables
 
 
 def load_items(session, base_url):
@@ -302,75 +595,64 @@ if "df_original" in st.session_state:
                             if setup_failed or not api_base or not attr_sets_map:
                                 st.session_state["show_attributes_trigger"] = False
                             else:
-                                grouped = df_changed.groupby(
-                                    "attribute set", dropna=False
+                                need_rebuild = show_attributes_clicked or not st.session_state.get(
+                                    "step2_tables"
                                 )
-
-                                for attr_set_value, group in grouped:
-                                    attr_title = (
-                                        attr_set_value if pd.notna(attr_set_value) else "—"
+                                if need_rebuild:
+                                    tables = _prepare_step2_tables(
+                                        df_changed,
+                                        session,
+                                        api_base,
+                                        attribute_sets,
+                                        attr_sets_map,
                                     )
-                                    st.markdown(f"#### 🎯 Attribute Set: {attr_title}")
+                                    st.session_state["step2_tables"] = tables
+                                    st.session_state["step2_edits"] = {}
 
-                                    for _, row in group.iterrows():
-                                        sku_value = str(row.get("sku", "")).strip()
-                                        if not sku_value:
-                                            continue
+                                tables = st.session_state.get("step2_tables", [])
+                                if not tables:
+                                    st.info("Нет атрибутов для отображения.")
+                                else:
+                                    step2_edits = st.session_state.setdefault(
+                                        "step2_edits", {}
+                                    )
+                                    for idx, entry in enumerate(tables):
+                                        attr_title = entry.get("title", "—")
+                                        st.subheader(f"Attribute Set: {attr_title}")
 
-                                        name_value = row.get("name")
-                                        header = f"**{sku_value}**"
-                                        if isinstance(name_value, str) and name_value.strip():
-                                            header = (
-                                                f"**{sku_value} — {name_value.strip()}**"
-                                            )
-                                        st.markdown(header)
+                                        base_df = entry.get("data")
+                                        if isinstance(base_df, pd.DataFrame):
+                                            display_df = base_df.copy(deep=True)
+                                        else:
+                                            display_df = pd.DataFrame()
 
-                                        try:
-                                            with st.spinner("Получение данных из Magento…"):
-                                                product = get_product_by_sku(
-                                                    session, api_base, sku_value
-                                                )
-                                                attr_set_id = None
-                                                if pd.notna(attr_set_value):
-                                                    attr_set_id = attribute_sets.get(
-                                                        attr_set_value
-                                                    )
-                                                if attr_set_id is None:
-                                                    attr_set_id = product.get(
-                                                        "attribute_set_id"
-                                                    )
-                                                allowed = compute_allowed_attrs(
-                                                    attr_set_id,
-                                                    SET_ATTRS,
-                                                    attr_sets_map or {},
-                                                    ALWAYS_ATTRS,
-                                                )
-                                                if not allowed:
-                                                    st.info("Нет атрибутов для отображения.")
-                                                    continue
-                                                allowed_sorted = sorted(allowed)
-                                                df_full = collect_attributes_table(
-                                                    product,
-                                                    allowed_sorted,
-                                                    session,
-                                                    api_base,
-                                                )
-                                                if df_full.empty:
-                                                    st.info(
-                                                        "Нет данных по атрибутам, пропуск."
-                                                    )
-                                                    continue
-                                        except Exception as exc:  # pragma: no cover - UI interaction
-                                            st.warning(
-                                                f"{sku_value}: не удалось получить атрибуты ({exc})"
-                                            )
-                                            continue
-
-                                        df_display = build_attributes_display_table(df_full)
-                                        st.dataframe(
-                                            df_display,
+                                        column_config = entry.get("column_config", {})
+                                        column_order = entry.get("column_order")
+                                        editor_key = f"step2_editor_{idx}_{attr_title}"
+                                        edited_df = st.data_editor(
+                                            display_df,
+                                            column_config=column_config,
+                                            column_order=column_order,
                                             use_container_width=True,
+                                            num_rows="fixed",
+                                            hide_index=True,
+                                            key=editor_key,
                                         )
+
+                                        if isinstance(edited_df, pd.DataFrame):
+                                            _update_step2_edits(
+                                                step2_edits,
+                                                entry.get("original_df", pd.DataFrame()),
+                                                edited_df,
+                                                entry.get("editable_columns", []),
+                                            )
+                                            entry["data"] = edited_df.copy(deep=True)
+
+                                    st.session_state["step2_edits"] = {
+                                        sku: values
+                                        for sku, values in step2_edits.items()
+                                        if values
+                                    }
         else:
             st.info("Нет изменённых товаров.")
 else:
