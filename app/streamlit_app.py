@@ -12,12 +12,12 @@ import streamlit as st
 from services.ai_fill import (
     ALWAYS_ATTRS,
     SET_ATTRS,
+    build_attributes_display_table,
     collect_attributes_table,
     compute_allowed_attrs,
     get_attribute_sets_map,
     get_product_by_sku,
     probe_api_base,
-    show_scrollable_ai,
 )
 from services.attributes import build_attributes_table_for_sku
 from services.inventory import (
@@ -366,8 +366,10 @@ if "df_original" in st.session_state:
                                             )
                                             continue
 
-                                        show_scrollable_ai(
-                                            df_full, pd.DataFrame(columns=["code", "value"])
+                                        df_display = build_attributes_display_table(df_full)
+                                        st.dataframe(
+                                            df_display,
+                                            use_container_width=True,
                                         )
         else:
             st.info("Нет изменённых товаров.")
