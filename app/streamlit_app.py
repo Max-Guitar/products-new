@@ -855,15 +855,13 @@ if "df_original" in st.session_state:
                                         unique_id = entry_id or f"table::{idx}"
                                         editor_key = f"step2_editor_{unique_id}"
 
-                                        if editor_key not in st.session_state:
-                                            st.session_state[editor_key] = base_df.copy(
-                                                deep=True
-                                            )
-
-                                        base_df_session = st.session_state[editor_key]
+                                        session_df = st.session_state.setdefault(
+                                            editor_key,
+                                            base_df.copy(deep=True),
+                                        )
 
                                         edited_df = st.data_editor(
-                                            base_df_session,
+                                            session_df,
                                             column_config=column_config,
                                             column_order=column_order,
                                             use_container_width=True,
@@ -873,14 +871,12 @@ if "df_original" in st.session_state:
                                         )
 
                                         if isinstance(edited_df, pd.DataFrame):
-                                            updated_df = edited_df.copy(deep=True)
-                                        else:
-                                            updated_df = base_df_session.copy(deep=True)
+                                            st.session_state[editor_key] = edited_df.copy(
+                                                deep=True
+                                            )
 
-                                        st.session_state[editor_key] = updated_df.copy(
-                                            deep=True
-                                        )
-                                        edited_copy = updated_df.copy(deep=True)
+                                        current_df = st.session_state[editor_key]
+                                        edited_copy = current_df.copy(deep=True)
 
                                         editable_columns = entry.get(
                                             "editable_columns", []
