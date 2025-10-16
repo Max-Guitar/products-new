@@ -150,6 +150,7 @@ if st.button("Load items", type="primary"):
             st.warning("No items match the Default set filter criteria.")
             st.session_state.pop("df_original", None)
             st.session_state.pop("df_edited", None)
+            st.session_state.pop("df_render", None)
             st.session_state.pop("attribute_sets", None)
         else:
             df_ui = df_items.copy()
@@ -160,7 +161,6 @@ if st.button("Load items", type="primary"):
             st.success(
                 f"Found {len(df_ui)} products (Default; qty>0 OR backorders=2)"
             )
-            st.session_state["df_original"] = df_ui.copy()
             try:
                 attribute_sets = list_attribute_sets(session, base_url)
             except Exception as exc:  # pragma: no cover - UI error handling
@@ -171,13 +171,14 @@ if st.button("Load items", type="primary"):
             if "selected" not in df_for_edit.columns:
                 df_for_edit.insert(0, "selected", False)
             else:
-                df_for_edit = df_for_edit.copy()
                 if df_for_edit.columns[0] != "selected":
                     selected_col = df_for_edit.pop("selected")
                     df_for_edit.insert(0, "selected", selected_col)
                 df_for_edit["selected"] = False
             df_for_edit["hint"] = ""
+            st.session_state["df_original"] = df_for_edit.copy()
             st.session_state["df_edited"] = df_for_edit.copy()
+            st.session_state["df_render"] = df_for_edit.copy()
     except Exception as exc:  # pragma: no cover - UI error handling
         st.error(f"Error: {exc}")
 
@@ -193,65 +194,34 @@ if "df_original" in st.session_state:
     else:
         if "df_edited" not in st.session_state:
             df_init = df_ui.copy()
-            df_init.insert(0, "selected", False)
+            if "selected" not in df_init.columns:
+                df_init.insert(0, "selected", False)
+            else:
+                if df_init.columns[0] != "selected":
+                    selected_col = df_init.pop("selected")
+                    df_init.insert(0, "selected", selected_col)
+                df_init["selected"] = False
             df_init["hint"] = ""
-            st.session_state["df_edited"] = df_init
+            st.session_state["df_edited"] = df_init.copy()
 
         df_edit = st.session_state["df_edited"].copy()
-
-        editor_state = st.session_state.get("editor_key_main")
-        if isinstance(editor_state, pd.DataFrame):
-            df_edit = editor_state.copy()
-
-        if "selected" not in df_edit.columns:
-            df_edit.insert(0, "selected", False)
-        elif df_edit.columns[0] != "selected":
-            selected_col = df_edit.pop("selected")
-            df_edit.insert(0, "selected", selected_col)
-
-        if "hint" not in df_edit.columns:
-            df_edit["hint"] = ""
-
         df_orig = st.session_state["df_original"]
 
-        def _normalize_attr_value(value):
-            if pd.isna(value):
-                return ""
-            return str(value).strip().lower()
-
         for idx in df_edit.index:
-            if idx not in df_orig.index:
-                continue
-            orig_value = _normalize_attr_value(df_orig.at[idx, "attribute set"])
-            current_value = _normalize_attr_value(df_edit.at[idx, "attribute set"])
-            if current_value != orig_value:
+            orig_val = str(df_orig.at[idx, "attribute set"]).strip().lower()
+            new_val = str(df_edit.at[idx, "attribute set"]).strip().lower()
+            if new_val != orig_val:
                 df_edit.at[idx, "selected"] = True
 
-        st.session_state["df_edited"] = df_edit.copy()
         st.session_state["df_render"] = df_edit.copy()
 
-        options = list(attribute_sets.keys())
-        options.extend(
-            name
-            for name in df_edit["attribute set"].dropna().unique()
-            if name not in attribute_sets
-        )
-        options = list(dict.fromkeys(options))
-
         edited_df = st.data_editor(
-            df_edit,
+            st.session_state["df_render"],
             column_config={
-                "selected": st.column_config.CheckboxColumn(
-                    "✓",
-                    default=False,
-                    width=28,
-                    help="Mark items for bulk actions",
-                ),
+                "selected": st.column_config.CheckboxColumn("✓", default=False, width=15),
                 "attribute set": st.column_config.SelectboxColumn(
                     "Attribute Set",
-                    help="Change attribute set",
-                    options=options,
-                    required=True,
+                    options=list(attribute_sets.keys()),
                 ),
                 "hint": st.column_config.TextColumn("Hint"),
             },
@@ -261,7 +231,11 @@ if "df_original" in st.session_state:
         )
 
         if edited_df is None:
-            edited_df = df_render.copy()
+            edited_df = st.session_state["df_render"].copy()
+
+        if edited_df is not None:
+            st.session_state["df_render"] = edited_df.copy()
+            st.session_state["df_edited"] = edited_df.copy()
 
         if st.button("Сохранить изменения"):
             st.session_state["df_edited"] = edited_df.copy()
