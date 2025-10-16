@@ -192,17 +192,11 @@ if "df_original" in st.session_state:
 
         df_base = st.session_state["df_edited"].copy()
 
-        editor_state = st.session_state.get("editor_key_main")
-        if isinstance(editor_state, pd.DataFrame):
-            df_base = editor_state.copy()
-
         if "hint" not in df_base.columns:
             df_base["hint"] = ""
 
         cols_order = ["sku", "name", "attribute set", "hint", "created_at"]
         df_base = df_base[[col for col in cols_order if col in df_base.columns]]
-        st.session_state["df_edited"] = df_base.copy()
-
         options = list(attribute_sets.keys())
         options.extend(
             name
