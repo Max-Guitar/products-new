@@ -882,55 +882,55 @@ if "df_original" in st.session_state:
                                         )
                                         edited_copy = updated_df.copy(deep=True)
 
-                                            editable_columns = entry.get(
-                                                "editable_columns", []
-                                            )
-                                            storage_df_original = entry.get(
-                                                "storage_df_original",
-                                                entry.get("storage_df", pd.DataFrame()),
-                                            )
-                                            if isinstance(
-                                                storage_df_original, pd.DataFrame
-                                            ):
-                                                original_storage = storage_df_original.copy(
-                                                    deep=True
-                                                )
-                                            else:
-                                                original_storage = pd.DataFrame()
-                                            label_to_id = entry.get(
-                                                "category_label_to_id", {}
-                                            )
-                                            multiselect_columns = entry.get(
-                                                "multiselect_columns", []
-                                            )
-
-                                            edited_storage = _convert_df_for_storage(
-                                                edited_copy,
-                                                label_to_id,
-                                                multiselect_columns,
-                                            )
-                                            entry["storage_df"] = edited_storage.copy(
+                                        editable_columns = entry.get(
+                                            "editable_columns", []
+                                        )
+                                        storage_df_original = entry.get(
+                                            "storage_df_original",
+                                            entry.get("storage_df", pd.DataFrame()),
+                                        )
+                                        if isinstance(
+                                            storage_df_original, pd.DataFrame
+                                        ):
+                                            original_storage = storage_df_original.copy(
                                                 deep=True
                                             )
+                                        else:
+                                            original_storage = pd.DataFrame()
+                                        label_to_id = entry.get(
+                                            "category_label_to_id", {}
+                                        )
+                                        multiselect_columns = entry.get(
+                                            "multiselect_columns", []
+                                        )
 
-                                            changes_store = step2_edits.setdefault(
-                                                "_changes", {}
-                                            )
-                                            _update_step2_edits(
-                                                changes_store,
-                                                original_storage,
-                                                edited_storage,
-                                                editable_columns,
-                                            )
+                                        edited_storage = _convert_df_for_storage(
+                                            edited_copy,
+                                            label_to_id,
+                                            multiselect_columns,
+                                        )
+                                        entry["storage_df"] = edited_storage.copy(
+                                            deep=True
+                                        )
 
-                                            if "_changes" in step2_edits:
-                                                step2_edits["_changes"] = {
-                                                    sku: values
-                                                    for sku, values in step2_edits[
-                                                        "_changes"
-                                                    ].items()
-                                                    if values
-                                                }
+                                        changes_store = step2_edits.setdefault(
+                                            "_changes", {}
+                                        )
+                                        _update_step2_edits(
+                                            changes_store,
+                                            original_storage,
+                                            edited_storage,
+                                            editable_columns,
+                                        )
+
+                                        if "_changes" in step2_edits:
+                                            step2_edits["_changes"] = {
+                                                sku: values
+                                                for sku, values in step2_edits[
+                                                    "_changes"
+                                                ].items()
+                                                if values
+                                            }
         else:
             st.info("Нет изменённых товаров.")
 else:
