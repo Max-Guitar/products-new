@@ -31,6 +31,11 @@ from services.inventory import (
 )
 from utils.http import get_session
 
+try:  # pragma: no cover - optional integration hook
+    from services.attributes import apply_product_update  # type: ignore
+except ImportError:  # pragma: no cover - optional integration hook
+    apply_product_update = None
+
 
 _DEF_ATTR_SET_NAME = "Default"
 _ALLOWED_TYPES = {"simple", "configurable"}
@@ -313,13 +318,159 @@ def _build_column_config(column_order, column_meta):
             if options:
                 preview = ", ".join(options[:5])
                 help_parts.append(f"Options include: {preview}")
-            config[column] = st.column_config.Column(
+            config[column] = st.column_config.TextColumn(
                 label=label,
                 help=". ".join(help_parts),
             )
         else:
             config[column] = st.column_config.TextColumn(label)
     return config
+
+
+def _build_step2_editor_key(attr_set_title: str, fallback: str = "") -> str:
+    base = attr_set_title if attr_set_title else fallback or "unknown"
+    return f"step2_editor::{base}"
+
+
+def _format_diff_display_value(value) -> str:
+    if isinstance(value, bool):
+        return "True" if value else "False"
+    if isinstance(value, (list, tuple, set)):
+        parts = [str(item).strip() for item in value if str(item).strip()]
+        return ", ".join(parts)
+    if value is None:
+        return ""
+    if isinstance(value, float) and pd.isna(value):
+        return ""
+    return str(value)
+
+
+def _collect_step2_payload(step2_edits: dict, allowed_skus: set[str] | None = None) -> dict[str, dict]:
+    changes = step2_edits.get("_changes", {}) if isinstance(step2_edits, dict) else {}
+    if not changes:
+        return {}
+    if allowed_skus is None:
+        return {sku: payload.copy() for sku, payload in changes.items() if payload}
+    allowed = set(str(sku).strip() for sku in allowed_skus if str(sku).strip())
+    return {
+        sku: payload.copy()
+        for sku, payload in changes.items()
+        if payload and sku in allowed
+    }
+
+
+def _build_step2_diff(
+    payload: dict[str, dict], tables: list[dict] | None = None
+) -> pd.DataFrame:
+    if not payload:
+        return pd.DataFrame(columns=["SKU", "Attribute", "Original", "Edited"])
+
+    tables = tables or []
+    originals: dict[str, dict] = {}
+    for entry in tables:
+        storage_df = entry.get("storage_df_original")
+        if not isinstance(storage_df, pd.DataFrame) or storage_df.empty:
+            continue
+        storage_idx = storage_df.set_index("sku")
+        for sku, row in storage_idx.iterrows():
+            originals.setdefault(sku, {})
+            originals[sku].update(row.to_dict())
+
+    diff_rows = []
+    for sku, changes in payload.items():
+        original_row = originals.get(sku, {})
+        for column, new_value in changes.items():
+            old_value = original_row.get(column)
+            diff_rows.append(
+                {
+                    "SKU": sku,
+                    "Attribute": column,
+                    "Original": _format_diff_display_value(old_value),
+                    "Edited": _format_diff_display_value(new_value),
+                }
+            )
+    if not diff_rows:
+        return pd.DataFrame(columns=["SKU", "Attribute", "Original", "Edited"])
+    return pd.DataFrame(diff_rows)
+
+
+def _highlight_step2_dataframe(df: pd.DataFrame, highlights: dict[str, set[str]]):
+    if not isinstance(df, pd.DataFrame) or not highlights:
+        return df
+
+    def _style(_: pd.DataFrame) -> pd.DataFrame:
+        styles = pd.DataFrame("", index=df.index, columns=df.columns)
+        if "sku" not in df.columns:
+            return styles
+        for idx, sku in df["sku"].items():
+            changed_cols = highlights.get(sku, set())
+            for column in changed_cols:
+                if column in styles.columns:
+                    styles.at[idx, column] = "background-color: #e6ffe6"
+        return styles
+
+    return df.style.apply(_style, axis=None)
+
+
+def _handle_apply_step2_changes(
+    session,
+    base_url: str,
+    allowed_skus: set[str] | None = None,
+) -> None:
+    step2_edits = st.session_state.get("step2_edits", {})
+    payload = _collect_step2_payload(step2_edits, allowed_skus)
+
+    if not payload:
+        st.info("Нет изменений для применения.")
+        return
+
+    diff_df = _build_step2_diff(payload, st.session_state.get("step2_tables", []))
+    with st.expander("Preview attribute diff", expanded=True):
+        if not diff_df.empty:
+            st.dataframe(diff_df, use_container_width=True, hide_index=True)
+        st.json(payload)
+
+    success = False
+    if callable(apply_product_update):
+        try:
+            with st.spinner("Applying attribute updates…"):
+                apply_product_update(session=session, base_url=base_url, payload=payload)  # type: ignore[misc]
+            success = True
+        except Exception as exc:  # pragma: no cover - UI interaction
+            st.error(f"Failed to apply attribute updates: {exc}")
+    else:
+        st.warning("TODO: hook up apply_product_update service.")
+
+    if not success:
+        return
+
+    st.success("Attribute updates applied.")
+    highlight_map = {
+        sku: set(changes.keys()) for sku, changes in payload.items() if changes
+    }
+    st.session_state["step2_recent_updates"] = highlight_map
+    changes_store = st.session_state.setdefault("step2_edits", {}).setdefault(
+        "_changes", {}
+    )
+    for sku in payload:
+        changes_store.pop(sku, None)
+
+    st.session_state["step2_force_rebuild"] = True
+
+    editor_prefixes = ("step2_editor::", "step2_editor_")
+    keys_to_clear = [
+        key
+        for key in list(st.session_state.keys())
+        if any(key.startswith(prefix) for prefix in editor_prefixes)
+    ]
+    for key in keys_to_clear:
+        st.session_state.pop(key, None)
+        st.session_state.pop(f"{key}__data", None)
+        st.session_state.pop(f"{key}__original", None)
+
+    st.session_state.pop("step2_tables", None)
+
+    st.experimental_rerun()
 
 
 def _update_step2_edits(step2_edits, original_df, edited_df, editable_columns):
@@ -488,7 +639,7 @@ def _prepare_step2_tables(
             preview = ", ".join(category_labels[:5])
             category_help += f". Examples: {preview}"
         if "categories" in column_order:
-            column_config["categories"] = st.column_config.Column(
+            column_config["categories"] = st.column_config.TextColumn(
                 "Categories",
                 help=category_help,
             )
@@ -510,7 +661,6 @@ def _prepare_step2_tables(
 
         tables.append(
             {
-                "id": f"table::{attr_title}",
                 "title": attr_title,
                 "display_title": _format_attr_set_title(attr_title),
                 "data": display_df,
@@ -521,6 +671,7 @@ def _prepare_step2_tables(
                 "editable_columns": editable_columns,
                 "category_label_to_id": label_to_id,
                 "multiselect_columns": multiselect_columns,
+                "skus": df_table["sku"].tolist(),
             }
         )
 
@@ -731,6 +882,7 @@ if "df_original" in st.session_state:
             st.session_state["show_attributes_trigger"] = True
             show_attributes_clicked = True
 
+
         trigger = st.session_state.get("show_attributes_trigger", False)
         if trigger or show_attributes_clicked:
             if "df_edited" not in st.session_state:
@@ -774,25 +926,24 @@ if "df_original" in st.session_state:
                                     st.session_state["ai_api_base"] = api_base
                                 if not attr_sets_map and api_base:
                                     with st.spinner("📚 Загрузка attribute sets…"):
-                                        attr_sets_map = get_attribute_sets_map(
-                                            session, api_base
-                                        )
+                                        attr_sets_map = get_attribute_sets_map(session, api_base)
                                     st.session_state["ai_attr_sets_map"] = attr_sets_map
                             except Exception as exc:  # pragma: no cover - UI interaction
-                                st.warning(
-                                    f"Не удалось подготовить подключение к Magento: {exc}"
-                                )
+                                st.warning(f"Не удалось подготовить подключение к Magento: {exc}")
                                 setup_failed = True
 
                             if setup_failed or not api_base or not attr_sets_map:
                                 st.session_state["show_attributes_trigger"] = False
                             else:
-                                need_rebuild = show_attributes_clicked or not st.session_state.get(
-                                    "step2_tables"
+                                force_rebuild = st.session_state.pop("step2_force_rebuild", False)
+                                need_rebuild = (
+                                    show_attributes_clicked
+                                    or force_rebuild
+                                    or not st.session_state.get("step2_tables")
                                 )
                                 if need_rebuild:
                                     categories_options = st.session_state.get(
-                                        "step2_category_options"
+                                        "step2_category_options",
                                     )
                                     if not categories_options:
                                         try:
@@ -820,14 +971,20 @@ if "df_original" in st.session_state:
                                         categories_options,
                                     )
                                     st.session_state["step2_tables"] = tables
-                                    st.session_state["step2_edits"] = {}
+                                    st.session_state["step2_edits"] = {"_changes": {}}
+                                    editor_prefixes = ("step2_editor::", "step2_editor_")
                                     editor_keys_to_clear = [
                                         key
                                         for key in list(st.session_state.keys())
-                                        if key.startswith("step2_editor_")
+                                        if any(
+                                            key.startswith(prefix)
+                                            for prefix in editor_prefixes
+                                        )
                                     ]
                                     for editor_key in editor_keys_to_clear:
                                         st.session_state.pop(editor_key, None)
+                                        st.session_state.pop(f"{editor_key}__data", None)
+                                        st.session_state.pop(f"{editor_key}__original", None)
                                     st.session_state.pop("editor_state", None)
 
                                 tables = st.session_state.get("step2_tables", [])
@@ -837,35 +994,93 @@ if "df_original" in st.session_state:
                                     step2_edits = st.session_state.setdefault(
                                         "step2_edits", {}
                                     )
-                                    for idx, entry in enumerate(tables):
-                                        attr_title = entry.get("display_title")
-                                        if not attr_title:
-                                            attr_title = _format_attr_set_title(
-                                                entry.get("title", "—")
-                                            )
-                                        st.subheader(attr_title)
+                                    changes_store = step2_edits.setdefault("_changes", {})
+                                    highlight_map_raw = st.session_state.get(
+                                        "step2_recent_updates", {}
+                                    )
+                                    highlight_map = {
+                                        sku: set(columns)
+                                        for sku, columns in highlight_map_raw.items()
+                                        if columns
+                                    }
 
-                                        entry_id = entry.get("id")
+                                    apply_all_disabled = not bool(changes_store)
+                                    if st.button(
+                                        "Apply all changes",
+                                        type="primary",
+                                        disabled=apply_all_disabled,
+                                        key="step2_apply_all",
+                                    ):
+                                        _handle_apply_step2_changes(session, base_url)
+
+                                    used_editor_keys: set[str] = set()
+
+                                    for idx, entry in enumerate(tables):
+                                        raw_title = entry.get("title", "—")
+                                        display_title = entry.get("display_title") or _format_attr_set_title(
+                                            raw_title
+                                        )
+                                        st.subheader(display_title)
+
+                                        editor_key = _build_step2_editor_key(
+                                            raw_title, fallback=f"set-{idx}"
+                                        )
+                                        while editor_key in used_editor_keys:
+                                            editor_key = _build_step2_editor_key(
+                                                f"{raw_title}-{idx}",
+                                                fallback=f"set-{idx}",
+                                            )
+                                        used_editor_keys.add(editor_key)
+
+                                        data_state_key = f"{editor_key}__data"
+                                        original_state_key = f"{editor_key}__original"
+
                                         base_df = entry.get("data")
                                         if not isinstance(base_df, pd.DataFrame):
                                             base_df = pd.DataFrame()
 
-                                        column_config = entry.get("column_config", {})
-                                        column_order = entry.get("column_order")
-                                        unique_id = entry_id or f"table::{idx}"
-                                        editor_key = f"step2_editor_{unique_id}"
+                                        if data_state_key not in st.session_state:
+                                            st.session_state[data_state_key] = base_df.copy(
+                                                deep=True
+                                            )
+                                        if original_state_key not in st.session_state:
+                                            storage_df_original = entry.get(
+                                                "storage_df_original", pd.DataFrame()
+                                            )
+                                            if isinstance(storage_df_original, pd.DataFrame):
+                                                st.session_state[original_state_key] = (
+                                                    storage_df_original.copy(deep=True)
+                                                )
+                                            else:
+                                                st.session_state[original_state_key] = (
+                                                    pd.DataFrame()
+                                                )
 
-                                        state_key = f"{editor_key}__data"
-
-                                        if state_key not in st.session_state:
-                                            st.session_state[state_key] = (
-                                                base_df.copy(deep=True)
+                                        current_df = st.session_state.get(
+                                            data_state_key, base_df.copy(deep=True)
+                                        )
+                                        if not isinstance(current_df, pd.DataFrame):
+                                            current_df = base_df.copy(deep=True)
+                                            st.session_state[data_state_key] = current_df.copy(
+                                                deep=True
                                             )
 
-                                        current_df = st.session_state[state_key]
+                                        display_df = current_df.copy(deep=True)
+                                        table_highlight = {
+                                            sku: highlight_map.get(sku, set())
+                                            for sku in entry.get("skus", [])
+                                            if highlight_map.get(sku)
+                                        }
+                                        if table_highlight:
+                                            display_df = _highlight_step2_dataframe(
+                                                display_df, table_highlight
+                                            )
+
+                                        column_config = entry.get("column_config", {})
+                                        column_order = entry.get("column_order")
 
                                         edited_df = st.data_editor(
-                                            data=current_df,
+                                            data=display_df,
                                             column_config=column_config,
                                             column_order=column_order,
                                             use_container_width=True,
@@ -875,50 +1090,56 @@ if "df_original" in st.session_state:
                                         )
 
                                         if isinstance(edited_df, pd.DataFrame):
-                                            st.session_state[state_key] = edited_df.copy(
+                                            st.session_state[data_state_key] = edited_df.copy(
                                                 deep=True
                                             )
-
-                                        current_df = st.session_state[state_key]
-                                        edited_copy = current_df.copy(deep=True)
-
-                                        editable_columns = entry.get(
-                                            "editable_columns", []
-                                        )
-                                        storage_df_original = entry.get(
-                                            "storage_df_original",
-                                            entry.get("storage_df", pd.DataFrame()),
-                                        )
-                                        if isinstance(
-                                            storage_df_original, pd.DataFrame
-                                        ):
-                                            original_storage = storage_df_original.copy(
-                                                deep=True
-                                            )
+                                            current_df = st.session_state[data_state_key]
                                         else:
-                                            original_storage = pd.DataFrame()
+                                            edited_df = current_df.copy(deep=True)
+
                                         label_to_id = entry.get(
                                             "category_label_to_id", {}
                                         )
                                         multiselect_columns = entry.get(
                                             "multiselect_columns", []
                                         )
+                                        editable_columns = entry.get(
+                                            "editable_columns", []
+                                        )
 
                                         edited_storage = _convert_df_for_storage(
-                                            edited_copy,
+                                            st.session_state[data_state_key].copy(
+                                                deep=True
+                                            ),
                                             label_to_id,
                                             multiselect_columns,
                                         )
+
+                                        original_storage = st.session_state.get(
+                                            original_state_key
+                                        )
+                                        if not isinstance(original_storage, pd.DataFrame):
+                                            original_storage = entry.get(
+                                                "storage_df_original", pd.DataFrame()
+                                            )
+                                            if isinstance(original_storage, pd.DataFrame):
+                                                st.session_state[original_state_key] = (
+                                                    original_storage.copy(deep=True)
+                                                )
                                         entry["storage_df"] = edited_storage.copy(
                                             deep=True
                                         )
 
-                                        changes_store = step2_edits.setdefault(
-                                            "_changes", {}
-                                        )
+                                        if isinstance(original_storage, pd.DataFrame):
+                                            original_for_diff = original_storage.copy(
+                                                deep=True
+                                            )
+                                        else:
+                                            original_for_diff = pd.DataFrame()
+
                                         _update_step2_edits(
                                             changes_store,
-                                            original_storage,
+                                            original_for_diff,
                                             edited_storage,
                                             editable_columns,
                                         )
@@ -931,6 +1152,27 @@ if "df_original" in st.session_state:
                                                 ].items()
                                                 if values
                                             }
+
+                                        table_skus = {
+                                            str(sku).strip()
+                                            for sku in entry.get("skus", [])
+                                            if str(sku).strip()
+                                        }
+                                        table_has_changes = any(
+                                            sku in changes_store for sku in table_skus
+                                        )
+                                        if st.button(
+                                            "Apply attribute edits",
+                                            type="primary",
+                                            key=f"{editor_key}__apply",
+                                            disabled=not table_has_changes,
+                                        ):
+                                            _handle_apply_step2_changes(
+                                                session, base_url, table_skus
+                                            )
+
+                                    if highlight_map:
+                                        st.session_state["step2_recent_updates"] = {}
         else:
             st.info("Нет изменённых товаров.")
 else:
