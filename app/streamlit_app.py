@@ -227,9 +227,9 @@ if "df_original" in st.session_state:
             key="editor_key_main",
         )
 
-        if isinstance(edited_df, pd.DataFrame):
-            st.session_state["df_edited"] = edited_df.copy(deep=True)
-            st.session_state["df_original"] = edited_df.copy(deep=True)
+        if edited_df is not None:
+            st.session_state["df_edited"] = edited_df.copy()
+            st.session_state["df_original"] = edited_df.copy()
 else:
     st.info("Нажми **Load items** для загрузки и отображения товаров.")
 
