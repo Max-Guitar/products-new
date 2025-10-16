@@ -17,9 +17,9 @@ from services.ai_fill import (
     get_attribute_meta,
     get_attribute_sets_map,
     get_product_by_sku,
+    list_categories,
     probe_api_base,
 )
-from services.attributes import build_attributes_table_for_sku
 from services.inventory import (
     get_attr_set_id,
     get_backorders_parallel,
@@ -33,6 +33,18 @@ from utils.http import get_session
 
 _DEF_ATTR_SET_NAME = "Default"
 _ALLOWED_TYPES = {"simple", "configurable"}
+
+
+_ATTRIBUTE_SET_ICONS = {
+    "Accessories": "🧩",
+    "Acoustic guitar": "🎻",
+    "Amps": "🎚️",
+    "Bass Guitar": "🎸",
+    "Default": "🧾",
+    "Effects": "🎛️",
+    "Electric guitar": "🎸",
+}
+_DEFAULT_ATTRIBUTE_ICON = "🧩"
 
 
 def _get_custom_attr_value(item: dict, code: str, default=None):
@@ -68,6 +80,96 @@ def _meta_options(meta: dict) -> list:
             seen.add(item)
             unique.append(item)
     return unique
+
+
+def _attr_set_icon(name: str) -> str:
+    if not isinstance(name, str) or not name.strip():
+        return _DEFAULT_ATTRIBUTE_ICON
+    return _ATTRIBUTE_SET_ICONS.get(name.strip(), _DEFAULT_ATTRIBUTE_ICON)
+
+
+def _format_attr_set_title(name: str) -> str:
+    clean_name = name.strip() if isinstance(name, str) and name.strip() else "—"
+    icon = _attr_set_icon(clean_name)
+    return f"{icon} {clean_name}"
+
+
+def _format_category_label(name: str, cat_id: str) -> str:
+    base = name.strip() if isinstance(name, str) and name.strip() else ""
+    if not base:
+        return f"#{cat_id}"
+    return f"{base} (#{cat_id})"
+
+
+def _prepare_category_options(raw_categories: list[dict]) -> list[dict]:
+    prepared = []
+    seen_labels = set()
+    for item in raw_categories:
+        cat_id = str(item.get("id", "")).strip()
+        if not cat_id:
+            continue
+        name = str(item.get("name", "")).strip()
+        label = _format_category_label(name, cat_id)
+        if label in seen_labels:
+            label = f"{label}#{cat_id}"
+        seen_labels.add(label)
+        prepared.append({"id": cat_id, "name": name or label, "label": label})
+    prepared.sort(key=lambda x: (x["name"].lower(), x["id"]))
+    return prepared
+
+
+def _categories_ids_to_labels(values, id_to_label: dict[str, str]) -> list[str]:
+    if isinstance(values, (list, tuple, set)):
+        raw_values = list(values)
+    elif values in (None, ""):
+        raw_values = []
+    else:
+        raw_values = [values]
+
+    labels = []
+    for value in raw_values:
+        cat_id = str(value).strip()
+        if not cat_id:
+            continue
+        label = id_to_label.get(cat_id, _format_category_label("", cat_id))
+        if label not in labels:
+            labels.append(label)
+    return labels
+
+
+def _categories_labels_to_ids(values, label_to_id: dict[str, str]) -> list[str]:
+    if isinstance(values, (list, tuple, set)):
+        raw_values = list(values)
+    elif values in (None, ""):
+        raw_values = []
+    else:
+        raw_values = [values]
+
+    ids = []
+    for value in raw_values:
+        label = str(value).strip()
+        if not label:
+            continue
+        if label in label_to_id:
+            cat_id = label_to_id[label]
+        elif label.startswith("#"):
+            cat_id = label.lstrip("#")
+        else:
+            cat_id = label
+        if cat_id not in ids:
+            ids.append(cat_id)
+    return ids
+
+
+def _convert_df_for_storage(df: pd.DataFrame, label_to_id: dict[str, str]) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame):
+        return pd.DataFrame()
+    storage = df.copy(deep=True)
+    if "categories" in storage.columns:
+        storage["categories"] = storage["categories"].apply(
+            lambda values: _categories_labels_to_ids(values, label_to_id)
+        )
+    return storage
 
 
 def _value_for_editor(attr_row: dict, meta: dict):
@@ -216,10 +318,21 @@ def _update_step2_edits(step2_edits, original_df, edited_df, editable_columns):
             step2_edits.pop(sku, None)
 
 
-def _prepare_step2_tables(df_changed, session, api_base, attribute_sets, attr_sets_map):
+def _prepare_step2_tables(
+    df_changed,
+    session,
+    api_base,
+    attribute_sets,
+    attr_sets_map,
+    category_options,
+):
     tables = []
     core_codes = ["sku", "name", "brand", "condition"]
     meta_cache = {}
+
+    id_to_label = {item["id"]: item["label"] for item in category_options}
+    label_to_id = {item["label"]: item["id"] for item in category_options}
+    category_labels = [item["label"] for item in category_options]
 
     grouped = df_changed.groupby("attribute set", dropna=False)
     for attr_set_value, group in grouped:
@@ -289,6 +402,16 @@ def _prepare_step2_tables(df_changed, session, api_base, attribute_sets, attr_se
                 row_data[code] = value
                 attr_codes_seen.add(code)
 
+            category_links = (
+                (product.get("extension_attributes") or {}).get("category_links") or []
+            )
+            categories = [
+                str(link.get("category_id", "")).strip()
+                for link in category_links
+                if str(link.get("category_id", "")).strip()
+            ]
+            row_data["categories"] = _categories_ids_to_labels(categories, id_to_label)
+
             rows.append(row_data)
 
         if not rows:
@@ -306,29 +429,44 @@ def _prepare_step2_tables(df_changed, session, api_base, attribute_sets, attr_se
             if code not in df_table.columns:
                 df_table[code] = ""
 
+        if "categories" not in df_table.columns:
+            df_table["categories"] = [[] for _ in range(len(df_table))]
+
         other_columns = sorted(
             code
             for code in set(column_meta.keys()) | attr_codes_seen
-            if code not in {"brand", "condition", "sku", "name"}
+            if code not in {"brand", "condition", "sku", "name", "categories"}
         )
 
         column_order = [col for col in core_codes if col in df_table.columns]
         column_order.extend([col for col in other_columns if col in df_table.columns])
+        if "categories" in df_table.columns:
+            column_order.append("categories")
 
         df_table = df_table[column_order]
 
         column_meta_with_base = {code: column_meta.get(code, {}) for code in column_order}
         column_config = _build_column_config(column_order, column_meta_with_base)
+        if "categories" in column_order:
+            column_config["categories"] = st.column_config.MultiSelectColumn(
+                "Categories",
+                options=category_labels,
+                required=False,
+            )
         editable_columns = [col for col in column_order if col not in {"sku", "name"}]
+
+        storage_df = _convert_df_for_storage(df_table, label_to_id)
 
         tables.append(
             {
                 "title": attr_title,
+                "display_title": _format_attr_set_title(attr_title),
                 "data": df_table,
-                "original_df": df_table.copy(deep=True),
+                "storage_df": storage_df,
                 "column_config": column_config,
                 "column_order": column_order,
                 "editable_columns": editable_columns,
+                "category_label_to_id": label_to_id,
             }
         )
 
@@ -534,7 +672,7 @@ if "df_original" in st.session_state:
         st.markdown("### Step 2. Items with updated attribute sets")
 
         show_attributes_clicked = False
-        if isinstance(edited_df, pd.DataFrame) and st.button("➡️ Show Attributes"):
+        if isinstance(edited_df, pd.DataFrame) and st.button("Show Attributes"):
             st.session_state["df_edited"] = edited_df.copy()
             st.session_state["show_attributes_trigger"] = True
             show_attributes_clicked = True
@@ -599,12 +737,33 @@ if "df_original" in st.session_state:
                                     "step2_tables"
                                 )
                                 if need_rebuild:
+                                    categories_options = st.session_state.get(
+                                        "step2_category_options"
+                                    )
+                                    if not categories_options:
+                                        try:
+                                            with st.spinner("📂 Загрузка категорий…"):
+                                                raw_categories = list_categories(
+                                                    session, api_base
+                                                )
+                                            categories_options = _prepare_category_options(
+                                                raw_categories
+                                            )
+                                        except Exception as exc:  # pragma: no cover - UI interaction
+                                            st.warning(
+                                                f"Не удалось загрузить категории: {exc}"
+                                            )
+                                            categories_options = []
+                                        st.session_state[
+                                            "step2_category_options"
+                                        ] = categories_options
                                     tables = _prepare_step2_tables(
                                         df_changed,
                                         session,
                                         api_base,
                                         attribute_sets,
                                         attr_sets_map,
+                                        categories_options,
                                     )
                                     st.session_state["step2_tables"] = tables
                                     st.session_state["step2_edits"] = {}
@@ -617,8 +776,12 @@ if "df_original" in st.session_state:
                                         "step2_edits", {}
                                     )
                                     for idx, entry in enumerate(tables):
-                                        attr_title = entry.get("title", "—")
-                                        st.subheader(f"Attribute Set: {attr_title}")
+                                        attr_title = entry.get("display_title")
+                                        if not attr_title:
+                                            attr_title = _format_attr_set_title(
+                                                entry.get("title", "—")
+                                            )
+                                        st.subheader(attr_title)
 
                                         base_df = entry.get("data")
                                         if isinstance(base_df, pd.DataFrame):
@@ -640,40 +803,37 @@ if "df_original" in st.session_state:
                                         )
 
                                         if isinstance(edited_df, pd.DataFrame):
-                                            _update_step2_edits(
-                                                step2_edits,
-                                                entry.get("original_df", pd.DataFrame()),
-                                                edited_df,
-                                                entry.get("editable_columns", []),
-                                            )
                                             entry["data"] = edited_df.copy(deep=True)
-
-                                    st.session_state["step2_edits"] = {
-                                        sku: values
-                                        for sku, values in step2_edits.items()
-                                        if values
-                                    }
+                                        save_key = f"step2_save_{idx}_{entry.get('title','')}"
+                                        if st.button("💾 Save", key=save_key):
+                                            if isinstance(edited_df, pd.DataFrame):
+                                                editable_columns = entry.get(
+                                                    "editable_columns", []
+                                                )
+                                                storage_df = entry.get(
+                                                    "storage_df", pd.DataFrame()
+                                                )
+                                                label_to_id = entry.get(
+                                                    "category_label_to_id", {}
+                                                )
+                                                edited_storage = _convert_df_for_storage(
+                                                    edited_df, label_to_id
+                                                )
+                                                _update_step2_edits(
+                                                    step2_edits,
+                                                    storage_df,
+                                                    edited_storage,
+                                                    editable_columns,
+                                                )
+                                                entry["storage_df"] = edited_storage.copy(
+                                                    deep=True
+                                                )
+                                                st.session_state["step2_edits"] = {
+                                                    sku: values
+                                                    for sku, values in step2_edits.items()
+                                                    if values
+                                                }
         else:
             st.info("Нет изменённых товаров.")
 else:
     st.info("Нажми **Load items** для загрузки и отображения товаров.")
-
-st.divider()
-st.header("Attributes lookup", anchor="attributes")
-sku = st.text_input("SKU", placeholder="Enter product SKU")
-include_empty = st.checkbox("Include empty attributes", value=False)
-
-if st.button("Show attributes"):
-    if not sku:
-        st.warning("Please enter a SKU value first.")
-    else:
-        try:
-            df_attrs = build_attributes_table_for_sku(
-                session, base_url, sku.strip(), include_empty=include_empty
-            )
-            if df_attrs.empty:
-                st.info("No attributes to display for the provided SKU.")
-            else:
-                st.dataframe(df_attrs, use_container_width=True)
-        except Exception as exc:  # pragma: no cover - UI error handling
-            st.error(f"Error: {exc}")

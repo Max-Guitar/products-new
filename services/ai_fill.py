@@ -225,6 +225,42 @@ def get_attribute_meta(session: requests.Session, api_base: str, code: str) -> d
     return _meta_cache[code]
 
 
+def list_categories(session: requests.Session, api_base: str) -> List[Dict[str, str]]:
+    """Return Magento categories as a flat, alphabetically sorted list."""
+
+    url = _build_url(api_base, "/categories")
+    try:
+        resp = session.get(url, timeout=30)
+    except requests.RequestException as exc:
+        raise RuntimeError("❌ Не удалось загрузить категории.") from exc
+
+    content_type = resp.headers.get("Content-Type", "").lower()
+    if not resp.ok or ("json" not in content_type and not _looks_like_json(resp.text)):
+        raise RuntimeError(
+            f"Magento API error {resp.status_code}: {resp.text[:300]}"
+        )
+
+    payload = resp.json() or {}
+    items: List[Dict[str, str]] = []
+
+    def _walk(node: Optional[Dict[str, object]]):
+        if not isinstance(node, dict):
+            return
+        cat_id = node.get("id")
+        name = node.get("name")
+        if cat_id not in (None, "") and isinstance(name, str) and name.strip():
+            items.append({"id": str(cat_id), "name": name.strip()})
+        for child in node.get("children_data", []) or []:
+            _walk(child)
+
+    _walk(payload)
+
+    def _sort_key(item: Dict[str, str]):
+        return (item.get("name", "").lower(), item.get("id", ""))
+
+    return sorted(items, key=_sort_key)
+
+
 def option_label_for(session: requests.Session, api_base: str, code: str, raw_value) -> Tuple[Optional[str], Optional[str]]:
     meta = get_attribute_meta(session, api_base, code) or {}
     frontend_input = (meta.get("frontend_input") or "").lower()
