@@ -861,6 +861,7 @@ if "df_original" in st.session_state:
                                             )
 
                                         edited_df = st.data_editor(
+                                            data=st.session_state[editor_key],
                                             column_config=column_config,
                                             column_order=column_order,
                                             use_container_width=True,
