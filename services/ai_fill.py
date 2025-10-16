@@ -10,6 +10,7 @@ from urllib.parse import quote
 
 import pandas as pd
 import requests
+from IPython.display import HTML, display
 
 
 ALWAYS_ATTRS: Set[str] = {"brand", "country_of_manufacture", "short_description"}
@@ -294,8 +295,11 @@ def collect_attributes_table(
     return df
 
 
-def _strip_html(value: Optional[str]) -> str:
-    return re.sub(r"<[^>]+>", "", value or "")
+def _strip_html(value: Optional[object]) -> str:
+    try:
+        return re.sub(r"<[^>]+>", "", str(value or "")).strip()
+    except Exception:
+        return ""
 
 
 def _openai_complete(
@@ -378,36 +382,40 @@ def infer_missing(
     return pd.DataFrame(completion.get("attributes", []))
 
 
-def _first_sentence(value: Optional[str]) -> str:
-    text = _strip_html(value or "").strip()
+def _first_sentence(value: Optional[object]) -> str:
+    text = _strip_html(value)
     match = re.search(r"([^.?!]*[.?!])", text)
     if match:
         text = match.group(1).strip()
-    if len(text) > 200:
-        text = f"{text[:200]}…"
-    return text
+    return text[:200] + ("…" if len(text) > 200 else "")
 
 
-def show_scrollable_ai(df_full: pd.DataFrame, df_suggest: pd.DataFrame) -> str:
-    ai_values = {row["code"]: row.get("value") for _, row in df_suggest.iterrows()}
-    flattened: Dict[str, Optional[str]] = {}
-    for code in df_full.index:
-        flattened[code] = df_full.loc[code, "label"] or df_full.loc[code, "raw_value"]
-    flattened.update(ai_values)
+def show_scrollable_ai(df_full: pd.DataFrame, df_suggest: pd.DataFrame) -> Optional[str]:
+    ai = {r["code"]: r["value"] for _, r in df_suggest.iterrows()}
+    flattened = {
+        c: (df_full.loc[c, "label"] or df_full.loc[c, "raw_value"])
+        for c in df_full.index
+    }
+
+    flattened.update(ai)
     columns = list(flattened.keys())
-    headers_html = "".join(f"<th>{html.escape(col)}</th>" for col in columns)
-    cells: List[str] = []
+
+    ths = "".join(f"<th>{html.escape(c)}</th>" for c in columns)
+    tds: List[str] = []
     for code in columns:
-        value = _first_sentence(flattened.get(code))
-        marker = " 🤖" if code in ai_values else ""
-        style = "background:#fff7cc;" if code in ai_values else ""
-        cells.append(
-            f"<td style='{style}padding:6px 12px;border:1px solid #ddd;'>{html.escape(str(value))}{marker}</td>"
-        )
-    table_html = (
-        "<div style=\"overflow-x:auto;border:1px solid #ddd;border-radius:6px;\">"
-        "<table style=\"border-collapse:collapse;font-family:monospace;font-size:13px;\">"
-        f"<thead><tr>{headers_html}</tr></thead><tbody><tr>{''.join(cells)}</tr></tbody>"
-        "</table></div>"
-    )
-    return table_html
+        val = _first_sentence(flattened.get(code))
+        is_ai = code in ai
+        mark = " 🤖" if is_ai else ""
+        style = "background:#fff7cc;" if is_ai else ""
+        tds.append(f"<td style='{style}'>{html.escape(val)}{mark}</td>")
+
+    html_table = f"""
+    <div style="overflow-x:auto;border:1px solid #ddd;border-radius:6px;">
+    <table style="border-collapse:collapse;font-family:monospace;">
+      <thead><tr>{ths}</tr></thead>
+      <tbody><tr>{''.join(tds)}</tr></tbody>
+    </table>
+    </div>
+    """
+    display(HTML(html_table))
+    return html_table
