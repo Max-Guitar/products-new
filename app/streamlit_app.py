@@ -860,8 +860,12 @@ if "df_original" in st.session_state:
                                                 deep=True
                                             )
 
+                                        base_df_session = st.session_state[
+                                            editor_key
+                                        ].copy(deep=True)
+
                                         edited_df = st.data_editor(
-                                            st.session_state[editor_key],
+                                            base_df_session,
                                             column_config=column_config,
                                             column_order=column_order,
                                             use_container_width=True,
@@ -871,7 +875,14 @@ if "df_original" in st.session_state:
                                         )
 
                                         if isinstance(edited_df, pd.DataFrame):
-                                            edited_copy = edited_df.copy(deep=True)
+                                            updated_df = edited_df.copy(deep=True)
+                                        else:
+                                            updated_df = base_df_session.copy(deep=True)
+
+                                        st.session_state[editor_key] = updated_df.copy(
+                                            deep=True
+                                        )
+                                        edited_copy = updated_df.copy(deep=True)
 
                                             editable_columns = entry.get(
                                                 "editable_columns", []
