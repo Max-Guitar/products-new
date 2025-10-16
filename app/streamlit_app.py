@@ -157,6 +157,7 @@ if st.button("Load items", type="primary"):
                 f"Found {len(df_ui)} products (Default; qty>0 OR backorders=2)"
             )
             st.session_state["df_original"] = df_ui.copy()
+            st.session_state["df_original_snapshot"] = df_ui.copy()
             try:
                 attribute_sets = list_attribute_sets(session, base_url)
             except Exception as exc:  # pragma: no cover - UI error handling
@@ -175,6 +176,9 @@ if st.button("Load items", type="primary"):
 if "df_original" in st.session_state:
     df_ui = st.session_state["df_original"]
     attribute_sets = st.session_state.get("attribute_sets", {})
+
+    if "df_original_snapshot" not in st.session_state:
+        st.session_state["df_original_snapshot"] = df_ui.copy()
 
     if df_ui.empty:
         st.warning("No items match the Default set filter criteria.")
@@ -227,33 +231,62 @@ if "df_original" in st.session_state:
             key="editor_key_main",
         )
 
-        if isinstance(edited_df, pd.DataFrame) and st.button("💾 Сохранить изменения"):
-            st.session_state["df_edited"] = edited_df.copy()
-            st.success("Изменения сохранены.")
-
         st.markdown("### Step 2. Items with updated attribute sets")
-        if "df_edited" in st.session_state and "df_original" in st.session_state:
+
+        if isinstance(edited_df, pd.DataFrame) and st.button("➡️ Show Attributes"):
+            if "df_original" in st.session_state:
+                st.session_state["df_original_snapshot"] = st.session_state[
+                    "df_original"
+                ].copy()
+            st.session_state["df_edited"] = edited_df.copy()
+            st.session_state["df_original"] = edited_df.copy()
+            st.success("Changes registered.")
+
+        if (
+            "df_edited" in st.session_state
+            and "df_original" in st.session_state
+            and st.session_state.get("df_original_snapshot") is not None
+        ):
             df_new = st.session_state["df_edited"]
-            df_old = st.session_state["df_original"]
+            df_old = st.session_state.get("df_original_snapshot")
 
             required_cols = {"sku", "attribute set"}
             if required_cols.issubset(df_new.columns) and required_cols.issubset(
                 df_old.columns
             ):
-                new_attr = df_new.set_index("sku")["attribute set"]
-                old_attr = df_old.set_index("sku")["attribute set"]
-                aligned_index = new_attr.index.intersection(old_attr.index)
-                diff_mask = new_attr.loc[aligned_index] != old_attr.loc[aligned_index]
-                df_changed = (
-                    new_attr.loc[aligned_index][diff_mask]
-                    .rename("attribute set")
-                    .reset_index()
+                df_new_attr = df_new.set_index("sku")["attribute set"].to_frame(
+                    "attribute set_new"
                 )
+                df_old_attr = df_old.set_index("sku")["attribute set"].to_frame(
+                    "attribute set_old"
+                )
+                df_merged = df_new_attr.join(df_old_attr, how="inner")
+                df_changed = df_merged[df_merged["attribute set_new"] != df_merged["attribute set_old"]]
 
                 if df_changed.empty:
                     st.info("Нет изменённых товаров.")
                 else:
-                    st.dataframe(df_changed, use_container_width=True)
+                    df_changed = df_changed.reset_index()
+                    df_changed = df_changed.rename(
+                        columns={"attribute set_new": "attribute set"}
+                    )
+                    for attr_set_name in df_changed["attribute set"].dropna().unique():
+                        st.markdown(f"#### 🎯 Attribute Set: {attr_set_name}")
+                        st.dataframe(
+                            df_changed[df_changed["attribute set"] == attr_set_name][
+                                ["sku", "attribute set"]
+                            ],
+                            use_container_width=True,
+                        )
+
+                    if df_changed["attribute set"].isna().any():
+                        st.markdown("#### 🎯 Attribute Set: —")
+                        st.dataframe(
+                            df_changed[df_changed["attribute set"].isna()][
+                                ["sku", "attribute set"]
+                            ],
+                            use_container_width=True,
+                        )
             else:
                 st.info("Нет изменённых товаров.")
         else:
