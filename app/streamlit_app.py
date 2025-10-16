@@ -1,5 +1,6 @@
 from __future__ import annotations
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -137,13 +138,30 @@ def _categories_ids_to_labels(values, id_to_label: dict[str, str]) -> list[str]:
     return labels
 
 
-def _categories_labels_to_ids(values, label_to_id: dict[str, str]) -> list[str]:
+def _split_multiselect_input(values) -> list[str]:
     if isinstance(values, (list, tuple, set)):
-        raw_values = list(values)
+        iterable = [str(item).strip() for item in values]
+    elif isinstance(values, str):
+        iterable = [item.strip() for item in values.split(",")]
     elif values in (None, ""):
-        raw_values = []
+        iterable = []
+    elif isinstance(values, float) and pd.isna(values):
+        iterable = []
     else:
-        raw_values = [values]
+        iterable = [str(values).strip()]
+
+    return [item for item in iterable if item]
+
+
+def _format_multiselect_display_value(values) -> str:
+    parts = _split_multiselect_input(values)
+    if not parts:
+        return ""
+    return ", ".join(parts)
+
+
+def _categories_labels_to_ids(values, label_to_id: dict[str, str]) -> list[str]:
+    raw_values = _split_multiselect_input(values)
 
     ids = []
     for value in raw_values:
@@ -161,10 +179,20 @@ def _categories_labels_to_ids(values, label_to_id: dict[str, str]) -> list[str]:
     return ids
 
 
-def _convert_df_for_storage(df: pd.DataFrame, label_to_id: dict[str, str]) -> pd.DataFrame:
+def _convert_df_for_storage(
+    df: pd.DataFrame,
+    label_to_id: dict[str, str],
+    multiselect_columns: Iterable[str] | None = None,
+) -> pd.DataFrame:
     if not isinstance(df, pd.DataFrame):
         return pd.DataFrame()
     storage = df.copy(deep=True)
+
+    columns_to_process = set(multiselect_columns or [])
+    for column in columns_to_process:
+        if column in storage.columns and column != "categories":
+            storage[column] = storage[column].apply(_split_multiselect_input)
+
     if "categories" in storage.columns:
         storage["categories"] = storage["categories"].apply(
             lambda values: _categories_labels_to_ids(values, label_to_id)
@@ -281,10 +309,13 @@ def _build_column_config(column_order, column_meta):
                 required=False,
             )
         elif frontend_input == "multiselect":
-            config[column] = st.column_config.MultiSelectColumn(
+            help_parts = ["Comma-separated values"]
+            if options:
+                preview = ", ".join(options[:5])
+                help_parts.append(f"Options include: {preview}")
+            config[column] = st.column_config.Column(
                 label=label,
-                options=options,
-                required=False,
+                help=". ".join(help_parts),
             )
         else:
             config[column] = st.column_config.TextColumn(label)
@@ -447,26 +478,47 @@ def _prepare_step2_tables(
 
         column_meta_with_base = {code: column_meta.get(code, {}) for code in column_order}
         column_config = _build_column_config(column_order, column_meta_with_base)
+        multiselect_columns = [
+            column
+            for column, meta in column_meta_with_base.items()
+            if (meta.get("frontend_input") or "").lower() == "multiselect"
+        ]
+        category_help = "Comma-separated category labels"
+        if category_labels:
+            preview = ", ".join(category_labels[:5])
+            category_help += f". Examples: {preview}"
         if "categories" in column_order:
-            column_config["categories"] = st.column_config.MultiSelectColumn(
+            column_config["categories"] = st.column_config.Column(
                 "Categories",
-                options=category_labels,
-                required=False,
+                help=category_help,
+            )
+        display_df = df_table.copy(deep=True)
+        for column in multiselect_columns:
+            if column in display_df.columns:
+                display_df[column] = display_df[column].apply(
+                    _format_multiselect_display_value
+                )
+        if "categories" in display_df.columns:
+            display_df["categories"] = display_df["categories"].apply(
+                _format_multiselect_display_value
             )
         editable_columns = [col for col in column_order if col not in {"sku", "name"}]
 
-        storage_df = _convert_df_for_storage(df_table, label_to_id)
+        storage_df = _convert_df_for_storage(
+            df_table, label_to_id, multiselect_columns
+        )
 
         tables.append(
             {
                 "title": attr_title,
                 "display_title": _format_attr_set_title(attr_title),
-                "data": df_table,
+                "data": display_df,
                 "storage_df": storage_df,
                 "column_config": column_config,
                 "column_order": column_order,
                 "editable_columns": editable_columns,
                 "category_label_to_id": label_to_id,
+                "multiselect_columns": multiselect_columns,
             }
         )
 
@@ -816,8 +868,13 @@ if "df_original" in st.session_state:
                                                 label_to_id = entry.get(
                                                     "category_label_to_id", {}
                                                 )
+                                                multiselect_columns = entry.get(
+                                                    "multiselect_columns", []
+                                                )
                                                 edited_storage = _convert_df_for_storage(
-                                                    edited_df, label_to_id
+                                                    edited_df,
+                                                    label_to_id,
+                                                    multiselect_columns,
                                                 )
                                                 _update_step2_edits(
                                                     step2_edits,
