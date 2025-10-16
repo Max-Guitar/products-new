@@ -855,16 +855,10 @@ if "df_original" in st.session_state:
                                         unique_id = entry_id or f"table::{idx}"
                                         editor_key = f"step2_editor_{unique_id}"
 
-                                        saved_df = None
-                                        if entry_id is not None:
-                                            saved_df = step2_edits.get(entry_id)
-
                                         if editor_key not in st.session_state:
-                                            if isinstance(saved_df, pd.DataFrame):
-                                                source_df = saved_df.copy(deep=True)
-                                            else:
-                                                source_df = base_df.copy(deep=True)
-                                            st.session_state[editor_key] = source_df
+                                            st.session_state[editor_key] = base_df.copy(
+                                                deep=True
+                                            )
 
                                         edited_df = st.data_editor(
                                             st.session_state[editor_key],
@@ -878,7 +872,6 @@ if "df_original" in st.session_state:
 
                                         if isinstance(edited_df, pd.DataFrame):
                                             edited_copy = edited_df.copy(deep=True)
-                                            entry["data"] = edited_copy
 
                                             editable_columns = entry.get(
                                                 "editable_columns", []
@@ -920,9 +913,6 @@ if "df_original" in st.session_state:
                                                 edited_storage,
                                                 editable_columns,
                                             )
-
-                                            if entry_id is not None:
-                                                step2_edits[entry_id] = edited_copy
 
                                             if "_changes" in step2_edits:
                                                 step2_edits["_changes"] = {
