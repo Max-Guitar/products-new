@@ -515,6 +515,7 @@ def _prepare_step2_tables(
                 "display_title": _format_attr_set_title(attr_title),
                 "data": display_df,
                 "storage_df": storage_df,
+                "storage_df_original": storage_df.copy(deep=True),
                 "column_config": column_config,
                 "column_order": column_order,
                 "editable_columns": editable_columns,
@@ -820,6 +821,14 @@ if "df_original" in st.session_state:
                                     )
                                     st.session_state["step2_tables"] = tables
                                     st.session_state["step2_edits"] = {}
+                                    editor_keys_to_clear = [
+                                        key
+                                        for key in list(st.session_state.keys())
+                                        if key.startswith("step2_editor_")
+                                    ]
+                                    for editor_key in editor_keys_to_clear:
+                                        st.session_state.pop(editor_key, None)
+                                    st.session_state.pop("editor_state", None)
 
                                 tables = st.session_state.get("step2_tables", [])
                                 if not tables:
@@ -837,37 +846,28 @@ if "df_original" in st.session_state:
                                         st.subheader(attr_title)
 
                                         entry_id = entry.get("id")
-                                        # 👉 Синхронизировать сохранённые изменения из session_state
-                                        step2_saved = st.session_state.get(
-                                            "step2_edits", {}
-                                        )
-                                        saved_df = None
-                                        if entry_id is not None:
-                                            saved_df = step2_saved.get(entry_id)
-                                        if isinstance(saved_df, pd.DataFrame):
-                                            entry["data"] = saved_df.copy(deep=True)
-
                                         base_df = entry.get("data")
                                         if not isinstance(base_df, pd.DataFrame):
                                             base_df = pd.DataFrame()
 
                                         column_config = entry.get("column_config", {})
                                         column_order = entry.get("column_order")
-                                        editor_key = f"step2_editor_{idx}_{attr_title}"
+                                        unique_id = entry_id or f"table::{idx}"
+                                        editor_key = f"step2_editor_{unique_id}"
 
-                                        editor_state = st.session_state.setdefault(
-                                            "editor_state", {}
-                                        )
-                                        if (
-                                            editor_key not in editor_state
-                                            or not isinstance(
-                                                editor_state.get(editor_key), pd.DataFrame
-                                            )
-                                        ):
-                                            editor_state[editor_key] = base_df.copy(deep=True)
+                                        saved_df = None
+                                        if entry_id is not None:
+                                            saved_df = step2_edits.get(entry_id)
+
+                                        if editor_key not in st.session_state:
+                                            if isinstance(saved_df, pd.DataFrame):
+                                                source_df = saved_df.copy(deep=True)
+                                            else:
+                                                source_df = base_df.copy(deep=True)
+                                            st.session_state[editor_key] = source_df
 
                                         edited_df = st.data_editor(
-                                            editor_state[editor_key],
+                                            st.session_state[editor_key],
                                             column_config=column_config,
                                             column_order=column_order,
                                             use_container_width=True,
@@ -878,53 +878,61 @@ if "df_original" in st.session_state:
 
                                         if isinstance(edited_df, pd.DataFrame):
                                             edited_copy = edited_df.copy(deep=True)
-                                            editor_state[editor_key] = edited_copy
+                                            st.session_state[editor_key] = edited_copy
                                             entry["data"] = edited_copy
-                                        save_key = f"step2_save_{idx}_{entry.get('title','')}"
-                                        if st.button("💾 Save", key=save_key):
-                                            if isinstance(edited_df, pd.DataFrame):
-                                                editable_columns = entry.get(
-                                                    "editable_columns", []
-                                                )
-                                                storage_df = entry.get(
-                                                    "storage_df", pd.DataFrame()
-                                                )
-                                                label_to_id = entry.get(
-                                                    "category_label_to_id", {}
-                                                )
-                                                multiselect_columns = entry.get(
-                                                    "multiselect_columns", []
-                                                )
-                                                edited_storage = _convert_df_for_storage(
-                                                    edited_df,
-                                                    label_to_id,
-                                                    multiselect_columns,
-                                                )
-                                                changes_store = step2_edits.setdefault(
-                                                    "_changes", {}
-                                                )
-                                                _update_step2_edits(
-                                                    changes_store,
-                                                    storage_df,
-                                                    edited_storage,
-                                                    editable_columns,
-                                                )
-                                                entry["storage_df"] = edited_storage.copy(
+
+                                            editable_columns = entry.get(
+                                                "editable_columns", []
+                                            )
+                                            storage_df_original = entry.get(
+                                                "storage_df_original",
+                                                entry.get("storage_df", pd.DataFrame()),
+                                            )
+                                            if isinstance(
+                                                storage_df_original, pd.DataFrame
+                                            ):
+                                                original_storage = storage_df_original.copy(
                                                     deep=True
                                                 )
-                                                if entry_id is not None:
-                                                    step2_edits[entry_id] = (
-                                                        edited_df.copy(deep=True)
-                                                    )
-                                                if "_changes" in step2_edits:
-                                                    step2_edits["_changes"] = {
-                                                        sku: values
-                                                        for sku, values in step2_edits[
-                                                            "_changes"
-                                                        ].items()
-                                                        if values
-                                                    }
-                                                st.success("Changes saved.")
+                                            else:
+                                                original_storage = pd.DataFrame()
+                                            label_to_id = entry.get(
+                                                "category_label_to_id", {}
+                                            )
+                                            multiselect_columns = entry.get(
+                                                "multiselect_columns", []
+                                            )
+
+                                            edited_storage = _convert_df_for_storage(
+                                                edited_copy,
+                                                label_to_id,
+                                                multiselect_columns,
+                                            )
+                                            entry["storage_df"] = edited_storage.copy(
+                                                deep=True
+                                            )
+
+                                            changes_store = step2_edits.setdefault(
+                                                "_changes", {}
+                                            )
+                                            _update_step2_edits(
+                                                changes_store,
+                                                original_storage,
+                                                edited_storage,
+                                                editable_columns,
+                                            )
+
+                                            if entry_id is not None:
+                                                step2_edits[entry_id] = edited_copy
+
+                                            if "_changes" in step2_edits:
+                                                step2_edits["_changes"] = {
+                                                    sku: values
+                                                    for sku, values in step2_edits[
+                                                        "_changes"
+                                                    ].items()
+                                                    if values
+                                                }
         else:
             st.info("Нет изменённых товаров.")
 else:
