@@ -848,9 +848,7 @@ if "df_original" in st.session_state:
                                             entry["data"] = saved_df.copy(deep=True)
 
                                         base_df = entry.get("data")
-                                        if isinstance(base_df, pd.DataFrame):
-                                            base_df = base_df.copy(deep=True)
-                                        else:
+                                        if not isinstance(base_df, pd.DataFrame):
                                             base_df = pd.DataFrame()
 
                                         column_config = entry.get("column_config", {})
@@ -860,14 +858,16 @@ if "df_original" in st.session_state:
                                         editor_state = st.session_state.setdefault(
                                             "editor_state", {}
                                         )
-                                        state_df = editor_state.get(editor_key)
-                                        if isinstance(state_df, pd.DataFrame):
-                                            display_df = state_df.copy(deep=True)
-                                        else:
-                                            display_df = base_df.copy(deep=True)
+                                        if (
+                                            editor_key not in editor_state
+                                            or not isinstance(
+                                                editor_state.get(editor_key), pd.DataFrame
+                                            )
+                                        ):
+                                            editor_state[editor_key] = base_df.copy(deep=True)
 
                                         edited_df = st.data_editor(
-                                            display_df,
+                                            editor_state[editor_key],
                                             column_config=column_config,
                                             column_order=column_order,
                                             use_container_width=True,
@@ -879,14 +879,7 @@ if "df_original" in st.session_state:
                                         if isinstance(edited_df, pd.DataFrame):
                                             edited_copy = edited_df.copy(deep=True)
                                             editor_state[editor_key] = edited_copy
-                                            has_changes = not (
-                                                isinstance(display_df, pd.DataFrame)
-                                                and display_df.equals(edited_df)
-                                            )
-                                            if has_changes:
-                                                entry["data"] = edited_copy
-                                                if entry_id is not None:
-                                                    step2_edits[entry_id] = edited_copy
+                                            entry["data"] = edited_copy
                                         save_key = f"step2_save_{idx}_{entry.get('title','')}"
                                         if st.button("💾 Save", key=save_key):
                                             if isinstance(edited_df, pd.DataFrame):
@@ -931,6 +924,7 @@ if "df_original" in st.session_state:
                                                         ].items()
                                                         if values
                                                     }
+                                                st.success("Changes saved.")
         else:
             st.info("Нет изменённых товаров.")
 else:
