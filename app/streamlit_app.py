@@ -229,8 +229,35 @@ if "df_original" in st.session_state:
 
         if isinstance(edited_df, pd.DataFrame) and st.button("💾 Сохранить изменения"):
             st.session_state["df_edited"] = edited_df.copy()
-            st.session_state["df_original"] = edited_df.copy()
             st.success("Изменения сохранены.")
+
+        st.markdown("### Step 2. Items with updated attribute sets")
+        if "df_edited" in st.session_state and "df_original" in st.session_state:
+            df_new = st.session_state["df_edited"]
+            df_old = st.session_state["df_original"]
+
+            required_cols = {"sku", "attribute set"}
+            if required_cols.issubset(df_new.columns) and required_cols.issubset(
+                df_old.columns
+            ):
+                new_attr = df_new.set_index("sku")["attribute set"]
+                old_attr = df_old.set_index("sku")["attribute set"]
+                aligned_index = new_attr.index.intersection(old_attr.index)
+                diff_mask = new_attr.loc[aligned_index] != old_attr.loc[aligned_index]
+                df_changed = (
+                    new_attr.loc[aligned_index][diff_mask]
+                    .rename("attribute set")
+                    .reset_index()
+                )
+
+                if df_changed.empty:
+                    st.info("Нет изменённых товаров.")
+                else:
+                    st.dataframe(df_changed, use_container_width=True)
+            else:
+                st.info("Нет изменённых товаров.")
+        else:
+            st.info("Нет изменённых товаров.")
 else:
     st.info("Нажми **Load items** для загрузки и отображения товаров.")
 
