@@ -188,7 +188,7 @@ if "df_original" in st.session_state:
                 df_init["hint"] = ""
             cols_order = ["sku", "name", "attribute set", "hint", "created_at"]
             df_init = df_init[[col for col in cols_order if col in df_init.columns]]
-            st.session_state["df_edited"] = df_init
+            st.session_state["df_edited"] = df_init.copy()
 
         df_base = st.session_state["df_edited"].copy()
 
