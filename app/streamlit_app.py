@@ -17,7 +17,6 @@ from services.inventory import (
     get_source_items,
     iter_products_by_attr_set,
     list_attribute_sets,
-    update_product_attribute_set,
 )
 from utils.http import get_session
 
@@ -69,7 +68,7 @@ def load_items(session, base_url):
 
     df = pd.DataFrame(rows)
     if df.empty:
-        return pd.DataFrame(columns=["sku", "name", "attribute set", "date created"])
+        return pd.DataFrame(columns=["sku", "name", "attribute set", "created_at"])
 
     st.info(
         f"STEP A — products in 'Default' after status/visibility/type: {len(df)}"
@@ -125,11 +124,10 @@ def load_items(session, base_url):
     st.success(f"STEP F — final rows (qty>0 OR bo=2): {len(out)}")
 
     if out.empty:
-        return pd.DataFrame(columns=["sku", "name", "attribute set", "date created"])
+        return pd.DataFrame(columns=["sku", "name", "attribute set", "created_at"])
 
     out["attribute set"] = _DEF_ATTR_SET_NAME
-    out["date created"] = out["created_at"]
-    return out[["sku", "name", "attribute set", "date created"]]
+    return out[["sku", "name", "attribute set", "created_at"]]
 
 
 st.set_page_config(page_title="Default Set In-Stock Browser", layout="wide")
@@ -138,10 +136,8 @@ base_url = st.secrets["MAGENTO_BASE_URL"].rstrip("/")
 auth_token = st.secrets["MAGENTO_ADMIN_TOKEN"]
 session = get_session(auth_token)
 
-st.title("Default Set — In-Stock & Backorder Browser")
-st.caption(
-    "Filters: attribute set = Default; qty > 0 OR backorders = 2 (Allow Qty Below 0 & Notify Customer)."
-)
+st.markdown("### 🤖 AI Content Manager")
+st.info("Let’s find items that need attribute set assignment.")
 
 if st.button("Load items", type="primary"):
     try:
@@ -153,10 +149,10 @@ if st.button("Load items", type="primary"):
             st.session_state.pop("attribute_sets", None)
         else:
             df_ui = df_items.copy()
-            df_ui["date created"] = pd.to_datetime(
-                df_ui["date created"], errors="coerce"
+            df_ui["created_at"] = pd.to_datetime(
+                df_ui["created_at"], errors="coerce"
             )
-            df_ui = df_ui.sort_values("date created", ascending=False).reset_index(drop=True)
+            df_ui = df_ui.sort_values("created_at", ascending=False).reset_index(drop=True)
             st.success(
                 f"Found {len(df_ui)} products (Default; qty>0 OR backorders=2)"
             )
@@ -168,15 +164,10 @@ if st.button("Load items", type="primary"):
                 attribute_sets = {}
             st.session_state["attribute_sets"] = attribute_sets
             df_for_edit = df_ui.copy()
-            if "selected" not in df_for_edit.columns:
-                df_for_edit.insert(0, "selected", False)
-            else:
-                df_for_edit = df_for_edit.copy()
-                if df_for_edit.columns[0] != "selected":
-                    selected_col = df_for_edit.pop("selected")
-                    df_for_edit.insert(0, "selected", selected_col)
-                df_for_edit["selected"] = False
-            df_for_edit["hint"] = ""
+            if "hint" not in df_for_edit.columns:
+                df_for_edit["hint"] = ""
+            cols_order = ["sku", "name", "attribute set", "hint", "created_at"]
+            df_for_edit = df_for_edit[[col for col in cols_order if col in df_for_edit.columns]]
             st.session_state["df_edited"] = df_for_edit.copy()
     except Exception as exc:  # pragma: no cover - UI error handling
         st.error(f"Error: {exc}")
@@ -193,8 +184,10 @@ if "df_original" in st.session_state:
     else:
         if "df_edited" not in st.session_state:
             df_init = df_ui.copy()
-            df_init.insert(0, "selected", False)
-            df_init["hint"] = ""
+            if "hint" not in df_init.columns:
+                df_init["hint"] = ""
+            cols_order = ["sku", "name", "attribute set", "hint", "created_at"]
+            df_init = df_init[[col for col in cols_order if col in df_init.columns]]
             st.session_state["df_edited"] = df_init
 
         df_base = st.session_state["df_edited"].copy()
@@ -203,24 +196,11 @@ if "df_original" in st.session_state:
         if isinstance(editor_state, pd.DataFrame):
             df_base = editor_state.copy()
 
-        if "selected" not in df_base.columns:
-            df_base.insert(0, "selected", False)
-        elif df_base.columns[0] != "selected":
-            selected_col = df_base.pop("selected")
-            df_base.insert(0, "selected", selected_col)
-
         if "hint" not in df_base.columns:
             df_base["hint"] = ""
 
-        df_orig = st.session_state["df_original"]
-        for idx in df_base.index:
-            if (
-                idx in df_orig.index
-                and df_base.at[idx, "attribute set"]
-                != df_orig.at[idx, "attribute set"]
-            ):
-                df_base.at[idx, "selected"] = True
-
+        cols_order = ["sku", "name", "attribute set", "hint", "created_at"]
+        df_base = df_base[[col for col in cols_order if col in df_base.columns]]
         st.session_state["df_edited"] = df_base.copy()
 
         options = list(attribute_sets.keys())
@@ -231,67 +211,30 @@ if "df_original" in st.session_state:
         )
         options = list(dict.fromkeys(options))
 
+        st.markdown("**Step 1. Assign the attribute sets**")
+
         edited_df = st.data_editor(
             df_base,
             column_config={
-                "selected": st.column_config.CheckboxColumn(
-                    "✓",
-                    default=False,
-                    width=30,
-                    help="Mark items for bulk actions",
-                ),
+                "sku": st.column_config.TextColumn("SKU", disabled=True),
+                "name": st.column_config.TextColumn("Name", disabled=True),
                 "attribute set": st.column_config.SelectboxColumn(
-                    "Attribute Set",
+                    label="🎯 Attribute Set",
                     help="Change attribute set",
                     options=options,
                     required=True,
                 ),
                 "hint": st.column_config.TextColumn("Hint"),
+                "created_at": st.column_config.DatetimeColumn("Created At", disabled=True),
             },
+            column_order=["sku", "name", "attribute set", "hint", "created_at"],
             use_container_width=True,
             num_rows="fixed",
             key="editor_key_main",
         )
 
-        if edited_df is None:
-            edited_df = df_base.copy()
-
-        if st.button("Сохранить изменения"):
+        if isinstance(edited_df, pd.DataFrame):
             st.session_state["df_edited"] = edited_df.copy()
-            st.success("Изменения сохранены")
-
-        if st.button("Apply changes"):
-            mask = edited_df["attribute set"] != df_ui["attribute set"]
-            changed_rows = edited_df.loc[mask]
-            if changed_rows.empty:
-                st.info("No attribute set changes detected.")
-            else:
-                for _, row in changed_rows.iterrows():
-                    sku = row.get("sku", "")
-                    new_attr_set_name = str(row.get("attribute set") or "")
-                    if not sku:
-                        continue
-                    if not new_attr_set_name:
-                        st.error("Attribute set name is empty.")
-                        continue
-                    attr_set_id = attribute_sets.get(new_attr_set_name)
-                    if attr_set_id is None:
-                        st.error(
-                            f"Attribute set ID not found for {new_attr_set_name!r}."
-                        )
-                        continue
-                    try:
-                        update_product_attribute_set(
-                            session, base_url, sku, attr_set_id
-                        )
-                    except Exception as exc:  # pragma: no cover - UI error handling
-                        st.error(
-                            f"Failed to update {sku} to set {new_attr_set_name}: {exc}"
-                        )
-                    else:
-                        st.success(
-                            f"Updated {sku} to set {new_attr_set_name}"
-                        )
 else:
     st.info("Нажми **Load items** для загрузки и отображения товаров.")
 
