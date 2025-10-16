@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import html
 import json
 import re
 from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
@@ -390,31 +389,27 @@ def _first_sentence(text: Optional[object]) -> str:
     return text[:200] + ("…" if len(text) > 200 else "")
 
 
-def show_scrollable_ai(df_full: pd.DataFrame, df_suggest: pd.DataFrame) -> None:
-    ai = {r["code"]: r["value"] for _, r in df_suggest.iterrows()}
-    flattened = {
-        c: (df_full.loc[c, "label"] or df_full.loc[c, "raw_value"])
-        for c in df_full.index
-    }
+def build_attributes_display_table(df_full: pd.DataFrame) -> pd.DataFrame:
+    """Prepare a human-friendly table with attribute values for Streamlit."""
 
-    flattened.update(ai)
-    columns = list(flattened.keys())
+    if df_full.empty:
+        return pd.DataFrame(columns=["Attribute", "Value"])
 
-    ths = "".join(f"<th>{html.escape(c)}</th>" for c in columns)
-    tds: List[str] = []
-    for code in columns:
-        val = _first_sentence(flattened.get(code))
-        is_ai = code in ai
-        mark = " 🤖" if is_ai else ""
-        style = "background:#fff7cc;" if is_ai else ""
-        tds.append(f"<td style='{style}'>{html.escape(val)}{mark}</td>")
+    values: List[Tuple[str, str]] = []
+    for code, row in df_full.iterrows():
+        value = row.get("label")
+        if value is None or (isinstance(value, str) and not value.strip()):
+            value = row.get("raw_value")
 
-    html_table = f"""
-    <div style="overflow-x:auto;border:1px solid #ddd;border-radius:6px;">
-    <table style="border-collapse:collapse;font-family:monospace;">
-      <thead><tr>{ths}</tr></thead>
-      <tbody><tr>{''.join(tds)}</tr></tbody>
-    </table>
-    </div>
-    """
-    st.markdown(html_table, unsafe_allow_html=True)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            display_value = "-"
+        else:
+            first_sentence = _first_sentence(value)
+            display_value = first_sentence or str(value)
+            if not str(display_value).strip():
+                display_value = "-"
+
+        values.append((str(code), str(display_value)))
+
+    df_display = pd.DataFrame(values, columns=["Attribute", "Value"])
+    return df_display
