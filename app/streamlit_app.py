@@ -510,6 +510,7 @@ def _prepare_step2_tables(
 
         tables.append(
             {
+                "id": f"table::{attr_title}",
                 "title": attr_title,
                 "display_title": _format_attr_set_title(attr_title),
                 "data": display_df,
@@ -835,6 +836,17 @@ if "df_original" in st.session_state:
                                             )
                                         st.subheader(attr_title)
 
+                                        entry_id = entry.get("id")
+                                        # 👉 Синхронизировать сохранённые изменения из session_state
+                                        step2_saved = st.session_state.get(
+                                            "step2_edits", {}
+                                        )
+                                        saved_df = None
+                                        if entry_id is not None:
+                                            saved_df = step2_saved.get(entry_id)
+                                        if isinstance(saved_df, pd.DataFrame):
+                                            entry["data"] = saved_df.copy(deep=True)
+
                                         base_df = entry.get("data")
                                         if isinstance(base_df, pd.DataFrame):
                                             display_df = base_df.copy(deep=True)
@@ -856,6 +868,10 @@ if "df_original" in st.session_state:
 
                                         if isinstance(edited_df, pd.DataFrame):
                                             entry["data"] = edited_df.copy(deep=True)
+                                            if entry_id is not None:
+                                                step2_edits[entry_id] = edited_df.copy(
+                                                    deep=True
+                                                )
                                         save_key = f"step2_save_{idx}_{entry.get('title','')}"
                                         if st.button("💾 Save", key=save_key):
                                             if isinstance(edited_df, pd.DataFrame):
@@ -876,8 +892,11 @@ if "df_original" in st.session_state:
                                                     label_to_id,
                                                     multiselect_columns,
                                                 )
+                                                changes_store = step2_edits.setdefault(
+                                                    "_changes", {}
+                                                )
                                                 _update_step2_edits(
-                                                    step2_edits,
+                                                    changes_store,
                                                     storage_df,
                                                     edited_storage,
                                                     editable_columns,
@@ -885,11 +904,18 @@ if "df_original" in st.session_state:
                                                 entry["storage_df"] = edited_storage.copy(
                                                     deep=True
                                                 )
-                                                st.session_state["step2_edits"] = {
-                                                    sku: values
-                                                    for sku, values in step2_edits.items()
-                                                    if values
-                                                }
+                                                if entry_id is not None:
+                                                    step2_edits[entry_id] = (
+                                                        edited_df.copy(deep=True)
+                                                    )
+                                                if "_changes" in step2_edits:
+                                                    step2_edits["_changes"] = {
+                                                        sku: values
+                                                        for sku, values in step2_edits[
+                                                            "_changes"
+                                                        ].items()
+                                                        if values
+                                                    }
         else:
             st.info("Нет изменённых товаров.")
 else:
