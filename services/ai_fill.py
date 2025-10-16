@@ -10,7 +10,7 @@ from urllib.parse import quote
 
 import pandas as pd
 import requests
-from IPython.display import HTML, display
+import streamlit as st
 
 
 ALWAYS_ATTRS: Set[str] = {"brand", "country_of_manufacture", "short_description"}
@@ -382,15 +382,15 @@ def infer_missing(
     return pd.DataFrame(completion.get("attributes", []))
 
 
-def _first_sentence(value: Optional[object]) -> str:
-    text = _strip_html(value)
+def _first_sentence(text: Optional[object]) -> str:
+    text = _strip_html(text)
     match = re.search(r"([^.?!]*[.?!])", text)
     if match:
         text = match.group(1).strip()
     return text[:200] + ("…" if len(text) > 200 else "")
 
 
-def show_scrollable_ai(df_full: pd.DataFrame, df_suggest: pd.DataFrame) -> Optional[str]:
+def show_scrollable_ai(df_full: pd.DataFrame, df_suggest: pd.DataFrame) -> None:
     ai = {r["code"]: r["value"] for _, r in df_suggest.iterrows()}
     flattened = {
         c: (df_full.loc[c, "label"] or df_full.loc[c, "raw_value"])
@@ -417,5 +417,4 @@ def show_scrollable_ai(df_full: pd.DataFrame, df_suggest: pd.DataFrame) -> Optio
     </table>
     </div>
     """
-    display(HTML(html_table))
-    return html_table
+    st.markdown(html_table, unsafe_allow_html=True)

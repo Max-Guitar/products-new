@@ -366,10 +366,9 @@ if "df_original" in st.session_state:
                                             )
                                             continue
 
-                                        html_table = show_scrollable_ai(
+                                        show_scrollable_ai(
                                             df_full, pd.DataFrame(columns=["code", "value"])
                                         )
-                                        st.markdown(html_table, unsafe_allow_html=True)
         else:
             st.info("Нет изменённых товаров.")
 else:
