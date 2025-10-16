@@ -878,7 +878,6 @@ if "df_original" in st.session_state:
 
                                         if isinstance(edited_df, pd.DataFrame):
                                             edited_copy = edited_df.copy(deep=True)
-                                            st.session_state[editor_key] = edited_copy
                                             entry["data"] = edited_copy
 
                                             editable_columns = entry.get(
