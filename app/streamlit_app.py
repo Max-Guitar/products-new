@@ -8,7 +8,6 @@ if str(ROOT) not in sys.path:
 
 import pandas as pd
 import streamlit as st
-from typing import Optional
 
 from services.ai_fill import (
     ALWAYS_ATTRS,
@@ -17,7 +16,6 @@ from services.ai_fill import (
     compute_allowed_attrs,
     get_attribute_sets_map,
     get_product_by_sku,
-    infer_missing,
     probe_api_base,
     show_scrollable_ai,
 )
@@ -169,7 +167,6 @@ if st.button("Load items", type="primary"):
                 f"Found {len(df_ui)} products (Default; qty>0 OR backorders=2)"
             )
             st.session_state["df_original"] = df_ui.copy()
-            st.session_state["df_original_snapshot"] = df_ui.copy()
             try:
                 attribute_sets = list_attribute_sets(session, base_url)
             except Exception as exc:  # pragma: no cover - UI error handling
@@ -182,15 +179,13 @@ if st.button("Load items", type="primary"):
             cols_order = ["sku", "name", "attribute set", "hint", "created_at"]
             df_for_edit = df_for_edit[[col for col in cols_order if col in df_for_edit.columns]]
             st.session_state["df_edited"] = df_for_edit.copy()
+            st.session_state["show_attributes_trigger"] = False
     except Exception as exc:  # pragma: no cover - UI error handling
         st.error(f"Error: {exc}")
 
 if "df_original" in st.session_state:
     df_ui = st.session_state["df_original"]
     attribute_sets = st.session_state.get("attribute_sets", {})
-
-    if "df_original_snapshot" not in st.session_state:
-        st.session_state["df_original_snapshot"] = df_ui.copy()
 
     if df_ui.empty:
         st.warning("No items match the Default set filter criteria.")
@@ -245,133 +240,136 @@ if "df_original" in st.session_state:
 
         st.markdown("### Step 2. Items with updated attribute sets")
 
+        show_attributes_clicked = False
         if isinstance(edited_df, pd.DataFrame) and st.button("➡️ Show Attributes"):
-            if "df_original" in st.session_state:
-                st.session_state["df_original_snapshot"] = st.session_state[
-                    "df_original"
-                ].copy()
             st.session_state["df_edited"] = edited_df.copy()
-            st.session_state["df_original"] = edited_df.copy()
-            st.success("Changes registered.")
+            st.session_state["show_attributes_trigger"] = True
+            show_attributes_clicked = True
 
-        if (
-            "df_edited" in st.session_state
-            and "df_original" in st.session_state
-            and st.session_state.get("df_original_snapshot") is not None
-        ):
-            df_new = st.session_state["df_edited"]
-            df_old = st.session_state.get("df_original_snapshot")
+        trigger = st.session_state.get("show_attributes_trigger", False)
+        if trigger or show_attributes_clicked:
+            if "df_edited" not in st.session_state:
+                st.info("Нет изменённых товаров.")
+            elif "df_original" not in st.session_state:
+                st.info("Нет исходных данных для сравнения.")
+            else:
+                df_new = st.session_state["df_edited"].copy()
+                df_old = st.session_state["df_original"].copy()
 
-            required_cols = {"sku", "attribute set"}
-            if required_cols.issubset(df_new.columns) and required_cols.issubset(
-                df_old.columns
-            ):
-                df_new_attr = df_new.set_index("sku")["attribute set"].to_frame(
-                    "attribute set_new"
-                )
-                df_old_attr = df_old.set_index("sku")["attribute set"].to_frame(
-                    "attribute set_old"
-                )
-                df_merged = df_new_attr.join(df_old_attr, how="inner")
-                df_changed = df_merged[df_merged["attribute set_new"] != df_merged["attribute set_old"]]
-
-                if df_changed.empty:
+                required_cols = {"sku", "attribute set"}
+                if not (
+                    required_cols.issubset(df_new.columns)
+                    and required_cols.issubset(df_old.columns)
+                ):
                     st.info("Нет изменённых товаров.")
                 else:
-                    df_changed = df_changed.reset_index()
-                    df_changed = df_changed.rename(
-                        columns={"attribute set_new": "attribute set"}
-                    )
-
-                    openai_key = st.secrets.get("OPENAI_API_KEY")
-                    ai_error: Optional[str] = None
-                    ai_ready = False
-                    ai_api_base = st.session_state.get("ai_api_base")
-                    ai_sets_map = st.session_state.get("ai_attr_sets_map")
-
-                    if not openai_key:
-                        ai_error = "AI подсказки недоступны: отсутствует OPENAI_API_KEY."
+                    df_new_idx = df_new.set_index("sku")
+                    df_old_idx = df_old.set_index("sku")
+                    common_skus = df_new_idx.index.intersection(df_old_idx.index)
+                    if common_skus.empty:
+                        st.info("Нет изменённых товаров.")
                     else:
-                        try:
-                            if not ai_api_base:
-                                with st.spinner("🔌 Подключение к Magento…"):
-                                    ai_api_base = probe_api_base(session, base_url)
-                                st.session_state["ai_api_base"] = ai_api_base
-                            if not ai_sets_map:
-                                with st.spinner("📚 Загрузка attribute sets…"):
-                                    ai_sets_map = get_attribute_sets_map(session, ai_api_base)
-                                st.session_state["ai_attr_sets_map"] = ai_sets_map
-                            ai_ready = bool(ai_api_base and ai_sets_map)
-                        except Exception as exc:  # pragma: no cover - UI interaction
-                            ai_error = f"AI подсказки недоступны: {exc}"
+                        df_new_common = df_new_idx.loc[common_skus]
+                        new_sets = df_new_common["attribute set"].fillna("")
+                        old_sets = df_old_idx.loc[common_skus, "attribute set"].fillna("")
+                        diff_mask = new_sets != old_sets
+                        df_changed = df_new_common.loc[diff_mask].reset_index()
 
-                    grouped = df_changed.groupby("attribute set", dropna=False)
-
-                    for attr_set_value, group in grouped:
-                        attr_title = attr_set_value if pd.notna(attr_set_value) else "—"
-                        st.markdown(f"#### 🎯 Attribute Set: {attr_title}")
-                        st.dataframe(group[["sku", "attribute set"]], use_container_width=True)
-
-                        if not ai_ready:
-                            continue
-
-                        attr_set_id = None
-                        if pd.notna(attr_set_value):
-                            attr_set_id = attribute_sets.get(attr_set_value)
-                            if attr_set_id is None:
-                                st.warning(
-                                    f"Attribute set '{attr_set_value}' отсутствует в Magento, пропуск AI."
-                                )
-                                continue
+                        if df_changed.empty:
+                            st.info("Нет изменённых товаров.")
                         else:
-                            st.warning("Attribute set не указан, пропуск AI.")
-                            continue
+                            api_base = st.session_state.get("ai_api_base")
+                            attr_sets_map = st.session_state.get("ai_attr_sets_map")
+                            setup_failed = False
 
-                        for _, row in group.iterrows():
-                            sku_value = str(row.get("sku", "")).strip()
-                            if not sku_value:
-                                continue
-                            st.markdown(f"**SKU: {sku_value}**")
                             try:
-                                with st.spinner("🤖 AI подбирает атрибуты…"):
-                                    product = get_product_by_sku(session, ai_api_base, sku_value)
-                                    allowed = compute_allowed_attrs(
-                                        attr_set_id, SET_ATTRS, ai_sets_map, ALWAYS_ATTRS
-                                    )
-                                    if not allowed:
-                                        st.info("Нет атрибутов для отображения.")
-                                        continue
-                                    allowed_sorted = sorted(allowed)
-                                    df_full = collect_attributes_table(
-                                        product, allowed_sorted, session, ai_api_base
-                                    )
-                                    if df_full.empty:
-                                        st.warning("Нет данных по атрибутам, пропуск.")
-                                        continue
-                                    df_suggest = infer_missing(
-                                        product,
-                                        df_full,
-                                        session,
-                                        ai_api_base,
-                                        allowed_sorted,
-                                        openai_key,
-                                        model="gpt-5-mini",
-                                    )
+                                if not api_base:
+                                    with st.spinner("🔌 Подключение к Magento…"):
+                                        api_base = probe_api_base(session, base_url)
+                                    st.session_state["ai_api_base"] = api_base
+                                if not attr_sets_map and api_base:
+                                    with st.spinner("📚 Загрузка attribute sets…"):
+                                        attr_sets_map = get_attribute_sets_map(
+                                            session, api_base
+                                        )
+                                    st.session_state["ai_attr_sets_map"] = attr_sets_map
                             except Exception as exc:  # pragma: no cover - UI interaction
-                                st.warning(f"{sku_value}: не удалось получить AI-подсказки ({exc})")
-                                continue
+                                st.warning(
+                                    f"Не удалось подготовить подключение к Magento: {exc}"
+                                )
+                                setup_failed = True
 
-                            if df_suggest.empty:
-                                st.info("AI не предложил новых значений.")
-                                continue
+                            if setup_failed or not api_base or not attr_sets_map:
+                                st.session_state["show_attributes_trigger"] = False
+                            else:
+                                grouped = df_changed.groupby(
+                                    "attribute set", dropna=False
+                                )
 
-                            html_table = show_scrollable_ai(df_full, df_suggest)
-                            st.markdown(html_table, unsafe_allow_html=True)
+                                for attr_set_value, group in grouped:
+                                    attr_title = (
+                                        attr_set_value if pd.notna(attr_set_value) else "—"
+                                    )
+                                    st.markdown(f"#### 🎯 Attribute Set: {attr_title}")
 
-                    if ai_error:
-                        st.warning(ai_error)
-            else:
-                st.info("Нет изменённых товаров.")
+                                    for _, row in group.iterrows():
+                                        sku_value = str(row.get("sku", "")).strip()
+                                        if not sku_value:
+                                            continue
+
+                                        name_value = row.get("name")
+                                        header = f"**{sku_value}**"
+                                        if isinstance(name_value, str) and name_value.strip():
+                                            header = (
+                                                f"**{sku_value} — {name_value.strip()}**"
+                                            )
+                                        st.markdown(header)
+
+                                        try:
+                                            with st.spinner("Получение данных из Magento…"):
+                                                product = get_product_by_sku(
+                                                    session, api_base, sku_value
+                                                )
+                                                attr_set_id = None
+                                                if pd.notna(attr_set_value):
+                                                    attr_set_id = attribute_sets.get(
+                                                        attr_set_value
+                                                    )
+                                                if attr_set_id is None:
+                                                    attr_set_id = product.get(
+                                                        "attribute_set_id"
+                                                    )
+                                                allowed = compute_allowed_attrs(
+                                                    attr_set_id,
+                                                    SET_ATTRS,
+                                                    attr_sets_map or {},
+                                                    ALWAYS_ATTRS,
+                                                )
+                                                if not allowed:
+                                                    st.info("Нет атрибутов для отображения.")
+                                                    continue
+                                                allowed_sorted = sorted(allowed)
+                                                df_full = collect_attributes_table(
+                                                    product,
+                                                    allowed_sorted,
+                                                    session,
+                                                    api_base,
+                                                )
+                                                if df_full.empty:
+                                                    st.info(
+                                                        "Нет данных по атрибутам, пропуск."
+                                                    )
+                                                    continue
+                                        except Exception as exc:  # pragma: no cover - UI interaction
+                                            st.warning(
+                                                f"{sku_value}: не удалось получить атрибуты ({exc})"
+                                            )
+                                            continue
+
+                                        html_table = show_scrollable_ai(
+                                            df_full, pd.DataFrame(columns=["code", "value"])
+                                        )
+                                        st.markdown(html_table, unsafe_allow_html=True)
         else:
             st.info("Нет изменённых товаров.")
 else:
