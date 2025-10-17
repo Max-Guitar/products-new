@@ -1,6 +1,6 @@
 from __future__ import annotations
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from urllib.parse import quote
 
@@ -347,28 +347,24 @@ def _reset_step2_state():
         "step2_column_config_cache",
         "step2_disabled_cols_cache",
         "step2_meta",
+        "show_attrs",
     ):
         st.session_state.pop(key, None)
 
 
-def _collect_options_map(column_meta: dict[str, dict]) -> dict[str, dict[str, dict]]:
-    options_map: dict[str, dict[str, dict]] = {}
+def _collect_options_map(column_meta: dict[str, dict]) -> dict[str, dict[str, object]]:
+    options_map: dict[str, dict[str, object]] = {}
     for column, meta in column_meta.items():
         opts = meta.get("options") or []
-        label_to_value: dict[str, object] = {}
-        value_to_label: dict[str, str] = {}
+        mapping: dict[str, object] = {}
         for opt in opts:
             label = str(opt.get("label", "")).strip()
             value = opt.get("value")
-            if label:
-                label_to_value[label] = value
-            if value is not None:
-                value_to_label[str(value)] = label
-        if label_to_value or value_to_label:
-            options_map[column] = {
-                "label_to_value": label_to_value,
-                "value_to_label": value_to_label,
-            }
+            if not label:
+                continue
+            mapping[label] = value
+        if mapping:
+            options_map[column] = mapping
     return options_map
 
 
@@ -466,13 +462,7 @@ def build_attributes_df(
         rows.append(row_data)
 
     if not rows:
-        meta_info = {
-            "column_meta": {},
-            "multiselect_columns": [],
-            "options_map": {},
-            "category_label_to_id": label_to_id,
-        }
-        return pd.DataFrame(), {}, [], meta_info
+        return pd.DataFrame(), {}, [], {}
 
     df_table = pd.DataFrame(rows)
     if "sku" not in df_table.columns:
@@ -543,14 +533,20 @@ def build_attributes_df(
 
     disabled_columns = ["sku", "name", "attribute set"]
 
-    meta_info = {
-        "column_meta": column_meta_with_base,
-        "multiselect_columns": multiselect_columns,
-        "options_map": _collect_options_map(column_meta_with_base),
-        "category_label_to_id": label_to_id,
-    }
+    options_map = _collect_options_map(column_meta_with_base)
+    attr_meta: dict[str, dict[str, object]] = {}
+    for code, meta in column_meta_with_base.items():
+        attr_meta[code] = {
+            "frontend_input": (meta.get("frontend_input") or "").lower(),
+            "options_map": options_map.get(code, {}),
+        }
+    if label_to_id:
+        attr_meta["categories"] = {
+            "frontend_input": "multiselect",
+            "options_map": label_to_id,
+        }
 
-    return display_df, column_config, disabled_columns, meta_info
+    return display_df, column_config, disabled_columns, attr_meta
 
 
 def get_editable_columns() -> list[str]:
@@ -562,47 +558,44 @@ def get_editable_columns() -> list[str]:
     return [col for col in df.columns if col not in disabled_set]
 
 
-def normalize_value(column: str, value, *, sku: str | None = None):
-    meta_info = st.session_state.get("step2_meta", {})
-    column_meta = (meta_info.get("column_meta") or {}).get(column, {})
-    options_map = (meta_info.get("options_map") or {}).get(column, {})
-    label_to_id = meta_info.get("category_label_to_id", {})
-    frontend_input = (column_meta.get("frontend_input") or "").lower()
+def normalize_for_magento(attr_code: str, val, meta: Mapping[str, Mapping[str, object]]):
+    attr_meta = meta.get(attr_code, {})
+    if val in (None, "", [], {}):
+        return None
 
-    if column == "categories":
-        return _categories_labels_to_ids(value, label_to_id)
+    frontend_input = str(attr_meta.get("frontend_input", "")).lower()
+    options = attr_meta.get("options_map") or {}
 
-    if frontend_input == "boolean":
-        if isinstance(value, bool):
-            return value
-        if value in (None, ""):
-            return False
-        value_str = str(value).strip().lower()
-        return value_str in {"1", "true", "yes", "y", "on"}
+    if frontend_input in {"select", "boolean", "int"}:
+        if isinstance(val, str):
+            val = val.strip()
+            if val in options:
+                val = options[val]
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return int(str(val).strip())
 
     if frontend_input == "multiselect":
-        items = _split_multiselect_input(value)
-        label_to_value = options_map.get("label_to_value", {})
-        normalized = []
+        if isinstance(val, (list, tuple, set)):
+            items = list(val)
+        else:
+            items = [
+                item.strip()
+                for item in str(val).split(",")
+                if str(item).strip()
+            ]
+        ids = []
         for item in items:
-            raw = label_to_value.get(item, item)
-            if raw not in normalized:
-                normalized.append(raw)
-        return normalized
+            mapped = options.get(item, item)
+            try:
+                mapped_int = int(mapped)
+            except (TypeError, ValueError):
+                mapped_int = int(str(mapped).strip())
+            ids.append(mapped_int)
+        return ids
 
-    if frontend_input == "select":
-        if value in (None, ""):
-            return ""
-        value_str = str(value).strip()
-        label_to_value = options_map.get("label_to_value", {})
-        if value_str in label_to_value:
-            return label_to_value[value_str]
-        value_to_label = options_map.get("value_to_label", {})
-        if value_str in value_to_label:
-            return value_str
-        return value_str
-
-    return _sanitize_for_storage(value)
+    return val
 
 
 def apply_product_update(session, api_base: str, sku: str, attributes: dict):
@@ -659,29 +652,31 @@ def save_step2_to_magento():
         return
 
     diff = current_subset.loc[common_idx] != original_subset.loc[common_idx]
+    meta = st.session_state.get("step2_meta", {})
 
-    changes_by_sku: dict[str, dict] = {}
-    for idx_row, row_diff in diff.iterrows():
-        if not row_diff.any():
+    changes: dict[str, list[dict[str, object]]] = {}
+    for row_id, row_mask in diff.iterrows():
+        if not row_mask.any():
             continue
-        try:
-            sku_value = df_current.loc[idx_row, "sku"]
-        except Exception:
-            sku_value = None
+        sku_value = df_current.loc[row_id, "sku"]
         if not sku_value:
             continue
         sku_value = str(sku_value)
-        row_changes = changes_by_sku.setdefault(sku_value, {})
         for col in editable_cols:
-            if col not in row_diff or not row_diff[col]:
+            if not row_mask.get(col):
                 continue
-            value = df_current.loc[idx_row, col]
-            normalized = normalize_value(col, value, sku=sku_value)
-            attr_code = col
-            row_changes[attr_code] = normalized
+            normalized = normalize_for_magento(
+                col,
+                df_current.loc[row_id, col],
+                meta,
+            )
+            if normalized is None:
+                continue
+            changes.setdefault(sku_value, []).append(
+                {"attribute_code": col, "value": normalized}
+            )
 
-    changes_by_sku = {sku: attrs for sku, attrs in changes_by_sku.items() if attrs}
-    if not changes_by_sku:
+    if not changes:
         st.info("Нет изменений для сохранения.")
         return
 
@@ -691,9 +686,10 @@ def save_step2_to_magento():
         return
 
     results = {"ok": [], "fail": []}
-    for sku, attrs in changes_by_sku.items():
+    for sku, attrs in changes.items():
         try:
-            apply_product_update(session, api_base, sku, attrs)
+            payload = {item["attribute_code"]: item["value"] for item in attrs}
+            apply_product_update(session, api_base, sku, payload)
             results["ok"].append(sku)
         except Exception as exc:  # pragma: no cover - network interaction
             results["fail"].append({"sku": sku, "error": str(exc)})
@@ -705,14 +701,7 @@ def save_step2_to_magento():
         st.warning("Часть обновлений не удалась.")
         st.dataframe(pd.DataFrame(results["fail"]), use_container_width=True)
 
-    if results["ok"]:
-        original = st.session_state.get("step2_original")
-        if isinstance(original, pd.DataFrame):
-            success_skus = set(results["ok"])
-            for idx_row, sku_value in df_current["sku"].items():
-                if sku_value in success_skus and idx_row in original.index:
-                    original.loc[idx_row, :] = df_current.loc[idx_row, :]
-            st.session_state["step2_original"] = original.copy(deep=True)
+    st.session_state["step2_original"] = st.session_state["step2_df"].copy(deep=True)
 
 
 def load_items(session, base_url):
@@ -1030,10 +1019,21 @@ if "df_original" in st.session_state:
                                         attr_sets_map,
                                         categories_options,
                                     )
-                                    if {"sku", "attribute_code"}.issubset(df_step2.columns):
-                                        df_step2 = df_step2.set_index(
-                                            ["sku", "attribute_code"], drop=False
-                                        )
+                                    if not df_step2.empty:
+                                        if {"sku", "attribute_code"}.issubset(
+                                            df_step2.columns
+                                        ):
+                                            df_step2["__row_id"] = (
+                                                df_step2["sku"].astype(str)
+                                                + "|"
+                                                + df_step2["attribute_code"].astype(str)
+                                            )
+                                        else:
+                                            df_step2["__row_id"] = df_step2.index.astype(str)
+                                        df_step2 = df_step2.set_index("__row_id", drop=False)
+                                        if "__row_id" not in disabled_cols:
+                                            disabled_cols = list(disabled_cols)
+                                            disabled_cols.append("__row_id")
                                     st.session_state["step2_df"] = df_step2.copy(deep=True)
                                     st.session_state["step2_original"] = df_step2.copy(
                                         deep=True
@@ -1045,13 +1045,14 @@ if "df_original" in st.session_state:
                                         "step2_disabled_cols_cache"
                                     ] = disabled_cols
                                     st.session_state["step2_meta"] = meta_info
+                                    st.session_state["show_attrs"] = True
 
                                 df_step2_current = st.session_state.get("step2_df")
                                 if not isinstance(
                                     df_step2_current, pd.DataFrame
                                 ) or df_step2_current.empty:
                                     st.info("Нет атрибутов для отображения.")
-                                else:
+                                elif st.session_state.get("show_attrs"):
                                     col_cfg, disabled_cols = (
                                         _build_column_config_for_step1_like(step="step2")
                                     )
@@ -1078,7 +1079,7 @@ if "df_original" in st.session_state:
                                     if st.button(
                                         "Save to Magento",
                                         type="primary",
-                                        key="step2_save_btn",
+                                        key="step2_save",
                                     ):
                                         save_step2_to_magento()
 else:
