@@ -11,6 +11,8 @@ import pandas as pd
 import requests
 import streamlit as st
 
+from utils.http import MAGENTO_REST_PATH_CANDIDATES, build_magento_headers
+
 
 ALWAYS_ATTRS: Set[str] = {"brand", "country_of_manufacture", "short_description"}
 
@@ -132,6 +134,23 @@ SET_ATTRS: Mapping[str, Set[str]] = {
 }
 
 
+class HTMLResponseError(RuntimeError):
+    """Raised when Magento returns an HTML page instead of JSON."""
+
+    def __init__(self, base_url: str):
+        super().__init__(
+            "❌ HTML вместо JSON — проверь base URL или WAF/Cloudflare; "
+            f"попробован путь: {base_url}"
+        )
+        self.base_url = base_url
+
+
+def _magento_headers(session: requests.Session) -> dict[str, str]:
+    """Build default Magento headers using the session auth token if available."""
+
+    return build_magento_headers(session=session)
+
+
 def _looks_like_json(text: str) -> bool:
     try:
         json.loads(text)
@@ -144,17 +163,25 @@ def probe_api_base(session: requests.Session, origin: str) -> str:
     """Discover a working Magento REST prefix for ``origin``."""
 
     origin = origin.rstrip("/")
-    for path in ("/rest/V1", "/rest/default/V1", "/rest/all/V1", "/index.php/rest/V1"):
+    non_json_paths: list[str] = []
+    for path in MAGENTO_REST_PATH_CANDIDATES:
         base = f"{origin}{path}"
         try:
-            resp = session.get(f"{base}/store/storeViews", timeout=10)
+            resp = session.get(
+                f"{base}/store/storeViews",
+                headers=_magento_headers(session),
+                timeout=10,
+            )
         except requests.RequestException:
             continue
         content_type = resp.headers.get("Content-Type", "").lower()
-        if resp.status_code in {200, 401, 403} and (
-            "json" in content_type or _looks_like_json(resp.text)
-        ):
+        if "json" not in content_type:
+            non_json_paths.append(base)
+            continue
+        if resp.status_code in {200, 401, 403}:
             return base
+    if non_json_paths:
+        raise HTMLResponseError(non_json_paths[-1])
     raise RuntimeError("❌ Не удалось определить корректный REST-префикс.")
 
 
@@ -166,7 +193,7 @@ def _build_url(api_base: str, path: str) -> str:
 
 def get_product_by_sku(session: requests.Session, api_base: str, sku: str) -> dict:
     url = _build_url(api_base, f"/products/{quote(sku, safe='')}")
-    resp = session.get(url, timeout=20)
+    resp = session.get(url, headers=_magento_headers(session), timeout=20)
     content_type = resp.headers.get("Content-Type", "").lower()
     if "text/html" in content_type:
         raise RuntimeError(f"❌ HTML вместо JSON — проверь REST базу: {api_base}")
@@ -190,7 +217,7 @@ def get_attribute_sets_map(session: requests.Session, api_base: str) -> Dict[int
     )
     for url in urls:
         try:
-            resp = session.get(url, timeout=20)
+            resp = session.get(url, headers=_magento_headers(session), timeout=20)
         except requests.RequestException:
             continue
         content_type = resp.headers.get("Content-Type", "").lower()
@@ -213,7 +240,7 @@ def get_attribute_meta(session: requests.Session, api_base: str, code: str) -> d
         return _meta_cache[code]
     url = _build_url(api_base, f"/products/attributes/{quote(code, safe='')}")
     try:
-        resp = session.get(url, timeout=15)
+        resp = session.get(url, headers=_magento_headers(session), timeout=15)
     except requests.RequestException:
         _meta_cache[code] = {}
         return _meta_cache[code]
@@ -230,7 +257,7 @@ def list_categories(session: requests.Session, api_base: str) -> List[Dict[str, 
 
     url = _build_url(api_base, "/categories")
     try:
-        resp = session.get(url, timeout=30)
+        resp = session.get(url, headers=_magento_headers(session), timeout=30)
     except requests.RequestException as exc:
         raise RuntimeError("❌ Не удалось загрузить категории.") from exc
 
