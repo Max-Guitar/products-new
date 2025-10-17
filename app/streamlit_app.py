@@ -478,6 +478,44 @@ def apply_wide_edits_to_long(
     return updated
 
 
+def _ensure_wide_meta_options(
+    meta_map: dict[str, dict], sample_df: pd.DataFrame | None
+) -> None:
+    if not isinstance(meta_map, dict):
+        return
+    df = sample_df if isinstance(sample_df, pd.DataFrame) else None
+    for code, meta in meta_map.items():
+        if not isinstance(meta, dict):
+            continue
+        frontend = str(meta.get("frontend_input") or "").lower()
+        if frontend not in {"select", "boolean"}:
+            continue
+        options = meta.get("options") or []
+        if options:
+            continue
+        v2l = meta.get("values_to_labels") or {}
+        meta["options"] = [
+            {"label": lbl, "value": key}
+            for key, lbl in list(v2l.items())[:200]
+            if str(lbl).strip()
+        ]
+        if meta["options"]:
+            continue
+        if df is None or code not in df.columns:
+            continue
+        seen: set[str] = set()
+        opts: list[dict[str, str]] = []
+        for value in df[code].dropna().astype(str):
+            cleaned = value.strip()
+            if not cleaned or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            opts.append({"label": cleaned, "value": cleaned})
+            if len(opts) >= 200:
+                break
+        meta["options"] = opts
+
+
 def build_wide_colcfg(
     wide_meta: dict[str, dict], sample_df: pd.DataFrame | None = None
 ):
@@ -1412,6 +1450,10 @@ if "df_original" in st.session_state:
                                                 for code in attr_cols:
                                                     meta_for_set[code] = {}
                                             step2_state["wide_meta"][set_id] = meta_for_set
+                                            _ensure_wide_meta_options(
+                                                step2_state["wide_meta"][set_id],
+                                                step2_state["wide"].get(set_id),
+                                            )
                                         if set_id not in step2_state["wide_colcfg"]:
                                             step2_state["wide_colcfg"][set_id] = (
                                                 build_wide_colcfg(
@@ -1465,6 +1507,10 @@ if "df_original" in st.session_state:
                                                     for code in attr_codes:
                                                         meta_for_set[code] = {}
                                                 step2_state["wide_meta"][set_id] = meta_for_set
+                                            _ensure_wide_meta_options(
+                                                step2_state["wide_meta"].get(set_id, {}),
+                                                step2_state["wide"].get(set_id),
+                                            )
                                             if set_id not in step2_state["wide_colcfg"]:
                                                 step2_state["wide_colcfg"][set_id] = (
                                                     build_wide_colcfg(
@@ -1494,30 +1540,22 @@ if "df_original" in st.session_state:
                                         )
                                         if not isinstance(meta_map, dict):
                                             meta_map = {}
-                                        # DEBUG
-                                        st.write(
-                                            f"DEBUG set_id={set_id} keys:",
-                                            list(meta_map.keys())[:20],
-                                        )
-                                        st.write(
-                                            "DEBUG brand meta:",
-                                            meta_map.get("brand"),
-                                        )
-                                        st.write(
-                                            "DEBUG condition meta:",
-                                            meta_map.get("condition"),
-                                        )
-                                        st.write(
-                                            "DEBUG types:",
-                                            {
-                                                k: (
-                                                    v.get("frontend_input"),
-                                                    len(v.get("options") or []),
-                                                )
-                                                for k, v in meta_map.items()
-                                            },
-                                        )
-
+                                        _ensure_wide_meta_options(meta_map, df_ref)
+                                        missing = [
+                                            c
+                                            for c, m in meta_map.items()
+                                            if (
+                                                str(m.get("frontend_input") or "").lower()
+                                                in {"select", "boolean"}
+                                            )
+                                            and not (m.get("options") or [])
+                                        ]
+                                        if missing:
+                                            st.caption(
+                                                "DEBUG: no options for "
+                                                f"{len(missing)} attrs: "
+                                                + ", ".join(missing[:10])
+                                            )
                                         colcfg = build_wide_colcfg(
                                             meta_map, sample_df=df_ref
                                         )

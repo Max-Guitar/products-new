@@ -53,9 +53,25 @@ class AttributeMetaCache:
         """Store synthetic metadata (e.g. for categories) in the cache."""
         self._data[code] = info
 
-    @staticmethod
-    def _prepare_meta(code: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+    def _fetch_options_list(self, code: str) -> list[dict]:
+        try:
+            return (
+                magento_get(
+                    self._session,
+                    self._base_url,
+                    f"/products/attributes/{code}/options",
+                )
+                or []
+            )
+        except Exception:
+            return []
+
+    def _prepare_meta(self, code: str, meta: Dict[str, Any]) -> Dict[str, Any]:
         options = meta.get("options") or []
+        if not options:
+            options = self._fetch_options_list(meta.get("attribute_code") or code)
+            if options:
+                meta["options"] = options
         alias_map: Dict[Any, Any] = {}
         value_to_label: Dict[Any, str] = {}
         valid_examples: list[str] = []
@@ -83,23 +99,23 @@ class AttributeMetaCache:
                 value_to_label[str_value] = label
                 if int_value is not None:
                     value_to_label[int_value] = label
-                AttributeMetaCache._add_alias(alias_map, label, target)
-                AttributeMetaCache._add_alias(alias_map, label.lower(), target)
+                self._add_alias(alias_map, label, target)
+                self._add_alias(alias_map, label.lower(), target)
                 if label not in valid_examples and len(valid_examples) < 5:
                     valid_examples.append(label)
-            AttributeMetaCache._add_alias(alias_map, str_value, target)
+            self._add_alias(alias_map, str_value, target)
             if int_value is not None:
-                AttributeMetaCache._add_alias(alias_map, int_value, target)
-                AttributeMetaCache._add_alias(alias_map, str(int_value), target)
+                self._add_alias(alias_map, int_value, target)
+                self._add_alias(alias_map, str(int_value), target)
 
             aliases = opt.get("aliases") or []
             for alias in aliases:
-                AttributeMetaCache._add_alias(alias_map, alias, target)
+                self._add_alias(alias_map, alias, target)
 
             if code == "country_of_manufacture" and label:
                 for alias in country_aliases(label):
-                    AttributeMetaCache._add_alias(alias_map, alias, target)
-                    AttributeMetaCache._add_alias(alias_map, alias.upper(), target)
+                    self._add_alias(alias_map, alias, target)
+                    self._add_alias(alias_map, alias.upper(), target)
 
         prepared = dict(meta)
         prepared.setdefault("attribute_code", code)
