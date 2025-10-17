@@ -25,6 +25,7 @@ class AttributeMetaCache:
         self._base_url = base_url
         self._store: Dict[str, Dict[str, Any]] = {}
         self._aliases: Dict[str, str] = {}
+        self._debug_last: Dict[str, Dict[str, Any]] = {}
 
     def load(self, codes: list[str]) -> None:
         """Fetch metadata for the provided attribute codes if not cached."""
@@ -50,16 +51,53 @@ class AttributeMetaCache:
         for code in unique:
             lookup_code = self._aliases.get(code, code)
             try:
-                meta = magento_get(
-                    self._session,
-                    self._base_url,
-                    f"/products/attributes/{lookup_code}",
+                raw_meta = (
+                    magento_get(
+                        self._session,
+                        self._base_url,
+                        f"/products/attributes/{lookup_code}",
+                    )
+                    or {}
                 )
             except RuntimeError:
                 raise
             except Exception:  # pragma: no cover - network failure safety
-                meta = {}
-            prepared = self._prepare_meta(code, meta or {})
+                raw_meta = {}
+
+            try:
+                raw_opts = magento_get(
+                    self._session,
+                    self._base_url,
+                    f"/products/attributes/{lookup_code}/options?storeId=0",
+                )
+            except RuntimeError:
+                raise
+            except Exception:
+                raw_opts = []
+
+            self._debug_last[code] = {
+                "raw_meta_frontend_input": raw_meta.get("frontend_input"),
+                "raw_options_count": len(raw_opts) if isinstance(raw_opts, list) else -1,
+                "raw_options_sample": (raw_opts or [])[:5],
+            }
+
+            meta: Dict[str, Any] = dict(raw_meta or {})
+            meta.update(
+                {
+                    "attribute_code": code,
+                    "frontend_input": raw_meta.get("frontend_input"),
+                    "options": raw_opts,
+                }
+            )
+
+            prepared = self._prepare_meta(code, meta)
+            self._debug_last[code].update(
+                {
+                    "prepared_frontend_input": prepared.get("frontend_input"),
+                    "prepared_options_count": len(prepared.get("options") or []),
+                    "prepared_sample": (prepared.get("options") or [])[:3],
+                }
+            )
             self._store[code] = prepared
 
     def get(self, code: str) -> Optional[Dict[str, Any]]:
