@@ -477,7 +477,12 @@ def apply_wide_edits_to_long(
 
     return updated
 
-
+# сразу перед build_wide_colcfg(...)
+st.write("META brand:", step2_state["wide_meta"][set_id].get("brand"))
+st.write("META condition:", step2_state["wide_meta"][set_id].get("condition"))
+st.write("TYPES:",
+    {k:(v.get("frontend_input"), len(v.get("options") or []))
+     for k,v in step2_state["wide_meta"][set_id].items()})
 def build_wide_colcfg(
     wide_meta: dict[str, dict], sample_df: pd.DataFrame | None = None
 ):
