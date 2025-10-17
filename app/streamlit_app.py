@@ -526,6 +526,27 @@ def _refresh_wide_meta_from_cache(
     if target_codes:
         meta_cache.build_and_set_static_for(target_codes, store_id=0)
 
+    df_ref = wide_df if isinstance(wide_df, pd.DataFrame) else None
+    cats_series = df_ref.get("categories") if isinstance(df_ref, pd.DataFrame) else None
+    all_labels = sorted(
+        {
+            str(x)
+            for row in (cats_series if cats_series is not None else [])
+            for x in (row or [])
+            if isinstance(x, (str, int))
+        }
+    )
+    meta_cache.set_static(
+        "categories",
+        {
+            "attribute_code": "categories",
+            "frontend_input": "multiselect",
+            "options": [{"label": l, "value": l} for l in all_labels],
+            "options_map": {l: l for l in all_labels},
+            "values_to_labels": {l: l for l in all_labels},
+        },
+    )
+
     for code in unique_codes:
         cached_meta = meta_cache.get(code)
         if isinstance(cached_meta, dict):
@@ -555,22 +576,25 @@ def _coerce_for_ui(df: pd.DataFrame, meta_map: dict[str, dict]) -> pd.DataFrame:
     return out
 
 
-def _ensure_list_of_strings(value: object) -> list[str]:
+def _to_list_str(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, float) and math.isnan(value):
+        return []
     if isinstance(value, (list, tuple, set)):
-        values = list(value)
-    elif value in (None, ""):
-        values = []
-    else:
-        values = [value]
+        normalized: list[str] = []
+        for item in value:
+            if item in (None, ""):
+                continue
+            if isinstance(item, float) and math.isnan(item):
+                continue
+            normalized.append(str(item))
+        return normalized
+    return [str(value)]
 
-    normalized: list[str] = []
-    for item in values:
-        if item in (None, ""):
-            continue
-        if isinstance(item, float) and math.isnan(item):
-            continue
-        normalized.append(str(item))
-    return normalized
+
+def _ensure_list_of_strings(value: object) -> list[str]:
+    return _to_list_str(value)
 
 
 def _ensure_config_options(
@@ -1830,6 +1854,48 @@ if "df_original" in st.session_state:
                                         df_ref = _coerce_for_ui(wide_df, meta_map)
                                         _ensure_wide_meta_options(meta_map, df_ref)
 
+                                        all_labels: list[str] = []
+                                        if (
+                                            isinstance(df_ref, pd.DataFrame)
+                                            and "categories" in df_ref.columns
+                                        ):
+                                            df_ref["categories"] = df_ref["categories"].apply(
+                                                _to_list_str
+                                            )
+                                            cats_series = df_ref.get("categories")
+                                            all_labels = sorted(
+                                                {
+                                                    str(x)
+                                                    for row in (
+                                                        cats_series
+                                                        if cats_series is not None
+                                                        else []
+                                                    )
+                                                    for x in (row or [])
+                                                    if isinstance(x, (str, int))
+                                                }
+                                            )
+                                            if isinstance(
+                                                meta_cache_obj, AttributeMetaCache
+                                            ):
+                                                meta_cache_obj.set_static(
+                                                    "categories",
+                                                    {
+                                                        "attribute_code": "categories",
+                                                        "frontend_input": "multiselect",
+                                                        "options": [
+                                                            {"label": l, "value": l}
+                                                            for l in all_labels
+                                                        ],
+                                                        "options_map": {
+                                                            l: l for l in all_labels
+                                                        },
+                                                        "values_to_labels": {
+                                                            l: l for l in all_labels
+                                                        },
+                                                    },
+                                                )
+
                                         string_cols = [
                                             col
                                             for col in ("brand", "condition")
@@ -1925,6 +1991,21 @@ if "df_original" in st.session_state:
                                         colcfg = build_wide_colcfg(
                                             meta_map, sample_df=df_ref
                                         )
+                                        if (
+                                            isinstance(df_ref, pd.DataFrame)
+                                            and "categories" in df_ref.columns
+                                        ):
+                                            existing_cfg = colcfg.get("categories")
+                                            label = (
+                                                getattr(existing_cfg, "label", None)
+                                                or getattr(existing_cfg, "_label", None)
+                                                or "categories"
+                                            )
+                                            colcfg["categories"] = (
+                                                st.column_config.MultiselectColumn(
+                                                    label, options=all_labels
+                                                )
+                                            )
                                         step2_state["wide_colcfg"][set_id] = colcfg
 
                                         set_title = step2_state["set_names"].get(
