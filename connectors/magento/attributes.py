@@ -53,13 +53,13 @@ class AttributeMetaCache:
         """Store synthetic metadata (e.g. for categories) in the cache."""
         self._data[code] = info
 
-    def _fetch_options_list(self, code: str) -> list[dict]:
+    def _fetch_options_list(self, code: str, store_id: int = 0) -> list[dict]:
         try:
             return (
                 magento_get(
                     self._session,
                     self._base_url,
-                    f"/products/attributes/{code}/options",
+                    f"/products/attributes/{code}/options?storeId={store_id}",
                 )
                 or []
             )
@@ -67,11 +67,31 @@ class AttributeMetaCache:
             return []
 
     def _prepare_meta(self, code: str, meta: Dict[str, Any]) -> Dict[str, Any]:
-        options = meta.get("options") or []
-        if not options:
-            options = self._fetch_options_list(meta.get("attribute_code") or code)
-            if options:
-                meta["options"] = options
+        prepared = dict(meta)
+        prepared.setdefault("attribute_code", code)
+
+        raw_options = list(prepared.get("options") or [])
+        if not raw_options:
+            fetch_code = prepared.get("attribute_code") or code
+            raw_options = self._fetch_options_list(fetch_code)
+            if not raw_options and code == "brand":
+                raw_options = self._fetch_options_list("manufacturer")
+
+        options: list[dict[str, Any]] = []
+        for opt in raw_options:
+            if not isinstance(opt, dict):
+                continue
+            label_raw = opt.get("label")
+            value = opt.get("value")
+            label = str(label_raw).strip() if isinstance(label_raw, str) else ""
+            if not label:
+                continue
+            if value in (None, ""):
+                continue
+            options.append({"label": label, "value": value})
+
+        prepared["options"] = options
+
         alias_map: Dict[Any, Any] = {}
         value_to_label: Dict[Any, str] = {}
         valid_examples: list[str] = []
@@ -117,8 +137,6 @@ class AttributeMetaCache:
                     self._add_alias(alias_map, alias, target)
                     self._add_alias(alias_map, alias.upper(), target)
 
-        prepared = dict(meta)
-        prepared.setdefault("attribute_code", code)
         prepared["options_map"] = alias_map
         prepared["values_to_labels"] = value_to_label
         prepared["valid_examples"] = valid_examples

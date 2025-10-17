@@ -517,6 +517,76 @@ def _ensure_wide_meta_options(
         meta["options"] = opts
 
 
+def _refresh_wide_meta_from_cache(
+    meta_cache: AttributeMetaCache | None,
+    meta_map: dict[str, dict],
+    attr_codes: list[str],
+    wide_df: pd.DataFrame | None,
+) -> None:
+    if not isinstance(meta_map, dict) or not attr_codes:
+        return
+
+    df = wide_df if isinstance(wide_df, pd.DataFrame) else None
+
+    for code in attr_codes:
+        cached_meta = (
+            meta_cache.get(code)
+            if isinstance(meta_cache, AttributeMetaCache)
+            else None
+        )
+        existing = meta_map.get(code)
+        if not isinstance(existing, dict):
+            existing = {}
+        else:
+            existing = dict(existing)
+
+        if isinstance(cached_meta, dict):
+            merged = dict(existing)
+            for key, value in cached_meta.items():
+                if key == "options":
+                    cleaned_opts: list[dict[str, object]] = []
+                    for opt in value or []:
+                        if not isinstance(opt, dict):
+                            continue
+                        label = opt.get("label")
+                        label_str = (
+                            label.strip()
+                            if isinstance(label, str)
+                            else ""
+                        )
+                        if not label_str:
+                            continue
+                        cleaned_opts.append(
+                            {
+                                "label": label_str,
+                                "value": opt.get("value"),
+                            }
+                        )
+                    merged["options"] = cleaned_opts
+                else:
+                    merged[key] = value
+            existing = merged
+
+        options_list = existing.get("options")
+        if not isinstance(options_list, list):
+            existing["options"] = []
+        if not existing.get("options") and df is not None and code in df.columns:
+            seen: set[str] = set()
+            fallback: list[dict[str, str]] = []
+            series = df[code].dropna()
+            for raw in series.astype(str):
+                cleaned = raw.strip()
+                if not cleaned or cleaned in seen:
+                    continue
+                seen.add(cleaned)
+                fallback.append({"label": cleaned, "value": cleaned})
+                if len(fallback) >= 200:
+                    break
+            existing["options"] = fallback
+
+        meta_map[code] = existing
+
+
 def _coerce_for_ui(df: pd.DataFrame, meta_map: dict[str, dict]) -> pd.DataFrame:
     out = df.copy()
     for code, meta in (meta_map or {}).items():
@@ -612,15 +682,20 @@ def build_wide_colcfg(
                 is_list_series = series.apply(
                     lambda v: isinstance(v, (list, tuple, set)) or v in (None, "")
                 ).all()
-            if is_list_series:
+            if is_list_series and len(opts) > 1:
                 cfg[code] = st.column_config.MultiselectColumn(
                     _attr_label(meta, code), options=opts
                 )
             else:
                 cfg[code] = st.column_config.TextColumn(_attr_label(meta, code))
         elif bool_like:
-            cfg[code] = st.column_config.CheckboxColumn(_attr_label(meta, code))
-        elif select_like and opts:
+            if len(opts) > 1:
+                cfg[code] = st.column_config.CheckboxColumn(
+                    _attr_label(meta, code)
+                )
+            else:
+                cfg[code] = st.column_config.TextColumn(_attr_label(meta, code))
+        elif select_like and len(opts) > 1:
             cfg[code] = st.column_config.SelectboxColumn(
                 _attr_label(meta, code), options=opts
             )
@@ -1516,30 +1591,31 @@ if "df_original" in st.session_state:
                                             for col in wide_df.columns
                                             if col not in ("sku", "name")
                                         ]
-                                        if isinstance(
+                                        cacheable = isinstance(
                                             meta_cache_obj, AttributeMetaCache
-                                        ) and attr_cols:
+                                        )
+                                        if cacheable and attr_cols:
                                             meta_cache_obj.load(attr_cols)
-                                        meta_for_set: dict[str, dict] = {}
-                                        if set_id not in step2_state["wide_meta"]:
-                                            if isinstance(
-                                                meta_cache_obj, AttributeMetaCache
-                                            ):
-                                                for code in attr_cols:
-                                                    meta_for_set[code] = (
-                                                        meta_cache_obj.get(code) or {}
-                                                    )
-                                            else:
-                                                for code in attr_cols:
-                                                    meta_for_set[code] = {}
-                                            step2_state["wide_meta"][set_id] = meta_for_set
-                                            _apply_categories_fallback(
-                                                step2_state["wide_meta"][set_id]
-                                            )
-                                            _ensure_wide_meta_options(
-                                                step2_state["wide_meta"][set_id],
-                                                step2_state["wide"].get(set_id),
-                                            )
+                                        meta_map = step2_state["wide_meta"].setdefault(
+                                            set_id, {}
+                                        )
+                                        if not isinstance(meta_map, dict):
+                                            meta_map = {}
+                                            step2_state["wide_meta"][set_id] = meta_map
+                                        for code in attr_cols:
+                                            if code not in meta_map:
+                                                meta_map[code] = {}
+                                        _refresh_wide_meta_from_cache(
+                                            meta_cache_obj if cacheable else None,
+                                            meta_map,
+                                            attr_cols,
+                                            wide_df,
+                                        )
+                                        _apply_categories_fallback(meta_map)
+                                        _ensure_wide_meta_options(
+                                            meta_map,
+                                            step2_state["wide"].get(set_id),
+                                        )
                                         if set_id not in step2_state["wide_colcfg"]:
                                             meta_map = step2_state["wide_meta"].get(
                                                 set_id, {}
@@ -1580,23 +1656,25 @@ if "df_original" in st.session_state:
                                                 for col in wide_df.columns
                                                 if col not in ("sku", "name")
                                             ]
-                                            if isinstance(
+                                            cacheable = isinstance(
                                                 meta_obj, AttributeMetaCache
-                                            ) and attr_codes:
+                                            )
+                                            if cacheable and attr_codes:
                                                 meta_obj.load(attr_codes)
-                                            if set_id not in step2_state["wide_meta"]:
-                                                meta_for_set: dict[str, dict] = {}
-                                                if isinstance(meta_obj, AttributeMetaCache):
-                                                    for code in attr_codes:
-                                                        meta_for_set[code] = (
-                                                            meta_obj.get(code) or {}
-                                                        )
-                                                else:
-                                                    for code in attr_codes:
-                                                        meta_for_set[code] = {}
-                                                step2_state["wide_meta"][set_id] = meta_for_set
-                                            meta_map = step2_state["wide_meta"].get(
+                                            meta_map = step2_state["wide_meta"].setdefault(
                                                 set_id, {}
+                                            )
+                                            if not isinstance(meta_map, dict):
+                                                meta_map = {}
+                                                step2_state["wide_meta"][set_id] = meta_map
+                                            for code in attr_codes:
+                                                if code not in meta_map:
+                                                    meta_map[code] = {}
+                                            _refresh_wide_meta_from_cache(
+                                                meta_obj if cacheable else None,
+                                                meta_map,
+                                                attr_codes,
+                                                wide_df,
                                             )
                                             _apply_categories_fallback(meta_map)
                                             _ensure_wide_meta_options(
