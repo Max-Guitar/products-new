@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
-from urllib.parse import quote
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from urllib.parse import quote, urlencode
 
 import pandas as pd
 import requests
@@ -41,7 +41,11 @@ def get_attr_set_id(
         "searchCriteria[filter_groups][0][filters][0][value]": name,
         "searchCriteria[filter_groups][0][filters][0][condition_type]": "eq",
     }
-    data = magento_get(session, base_url, "/products/attribute-sets/sets/list", params=params)
+    data = magento_get(
+        session,
+        base_url,
+        _with_query("/products/attribute-sets/sets/list", params),
+    )
     items = data.get("items", [])
     if not items:
         raise ValueError(f'Attribute set "{name}" not found')
@@ -60,7 +64,11 @@ def list_attribute_sets(
             "searchCriteria[pageSize]": page_size,
             "searchCriteria[currentPage]": page,
         }
-        data = magento_get(session, base_url, "/products/attribute-sets/sets/list", params=params)
+        data = magento_get(
+            session,
+            base_url,
+            _with_query("/products/attribute-sets/sets/list", params),
+        )
         items = data.get("items", []) or []
         for item in items:
             name = (item.get("attribute_set_name") or "").strip()
@@ -89,7 +97,11 @@ def iter_products_by_attr_set(
             "searchCriteria[pageSize]": page_size,
             "searchCriteria[currentPage]": page,
         }
-        data = magento_get(session, base_url, "/products", params=params)
+        data = magento_get(
+            session,
+            base_url,
+            _with_query("/products", params),
+        )
         if total_count is None:
             total_count = int(data.get("total_count", 0) or 0)
         items = data.get("items", []) or []
@@ -116,7 +128,11 @@ def get_source_items(
             "searchCriteria[pageSize]": page_size,
             "searchCriteria[currentPage]": page,
         }
-        data = magento_get(session, base_url, "/inventory/source-items", params=params)
+        data = magento_get(
+            session,
+            base_url,
+            _with_query("/inventory/source-items", params),
+        )
         items = data.get("items", []) or []
         collected.extend(items)
         if not items or len(items) < page_size:
@@ -127,14 +143,14 @@ def get_source_items(
 
 def detect_default_source_code(session: requests.Session, base_url: str) -> str:
     try:
+        params = {
+            "searchCriteria[pageSize]": 500,
+            "searchCriteria[currentPage]": 1,
+        }
         data = magento_get(
             session,
             base_url,
-            "/inventory/sources",
-            {
-                "searchCriteria[pageSize]": 500,
-                "searchCriteria[currentPage]": 1,
-            },
+            _with_query("/inventory/sources", params),
         )
         for source in data.get("items", []) or []:
             code = (source.get("source_code") or "").strip()
@@ -324,3 +340,13 @@ def load_default_items(session: requests.Session, base_url: str) -> pd.DataFrame
     )
 
     return out[["sku", "name", "attribute set", "date created"]].reset_index(drop=True)
+
+
+def _with_query(path: str, params: Optional[Dict[str, Any]] = None) -> str:
+    if not params:
+        return path
+    query = urlencode(params, doseq=True)
+    if not query:
+        return path
+    separator = "&" if "?" in path else "?"
+    return f"{path}{separator}{query}"
