@@ -1,20 +1,57 @@
 """Magento attribute metadata cache with alias-aware option lookup."""
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import requests
 
 try:
-    from connectors.magento.client import magento_get
+    from connectors.magento.client import (
+        MAGENTO_ADMIN_TOKEN,
+        get_api_base,
+        magento_get,
+    )
 except ModuleNotFoundError:  # pragma: no cover - fallback for notebooks
     from connectors.magento import client as _client
 
+    MAGENTO_ADMIN_TOKEN = _client.MAGENTO_ADMIN_TOKEN
+    get_api_base = _client.get_api_base
     magento_get = _client.magento_get
 from services.country_aliases import country_aliases
 
 
 CANDIDATE_BRAND_CODES = ["brand", "manufacturer", "brand_name"]
+
+
+def magento_get_logged(
+    session: requests.Session,
+    base_url: str,
+    path: str,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: int = 30,
+) -> Tuple[int, Optional[str], str, requests.Response]:
+    """Perform a GET request to Magento capturing HTTP details without enforcing JSON."""
+
+    if not path.startswith("/"):
+        path = "/" + path
+    url = get_api_base(base_url) + path
+
+    auth_headers: Dict[str, str] = {"Accept": "application/json"}
+    token = MAGENTO_ADMIN_TOKEN.strip()
+    if token:
+        auth_headers["Authorization"] = f"Bearer {token}"
+    elif session.headers.get("Authorization"):
+        auth_headers["Authorization"] = session.headers["Authorization"]
+
+    if headers:
+        auth_headers.update(headers)
+
+    response = session.get(url, headers=auth_headers, timeout=timeout)
+    status = response.status_code
+    content_type = response.headers.get("Content-Type")
+    body_snippet = response.text
+
+    return status, content_type, body_snippet, response
 
 
 class AttributeMetaCache:
@@ -26,6 +63,7 @@ class AttributeMetaCache:
         self._store: Dict[str, Dict[str, Any]] = {}
         self._aliases: Dict[str, str] = {}
         self._debug_last: Dict[str, Dict[str, Any]] = {}
+        self._debug_http: Dict[str, Dict[str, Any]] = {}
 
     def load(self, codes: list[str]) -> None:
         """Fetch metadata for the provided attribute codes if not cached."""
@@ -125,109 +163,114 @@ class AttributeMetaCache:
             unique.append(code)
 
         for code in unique:
+            meta_status: Optional[int] = None
+            meta_ctype: Optional[str] = None
             raw_meta: Dict[str, Any] = {}
             try:
-                raw_meta = (
-                    magento_get(
-                        self._session,
-                        self._base_url,
-                        f"/products/attributes/{code}",
-                    )
-                    or {}
+                meta_status, meta_ctype, _body, resp = magento_get_logged(
+                    self._session,
+                    self._base_url,
+                    f"/products/attributes/{code}",
+                    headers={"Accept": "application/json"},
                 )
-            except RuntimeError:
-                raise
+                if "application/json" in (meta_ctype or ""):
+                    try:
+                        raw_meta = resp.json()
+                    except ValueError:
+                        raw_meta = {}
             except Exception:
                 raw_meta = {}
 
-            options_raw: list[dict] = []
-            options_source = "fallback"
+            tried: list[str] = []
+            raw_opts: list[Dict[str, Any]] = []
+            opts_status: Optional[int] = None
+            opts_ctype: Optional[str] = None
             for path in (
                 f"/products/attributes/{code}/options?storeId={store_id}",
                 f"/products/attributes/{code}/options",
                 f"/products/attributes/{code}/options?storeId=1",
             ):
+                tried.append(path)
                 try:
-                    data = magento_get(self._session, self._base_url, path)
-                except RuntimeError:
-                    raise
+                    status, ctype, _body, resp = magento_get_logged(
+                        self._session,
+                        self._base_url,
+                        path,
+                    )
+                    opts_status, opts_ctype = status, ctype
+                    if "application/json" in (ctype or ""):
+                        try:
+                            data = resp.json()
+                        except ValueError:
+                            data = None
+                        if isinstance(data, list):
+                            raw_opts = data
+                            break
                 except Exception:
                     continue
-                if isinstance(data, list):
-                    options_raw = data
-                    options_source = "magento"
-                    break
+
+            self._debug_http[code] = {
+                "meta_status": meta_status,
+                "meta_ctype": meta_ctype,
+                "paths_tried": tried,
+                "opts_status": opts_status,
+                "opts_ctype": opts_ctype,
+                "opts_count": len(raw_opts) if isinstance(raw_opts, list) else -1,
+                "opts_sample": (raw_opts or [])[:5],
+            }
 
             cleaned: list[Dict[str, Any]] = []
             seen: set[tuple[str, str]] = set()
-            for opt in options_raw or []:
+            valid_examples: list[str] = []
+            for opt in raw_opts or []:
                 if not isinstance(opt, dict):
                     continue
-                value = opt.get("value")
-                if value in (None, ""):
+                val = opt.get("value")
+                if val in (None, ""):
                     continue
-                label = str(opt.get("label", "")).strip()
-                if not label:
-                    label = str(value).strip()
-                if not label:
-                    continue
-                key = (str(value), label)
+                lbl = str(opt.get("label", "")).strip() or str(val).strip()
+                key = (str(val), lbl)
                 if key in seen:
                     continue
                 seen.add(key)
-                cleaned.append({"label": label, "value": value})
+                cleaned.append({"label": lbl, "value": val})
+                if lbl not in valid_examples and len(valid_examples) < 10:
+                    valid_examples.append(lbl)
 
-            frontend_input = str(raw_meta.get("frontend_input") or "text").lower()
+            ftype = (raw_meta.get("frontend_input") or "text").lower()
             if (raw_meta.get("frontend_input") or "").lower() == "boolean":
-                frontend_input = "boolean"
-            elif cleaned and frontend_input != "multiselect":
-                frontend_input = "select"
+                ftype = "boolean"
+            elif cleaned and ftype in {"", "text", "varchar", "static"}:
+                ftype = "select"
 
-            options_map: Dict[Any, Any] = {}
-            values_to_labels: Dict[Any, str] = {}
-            valid_examples: list[str] = []
-
-            for option in cleaned:
-                label = option.get("label")
-                value = option.get("value")
-                if not isinstance(label, str):
-                    continue
-                label_clean = label.strip()
-                if not label_clean:
-                    continue
-                if label_clean not in valid_examples and len(valid_examples) < 10:
-                    valid_examples.append(label_clean)
-
-                str_value = str(value)
-                values_to_labels[str_value] = label_clean
-                try:
-                    int_value = int(str_value)
-                except (TypeError, ValueError):
-                    int_value = None
-                if int_value is not None:
-                    values_to_labels[int_value] = label_clean
-
-                self._add_alias(options_map, label_clean, value)
-                self._add_alias(options_map, label_clean.lower(), value)
-                self._add_alias(options_map, str_value, value)
-                if int_value is not None:
-                    self._add_alias(options_map, int_value, value)
-                    self._add_alias(options_map, str(int_value), value)
+            options_map = {opt["label"]: opt["value"] for opt in cleaned}
+            values_to_labels = {
+                str(opt["value"]): opt["label"] for opt in cleaned
+            }
 
             prepared = {
                 "attribute_code": code,
-                "frontend_input": frontend_input,
+                "frontend_input": ftype,
                 "options": cleaned,
                 "options_map": options_map,
                 "values_to_labels": values_to_labels,
                 "valid_examples": valid_examples,
-                "options_source": options_source,
             }
 
-            if frontend_input == "boolean" and not cleaned:
-                prepared.setdefault("options", [])
-
             self.set_static(code, prepared)
+
+    def list_set_attributes(self, set_id: int):
+        try:
+            data = magento_get(
+                self._session,
+                self._base_url,
+                f"/products/attribute-sets/attributes/{set_id}",
+            )
+            if isinstance(data, list):
+                return data
+            return []
+        except Exception:
+            return []
 
     def _fetch_options(self, code: str, store_id: int = 0) -> list[dict]:
         for path in (
