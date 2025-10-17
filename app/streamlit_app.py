@@ -577,11 +577,7 @@ def build_wide_colcfg(
     for code, original_meta in list(wide_meta.items()):
         meta = original_meta or {}
         t = (meta.get("frontend_input") or meta.get("backend_type") or "text").lower()
-        opts = [
-            str(opt.get("label"))
-            for opt in (meta.get("options") or [])
-            if str(opt.get("label", "")).strip()
-        ]
+        opts = _meta_options(meta)
 
         if t == "multiselect":
             cfg[code] = st.column_config.MultiselectColumn(
@@ -1490,35 +1486,36 @@ if "df_original" in st.session_state:
                                         cacheable = isinstance(
                                             meta_cache_obj, AttributeMetaCache
                                         )
+                                        st.write(
+                                            "DEBUG attr_cols:",
+                                            sorted(attr_cols),
+                                        )
+                                        if cacheable:
+                                            fetch_codes = [
+                                                code
+                                                for code in attr_cols
+                                                if isinstance(code, str)
+                                            ]
+                                            if fetch_codes:
+                                                meta_cache_obj.build_and_set_static_for(
+                                                    fetch_codes, store_id=0
+                                                )
                                         wide_meta = step2_state.setdefault("wide_meta", {})
-                                        meta_map = wide_meta.setdefault(set_id, {})
-                                        if not isinstance(meta_map, dict):
-                                            meta_map = {}
-                                            wide_meta[set_id] = meta_map
-                                        for code in attr_cols:
-                                            if code not in meta_map:
-                                                meta_map[code] = {}
-                                        try:
-                                            _refresh_wide_meta_from_cache(
-                                                meta_cache_obj if cacheable else None,
-                                                meta_map,
-                                                attr_cols,
-                                                wide_df,
-                                            )
-                                        except RuntimeError:
-                                            st.error(
-                                                "❌ Magento returned non-JSON for attributes/options. "
-                                                "Check REST base (/rest/V1) or ACL/WAF."
-                                            )
-                                            st.stop()
+                                        meta_map: dict[str, dict] = {}
+                                        if cacheable:
+                                            for code in attr_cols:
+                                                cached = meta_cache_obj.get(code) or {}
+                                                if not isinstance(cached, dict):
+                                                    cached = {}
+                                                meta_map[code] = cached
+                                        else:
+                                            meta_map = {code: {} for code in attr_cols}
+                                        wide_meta[set_id] = meta_map
                                         _apply_categories_fallback(meta_map)
                                         _ensure_wide_meta_options(
                                             meta_map,
                                             step2_state["wide"].get(set_id),
                                         )
-                                        wide_meta[set_id] = {
-                                            code: meta_map.get(code, {}) for code in attr_cols
-                                        }
                                         meta_for_debug = wide_meta[set_id]
                                         def _meta_shot(code: str) -> dict:
                                             m = meta_for_debug.get(code, {})
@@ -1579,37 +1576,40 @@ if "df_original" in st.session_state:
                                             cacheable = isinstance(
                                                 meta_obj, AttributeMetaCache
                                             )
+                                            st.write(
+                                                "DEBUG attr_cols:",
+                                                sorted(attr_codes),
+                                            )
+                                            if cacheable:
+                                                fetch_codes = [
+                                                    code
+                                                    for code in attr_codes
+                                                    if isinstance(code, str)
+                                                ]
+                                                if fetch_codes:
+                                                    meta_obj.build_and_set_static_for(
+                                                        fetch_codes, store_id=0
+                                                    )
                                             wide_meta = step2_state.setdefault(
                                                 "wide_meta", {}
                                             )
-                                            meta_map = wide_meta.setdefault(set_id, {})
-                                            if not isinstance(meta_map, dict):
-                                                meta_map = {}
-                                                wide_meta[set_id] = meta_map
-                                            for code in attr_codes:
-                                                if code not in meta_map:
-                                                    meta_map[code] = {}
-                                            try:
-                                                _refresh_wide_meta_from_cache(
-                                                    meta_obj if cacheable else None,
-                                                    meta_map,
-                                                    attr_codes,
-                                                    wide_df,
-                                                )
-                                            except RuntimeError:
-                                                st.error(
-                                                    "❌ Magento returned non-JSON for attributes/options. "
-                                                    "Check REST base (/rest/V1) or ACL/WAF."
-                                                )
-                                                st.stop()
+                                            meta_map: dict[str, dict] = {}
+                                            if cacheable:
+                                                for code in attr_codes:
+                                                    cached = meta_obj.get(code) or {}
+                                                    if not isinstance(cached, dict):
+                                                        cached = {}
+                                                    meta_map[code] = cached
+                                            else:
+                                                meta_map = {
+                                                    code: {} for code in attr_codes
+                                                }
+                                            wide_meta[set_id] = meta_map
                                             _apply_categories_fallback(meta_map)
                                             _ensure_wide_meta_options(
                                                 meta_map,
                                                 step2_state["wide"].get(set_id),
                                             )
-                                            wide_meta[set_id] = {
-                                                code: meta_map.get(code, {}) for code in attr_codes
-                                            }
                                             meta_for_debug = wide_meta[set_id]
 
                                             def _meta_shot(code: str) -> dict:
@@ -1688,6 +1688,42 @@ if "df_original" in st.session_state:
                                         st.write("condition:", _meta_shot("condition"))
                                         st.write("DEBUG types distribution:", counts)
 
+                                        meta_cache_obj = step2_state.get("meta_cache")
+                                        dbg_source = (
+                                            getattr(meta_cache_obj, "_debug_http", {})
+                                            if isinstance(meta_cache_obj, AttributeMetaCache)
+                                            else {}
+                                        )
+                                        dbg = dbg_source.copy() if isinstance(dbg_source, dict) else {}
+                                        attrs_in_set = (
+                                            meta_cache_obj.list_set_attributes(set_id)
+                                            if isinstance(meta_cache_obj, AttributeMetaCache)
+                                            else []
+                                        )
+                                        st.write("HTTP brand:", dbg.get("brand"))
+                                        st.write("HTTP condition:", dbg.get("condition"))
+                                        st.write(
+                                            "META brand:",
+                                            meta_map.get("brand"),
+                                        )
+                                        st.write(
+                                            "META condition:",
+                                            meta_map.get("condition"),
+                                        )
+                                        st.write(
+                                            "SET attrs (brand/condition/manufacturer):",
+                                            {
+                                                a.get("attribute_code"): (
+                                                    a.get("frontend_input"),
+                                                    a.get("is_required"),
+                                                )
+                                                for a in attrs_in_set
+                                                if isinstance(a, dict)
+                                                and a.get("attribute_code")
+                                                in ("brand", "condition", "manufacturer")
+                                            },
+                                        )
+
                                         colcfg = build_wide_colcfg(
                                             meta_map, sample_df=df_ref
                                         )
@@ -1699,14 +1735,19 @@ if "df_original" in st.session_state:
                                         st.markdown(
                                             f"#### {_format_attr_set_title(set_title)} (ID {set_id})"
                                         )
-                                        column_order = [
-                                            "sku",
-                                            "name",
-                                        ] + [
+                                        attr_cols = [
                                             col
                                             for col in df_ref.columns
                                             if col not in ("sku", "name")
                                         ]
+                                        st.write(
+                                            "DEBUG attr_cols:",
+                                            sorted(attr_cols),
+                                        )
+                                        column_order = [
+                                            "sku",
+                                            "name",
+                                        ] + attr_cols
                                         edited_df = st.data_editor(
                                             df_ref,
                                             key=f"step2_wide::{set_id}",
