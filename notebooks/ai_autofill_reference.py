@@ -60,13 +60,26 @@ def _looks_like_json(text: str) -> bool:
     except Exception: return False
 
 def probe_api_base(origin: str, token: str) -> str:
-    for path in ["/rest/V1", "/rest/default/V1", "/rest/all/V1", "/index.php/rest/V1"]:
+    non_json_paths = []
+    for path in ["/rest/all/V1", "/index.php/rest/all/V1", "/rest/V1", "/index.php/rest/V1"]:
         base = origin.rstrip("/") + path
         try:
-            r = requests.get(f"{base}/store/storeViews", headers=_headers(token), timeout=10)
-            if r.status_code in (200,401,403) and ("json" in r.headers.get("Content-Type","").lower() or _looks_like_json(r.text)):
-                return base
-        except Exception: pass
+            r = requests.get(
+                f"{base}/store/storeViews", headers=_headers(token), timeout=10
+            )
+        except Exception:
+            continue
+        content_type = r.headers.get("Content-Type", "").lower()
+        if "json" not in content_type:
+            non_json_paths.append(base)
+            continue
+        if r.status_code in (200, 401, 403):
+            return base
+    if non_json_paths:
+        raise RuntimeError(
+            "❌ HTML вместо JSON — проверь base URL или WAF/Cloudflare; "
+            f"попробован путь: {non_json_paths[-1]}"
+        )
     raise RuntimeError("❌ Не удалось определить корректный REST-префикс.")
 
 def get_product_by_sku(api_base, token, sku):

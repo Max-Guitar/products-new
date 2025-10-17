@@ -18,6 +18,7 @@ from connectors.magento.attributes import AttributeMetaCache
 from services.ai_fill import (
     ALWAYS_ATTRS,
     SET_ATTRS,
+    HTMLResponseError,
     collect_attributes_table,
     compute_allowed_attrs,
     get_attribute_sets_map,
@@ -34,7 +35,7 @@ from services.inventory import (
     list_attribute_sets,
 )
 from services.normalizers import normalize_for_magento
-from utils.http import get_session
+from utils.http import build_magento_headers, get_session
 
 
 _DEF_ATTR_SET_NAME = "Default"
@@ -516,6 +517,40 @@ def _ensure_wide_meta_options(
         meta["options"] = opts
 
 
+def _coerce_for_ui(df: pd.DataFrame, meta_map: dict[str, dict]) -> pd.DataFrame:
+    out = df.copy()
+    for code, meta in (meta_map or {}).items():
+        t = (meta.get("frontend_input") or meta.get("backend_type") or "text").lower()
+        if code not in out.columns:
+            continue
+        if t == "boolean":
+            out[code] = out[code].apply(
+                lambda v: str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+                if v not in (None, "")
+                else False
+            )
+        elif t == "multiselect":
+            out[code] = out[code].apply(
+                lambda v: v
+                if isinstance(v, (list, tuple, set))
+                else ([] if v in (None, "") else [str(v).strip()])
+            )
+        else:
+            out[code] = out[code].astype(object)
+    return out
+
+
+def _apply_categories_fallback(meta_map: dict[str, dict]) -> None:
+    if not isinstance(meta_map, dict):
+        return
+    if not st.session_state.get("step2_categories_failed"):
+        return
+    meta = meta_map.get("categories")
+    if isinstance(meta, dict):
+        meta["frontend_input"] = "text"
+        meta.pop("options", None)
+
+
 def build_wide_colcfg(
     wide_meta: dict[str, dict], sample_df: pd.DataFrame | None = None
 ):
@@ -524,7 +559,22 @@ def build_wide_colcfg(
         "name": st.column_config.TextColumn("Name", disabled=True),
     }
 
-    for code, meta in wide_meta.items():
+    df_sample = sample_df if isinstance(sample_df, pd.DataFrame) else None
+
+    for code, original_meta in list(wide_meta.items()):
+        meta = original_meta or {}
+        series = df_sample[code] if (df_sample is not None and code in df_sample.columns) else None
+        frontend_input = (meta.get("frontend_input") or meta.get("backend_type") or "text").lower()
+        if (
+            frontend_input == "boolean"
+            and not meta.get("options")
+            and isinstance(series, pd.Series)
+            and not series.map(lambda v: isinstance(v, bool) or v in (None, "")).all()
+        ):
+            meta = dict(meta)
+            meta["frontend_input"] = "text"
+            wide_meta[code] = meta
+
         t = (meta.get("frontend_input") or meta.get("backend_type") or "text").lower()
         opts = [
             opt.get("label")
@@ -552,18 +602,25 @@ def build_wide_colcfg(
         select_like = (t == "select") or (
             opts and t in {"", "text", "varchar", "static"}
         )
-        bool_like = (t == "boolean") or (
-            opts
-            and ({s.lower() for s in opts} <= {"yes", "no", "0", "1", "true", "false"})
-        )
+        bool_like = t == "boolean"
+        if bool_like and isinstance(series, pd.Series):
+            bool_like = series.map(type).eq(bool).all()
 
-        if bool_like:
+        if t == "multiselect":
+            is_list_series = False
+            if isinstance(series, pd.Series):
+                is_list_series = series.apply(
+                    lambda v: isinstance(v, (list, tuple, set)) or v in (None, "")
+                ).all()
+            if is_list_series:
+                cfg[code] = st.column_config.MultiselectColumn(
+                    _attr_label(meta, code), options=opts
+                )
+            else:
+                cfg[code] = st.column_config.TextColumn(_attr_label(meta, code))
+        elif bool_like:
             cfg[code] = st.column_config.CheckboxColumn(_attr_label(meta, code))
-        elif t == "multiselect":
-            cfg[code] = st.column_config.MultiselectColumn(
-                _attr_label(meta, code), options=opts
-            )
-        elif select_like:
+        elif select_like and opts:
             cfg[code] = st.column_config.SelectboxColumn(
                 _attr_label(meta, code), options=opts
             )
@@ -884,7 +941,12 @@ def apply_product_update(session, api_base: str, sku: str, attributes: dict):
         payload["extension_attributes"] = extension_attributes
 
     url = f"{api_base.rstrip('/')}/products/{quote(sku, safe='')}"
-    resp = session.put(url, json={"product": payload}, timeout=30)
+    resp = session.put(
+        url,
+        json={"product": payload},
+        headers=build_magento_headers(session=session),
+        timeout=30,
+    )
     if not resp.ok:
         raise RuntimeError(
             f"Magento update failed for {sku}: {resp.status_code} {resp.text[:200]}"
@@ -1327,6 +1389,7 @@ if "df_original" in st.session_state:
                             attr_sets_map = st.session_state.get("ai_attr_sets_map")
                             setup_failed = False
 
+                            html_error = False
                             try:
                                 if not api_base:
                                     with st.spinner("🔌 Подключение к Magento…"):
@@ -1338,11 +1401,19 @@ if "df_original" in st.session_state:
                                             session, api_base
                                         )
                                     st.session_state["ai_attr_sets_map"] = attr_sets_map
+                            except HTMLResponseError as exc:
+                                st.error(str(exc))
+                                html_error = True
                             except Exception as exc:  # pragma: no cover - UI interaction
                                 st.warning(
                                     f"Не удалось подготовить подключение к Magento: {exc}"
                                 )
                                 setup_failed = True
+
+                            if html_error:
+                                st.session_state["show_attributes_trigger"] = False
+                                _reset_step2_state()
+                                st.stop()
 
                             if setup_failed or not api_base or not attr_sets_map:
                                 st.session_state["show_attributes_trigger"] = False
@@ -1350,6 +1421,9 @@ if "df_original" in st.session_state:
                             else:
                                 categories_options = st.session_state.get(
                                     "step2_category_options"
+                                )
+                                categories_failed = st.session_state.get(
+                                    "step2_categories_failed", False
                                 )
                                 if not categories_options:
                                     try:
@@ -1360,14 +1434,23 @@ if "df_original" in st.session_state:
                                         categories_options = _prepare_category_options(
                                             raw_categories
                                         )
+                                        categories_failed = False
                                     except Exception as exc:  # pragma: no cover - UI interaction
                                         st.warning(
                                             f"Не удалось загрузить категории: {exc}"
                                         )
                                         categories_options = []
+                                        categories_failed = True
                                     st.session_state[
                                         "step2_category_options"
                                     ] = categories_options
+                                    st.session_state[
+                                        "step2_categories_failed"
+                                    ] = categories_failed
+                                else:
+                                    st.session_state[
+                                        "step2_categories_failed"
+                                    ] = categories_failed
 
                                 step2_state = _ensure_step2_state()
                                 step2_state.setdefault("staged", {})
@@ -1450,16 +1533,21 @@ if "df_original" in st.session_state:
                                                 for code in attr_cols:
                                                     meta_for_set[code] = {}
                                             step2_state["wide_meta"][set_id] = meta_for_set
+                                            _apply_categories_fallback(
+                                                step2_state["wide_meta"][set_id]
+                                            )
                                             _ensure_wide_meta_options(
                                                 step2_state["wide_meta"][set_id],
                                                 step2_state["wide"].get(set_id),
                                             )
                                         if set_id not in step2_state["wide_colcfg"]:
+                                            meta_map = step2_state["wide_meta"].get(
+                                                set_id, {}
+                                            )
+                                            _apply_categories_fallback(meta_map)
                                             step2_state["wide_colcfg"][set_id] = (
                                                 build_wide_colcfg(
-                                                    step2_state["wide_meta"].get(
-                                                        set_id, {}
-                                                    ),
+                                                    meta_map,
                                                     sample_df=step2_state["wide"].get(
                                                         set_id
                                                     ),
@@ -1507,16 +1595,18 @@ if "df_original" in st.session_state:
                                                     for code in attr_codes:
                                                         meta_for_set[code] = {}
                                                 step2_state["wide_meta"][set_id] = meta_for_set
+                                            meta_map = step2_state["wide_meta"].get(
+                                                set_id, {}
+                                            )
+                                            _apply_categories_fallback(meta_map)
                                             _ensure_wide_meta_options(
-                                                step2_state["wide_meta"].get(set_id, {}),
+                                                meta_map,
                                                 step2_state["wide"].get(set_id),
                                             )
                                             if set_id not in step2_state["wide_colcfg"]:
                                                 step2_state["wide_colcfg"][set_id] = (
                                                     build_wide_colcfg(
-                                                        step2_state["wide_meta"].get(
-                                                            set_id, {}
-                                                        ),
+                                                        meta_map,
                                                         sample_df=step2_state["wide"].get(
                                                             set_id
                                                         ),
@@ -1540,6 +1630,8 @@ if "df_original" in st.session_state:
                                         )
                                         if not isinstance(meta_map, dict):
                                             meta_map = {}
+                                        _apply_categories_fallback(meta_map)
+                                        df_ref = _coerce_for_ui(df_ref, meta_map)
                                         _ensure_wide_meta_options(meta_map, df_ref)
                                         missing = [
                                             c
