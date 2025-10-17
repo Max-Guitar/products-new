@@ -381,6 +381,7 @@ def _ensure_step2_state() -> dict:
     state.setdefault("wide_orig", {})
     state.setdefault("wide_meta", {})
     state.setdefault("wide_colcfg", {})
+    state.setdefault("wide_synced", {})
     state.setdefault("staged", {})
     return state
 
@@ -755,6 +756,44 @@ def _is_blank_value(value) -> bool:
     return False
 
 
+def _normalize_seq_for_compare(value: object) -> tuple:
+    if not isinstance(value, (list, tuple, set)):
+        return ()
+    normalized: list[object] = []
+    for item in value:
+        if _is_blank_value(item):
+            continue
+        if isinstance(item, str):
+            stripped = item.strip()
+            if not stripped:
+                continue
+            normalized.append(stripped)
+        else:
+            normalized.append(item)
+    if not normalized:
+        return ()
+    try:
+        return tuple(sorted(normalized, key=lambda x: str(x)))
+    except Exception:  # pragma: no cover - safety fallback
+        return tuple(normalized)
+
+
+def _values_equal(left: object, right: object) -> bool:
+    if _is_blank_value(left) and _is_blank_value(right):
+        return True
+    if isinstance(left, float) and pd.isna(left):
+        left = None
+    if isinstance(right, float) and pd.isna(right):
+        right = None
+    if isinstance(left, str):
+        left = left.strip()
+    if isinstance(right, str):
+        right = right.strip()
+    if isinstance(left, (list, tuple, set)) or isinstance(right, (list, tuple, set)):
+        return _normalize_seq_for_compare(left) == _normalize_seq_for_compare(right)
+    return left == right
+
+
 def apply_product_update(session, api_base: str, sku: str, attributes: dict):
     if not attributes:
         return
@@ -796,75 +835,104 @@ def save_step2_to_magento():
         st.warning("Сначала нажмите \"💾 Сохранить изменения\".")
         return
 
-    dfs_map: dict[int, pd.DataFrame] = step2_state.get("dfs", {})
-    row_meta_map: dict[int, dict[str, dict]] = step2_state.get("row_meta", {})
+    wide_map: dict[int, pd.DataFrame] = step2_state.get("wide", {})
+    wide_meta_map: dict[int, dict[str, dict]] = step2_state.get("wide_meta", {})
+    baseline_map: dict[int, pd.DataFrame] = step2_state.get("wide_synced", {})
     meta_cache = step2_state.get("meta_cache")
     if meta_cache is None:
         meta_cache = step2_state.get("meta")
 
-    if not dfs_map:
+    if not wide_map:
         st.info("Нет изменений для сохранения.")
         return
 
     payload_by_sku: dict[str, dict[str, object]] = {}
     errors: list[dict[str, object]] = []
 
-    for set_id, current_df in dfs_map.items():
-        if not isinstance(current_df, pd.DataFrame) or current_df.empty:
+    for set_id, wide_df in wide_map.items():
+        if not isinstance(wide_df, pd.DataFrame) or wide_df.empty:
             continue
 
-        meta_for_set = row_meta_map.get(set_id, {})
+        attr_cols = [col for col in wide_df.columns if col not in ("sku", "name")]
+        if not attr_cols:
+            continue
 
-        for row_idx, row in current_df.iterrows():
-            sku = str(row.get("sku", ""))
-            if not sku:
+        meta_for_set = wide_meta_map.get(set_id, {})
+        baseline_df = baseline_map.get(set_id)
+        baseline_idx = (
+            baseline_df.set_index("sku")
+            if isinstance(baseline_df, pd.DataFrame) and not baseline_df.empty
+            else None
+        )
+        current_idx = wide_df.set_index("sku")
+
+        for sku, row in current_idx.iterrows():
+            sku_value = str(sku).strip() if isinstance(sku, str) else str(sku)
+            if not sku_value:
                 continue
-            code = row.get("attribute_code")
-            if not code:
-                continue
 
-            raw_value = row.get("value")
-            meta = meta_for_set.get(row_idx, {}) if isinstance(meta_for_set, dict) else {}
-            attr_code = meta.get("attribute_code") or code
+            baseline_row: pd.Series | None
+            if baseline_idx is not None and sku in baseline_idx.index:
+                baseline_row = baseline_idx.loc[sku]
+                if isinstance(baseline_row, pd.DataFrame):
+                    baseline_row = baseline_row.iloc[-1]
+            else:
+                baseline_row = None
 
-            try:
-                normalized = normalize_for_magento(attr_code, raw_value, meta_cache)
-            except Exception as exc:  # pragma: no cover - safety guard
-                errors.append(
-                    {
-                        "sku": sku,
-                        "attribute": attr_code,
-                        "raw": repr(raw_value),
-                        "hint_examples": f"normalize error: {exc}",
-                    }
+            for code in attr_cols:
+                new_raw = row.get(code)
+                old_raw = (
+                    baseline_row.get(code)
+                    if isinstance(baseline_row, pd.Series) and code in baseline_row.index
+                    else None
                 )
-                continue
 
-            if normalized is None:
-                if _is_blank_value(raw_value):
+                if _values_equal(new_raw, old_raw):
                     continue
-                meta_info = {}
-                if isinstance(meta_cache, AttributeMetaCache):
-                    meta_info = meta_cache.get(attr_code) or {}
-                examples = list(meta_info.get("valid_examples") or [])
-                if not examples:
-                    options = _meta_options(meta_info)
-                    for label in options:
-                        if label and label not in examples:
-                            examples.append(label)
-                        if len(examples) >= 5:
-                            break
-                errors.append(
-                    {
-                        "sku": sku,
-                        "attribute": attr_code,
-                        "raw": str(raw_value),
-                        "hint_examples": ", ".join(examples[:5]),
-                    }
-                )
-                continue
 
-            payload_by_sku.setdefault(sku, {})[attr_code] = normalized
+                meta = meta_for_set.get(code) or {}
+                attr_code = meta.get("attribute_code") or code
+
+                try:
+                    normalized = normalize_for_magento(attr_code, new_raw, meta_cache)
+                except Exception as exc:  # pragma: no cover - safety guard
+                    errors.append(
+                        {
+                            "sku": sku_value,
+                            "attribute": attr_code,
+                            "raw": repr(new_raw),
+                            "hint_examples": f"normalize error: {exc}",
+                        }
+                    )
+                    continue
+
+                if normalized is None:
+                    if _is_blank_value(new_raw):
+                        continue
+                    meta_info: dict[str, object] = {}
+                    if isinstance(meta_cache, AttributeMetaCache):
+                        meta_info = meta_cache.get(attr_code) or meta
+                    elif isinstance(meta_for_set, dict):
+                        meta_info = meta or {}
+                    examples = list(meta_info.get("valid_examples") or [])
+                    if not examples:
+                        options = _meta_options(meta_info)
+                        for label in options:
+                            if label and label not in examples:
+                                examples.append(label)
+                            if len(examples) >= 5:
+                                break
+                    errors.append(
+                        {
+                            "sku": sku_value,
+                            "attribute": attr_code,
+                            "raw": str(new_raw),
+                            "hint_examples": ", ".join(examples[:5]),
+                        }
+                    )
+                    continue
+
+                payload_by_sku.setdefault(sku_value, {})[attr_code] = normalized
 
     if not payload_by_sku and not errors:
         st.info("Нет изменений для сохранения.")
@@ -909,9 +977,29 @@ def save_step2_to_magento():
         )
 
     if ok_skus:
-        for set_id, df_current in dfs_map.items():
-            if isinstance(df_current, pd.DataFrame):
-                step2_state["original"][set_id] = df_current.copy(deep=True)
+        for set_id, wide_df in wide_map.items():
+            if not isinstance(wide_df, pd.DataFrame) or wide_df.empty:
+                continue
+            current_idx = wide_df.set_index("sku")
+            baseline_df = baseline_map.get(set_id)
+            if isinstance(baseline_df, pd.DataFrame) and not baseline_df.empty:
+                baseline_idx = baseline_df.set_index("sku")
+            else:
+                baseline_idx = pd.DataFrame(columns=current_idx.columns)
+                baseline_idx.index.name = "sku"
+            updated_idx = baseline_idx.copy()
+            changed = False
+            for sku in ok_skus:
+                if sku not in current_idx.index:
+                    continue
+                row = current_idx.loc[sku]
+                updated_idx.loc[sku, :] = row
+                changed = True
+            if changed:
+                result_df = updated_idx.reset_index()
+                for column in result_df.columns:
+                    result_df[column] = result_df[column].astype(object)
+                step2_state["wide_synced"][set_id] = result_df
 
 
 def load_items(session, base_url):
@@ -1265,8 +1353,13 @@ if "df_original" in st.session_state:
                                             set_id, str(set_id)
                                         )
                                         wide_df = make_wide(stored_df)
+                                        for column in wide_df.columns:
+                                            wide_df[column] = wide_df[column].astype(object)
                                         step2_state["wide"][set_id] = wide_df
                                         step2_state["wide_orig"][set_id] = wide_df.copy(
+                                            deep=True
+                                        )
+                                        step2_state["wide_synced"][set_id] = wide_df.copy(
                                             deep=True
                                         )
                                         attr_cols = [
@@ -1275,20 +1368,26 @@ if "df_original" in st.session_state:
                                             if col not in ("sku", "name")
                                         ]
                                         meta_for_set: dict[str, dict] = {}
-                                        if isinstance(
-                                            meta_cache_obj, AttributeMetaCache
-                                        ):
-                                            for code in attr_cols:
-                                                meta_for_set[code] = (
-                                                    meta_cache_obj.get(code) or {}
+                                        if set_id not in step2_state["wide_meta"]:
+                                            if isinstance(
+                                                meta_cache_obj, AttributeMetaCache
+                                            ):
+                                                for code in attr_cols:
+                                                    meta_for_set[code] = (
+                                                        meta_cache_obj.get(code) or {}
+                                                    )
+                                            else:
+                                                for code in attr_cols:
+                                                    meta_for_set[code] = {}
+                                            step2_state["wide_meta"][set_id] = meta_for_set
+                                        if set_id not in step2_state["wide_colcfg"]:
+                                            step2_state["wide_colcfg"][set_id] = (
+                                                build_wide_colcfg(
+                                                    step2_state["wide_meta"].get(
+                                                        set_id, {}
+                                                    )
                                                 )
-                                        else:
-                                            for code in attr_cols:
-                                                meta_for_set[code] = {}
-                                        step2_state["wide_meta"][set_id] = meta_for_set
-                                        step2_state["wide_colcfg"][set_id] = (
-                                            build_wide_colcfg(meta_for_set)
-                                        )
+                                            )
                                     step2_state["meta_cache"] = meta_cache_obj
 
                                     for set_id, df0 in step2_state["dfs"].items():
@@ -1301,28 +1400,40 @@ if "df_original" in st.session_state:
                                             if not isinstance(df_existing, pd.DataFrame):
                                                 continue
                                             wide_df = make_wide(df_existing)
+                                            for column in wide_df.columns:
+                                                wide_df[column] = wide_df[column].astype(object)
                                             step2_state["wide"][set_id] = wide_df
                                             step2_state["wide_orig"][set_id] = wide_df.copy(
                                                 deep=True
                                             )
+                                            if set_id not in step2_state["wide_synced"]:
+                                                step2_state["wide_synced"][
+                                                    set_id
+                                                ] = wide_df.copy(deep=True)
                                             attr_codes = [
                                                 col
                                                 for col in wide_df.columns
                                                 if col not in ("sku", "name")
                                             ]
-                                            meta_for_set: dict[str, dict] = {}
-                                            if isinstance(meta_obj, AttributeMetaCache):
-                                                for code in attr_codes:
-                                                    meta_for_set[code] = (
-                                                        meta_obj.get(code) or {}
+                                            if set_id not in step2_state["wide_meta"]:
+                                                meta_for_set: dict[str, dict] = {}
+                                                if isinstance(meta_obj, AttributeMetaCache):
+                                                    for code in attr_codes:
+                                                        meta_for_set[code] = (
+                                                            meta_obj.get(code) or {}
+                                                        )
+                                                else:
+                                                    for code in attr_codes:
+                                                        meta_for_set[code] = {}
+                                                step2_state["wide_meta"][set_id] = meta_for_set
+                                            if set_id not in step2_state["wide_colcfg"]:
+                                                step2_state["wide_colcfg"][set_id] = (
+                                                    build_wide_colcfg(
+                                                        step2_state["wide_meta"].get(
+                                                            set_id, {}
+                                                        )
                                                     )
-                                            else:
-                                                for code in attr_codes:
-                                                    meta_for_set[code] = {}
-                                            step2_state["wide_meta"][set_id] = meta_for_set
-                                            step2_state["wide_colcfg"][set_id] = (
-                                                build_wide_colcfg(meta_for_set)
-                                            )
+                                                )
 
                                     st.session_state["show_attrs"] = bool(
                                         step2_state["wide"]
@@ -1364,6 +1475,10 @@ if "df_original" in st.session_state:
                                         )
 
                                         if isinstance(edited_df, pd.DataFrame):
+                                            for column in edited_df.columns:
+                                                edited_df[column] = edited_df[
+                                                    column
+                                                ].astype(object)
                                             step2_state["staged"][set_id] = edited_df.copy(
                                                 deep=True
                                             )
