@@ -5,7 +5,7 @@ from typing import Any, Dict, Iterable, Optional
 
 import requests
 
-from connectors.magento import magento_get
+from .client import magento_get
 from services.country_aliases import country_aliases
 
 
