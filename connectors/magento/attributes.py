@@ -113,7 +113,9 @@ class AttributeMetaCache:
 
         # если варианты — типичные yes/no, считаем boolean
         yesno = {str(opt.get("label", "")).strip().lower() for opt in options}
-        if yesno <= {"yes", "no"} or yesno <= {"0", "1", "true", "false"}:
+        if options and yesno and (
+            yesno <= {"yes", "no"} or yesno <= {"0", "1", "true", "false"}
+        ):
             prepared["frontend_input"] = "boolean"
         backend_type = meta.get("backend_type") or ""
         if backend_type:
