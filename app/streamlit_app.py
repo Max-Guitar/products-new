@@ -1170,8 +1170,9 @@ if "df_original" in st.session_state:
                                     )
 
                                     for set_id, df_set in dfs_by_set.items():
-                                        step2_state["dfs"][set_id] = df_set.copy(deep=True)
-                                        step2_state["original"][set_id] = df_set.copy(
+                                        stored_df = df_set.copy(deep=True)
+                                        step2_state["dfs"][set_id] = stored_df
+                                        step2_state["original"][set_id] = stored_df.copy(
                                             deep=True
                                         )
                                         step2_state["column_config"][set_id] = (
@@ -1202,9 +1203,11 @@ if "df_original" in st.session_state:
                                 if not step2_state["dfs"]:
                                     st.info("Нет атрибутов для отображения.")
                                 elif st.session_state.get("show_attrs"):
-                                    for set_id, df_set in sorted(
-                                        step2_state["dfs"].items()
-                                    ):
+                                    for set_id in sorted(step2_state["dfs"].keys()):
+                                        df_ref = step2_state["dfs"].get(set_id)
+                                        if not isinstance(df_ref, pd.DataFrame):
+                                            continue
+
                                         set_title = step2_state["set_names"].get(
                                             set_id, str(set_id)
                                         )
@@ -1212,7 +1215,7 @@ if "df_original" in st.session_state:
                                             f"#### {_format_attr_set_title(set_title)} (ID {set_id})"
                                         )
                                         edited_df = st.data_editor(
-                                            df_set,
+                                            df_ref,
                                             key=f"step2_editor::{set_id}",
                                             column_config=step2_state["column_config"][
                                                 set_id
@@ -1230,9 +1233,11 @@ if "df_original" in st.session_state:
                                         )
 
                                         if isinstance(edited_df, pd.DataFrame):
-                                            step2_state["dfs"][set_id] = edited_df.copy(
-                                                deep=True
-                                            )
+                                            df_ref.update(edited_df)
+                                            if "value" in edited_df.columns:
+                                                df_ref.loc[
+                                                    edited_df.index, "value"
+                                                ] = edited_df["value"]
 
                                     if st.button(
                                         "Save to Magento",
