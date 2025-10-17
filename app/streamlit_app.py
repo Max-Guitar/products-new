@@ -490,39 +490,13 @@ def _ensure_wide_meta_options(
 ) -> None:
     if not isinstance(meta_map, dict):
         return
-    df = sample_df if isinstance(sample_df, pd.DataFrame) else None
-    for code, meta in meta_map.items():
+    for meta in meta_map.values():
         if not isinstance(meta, dict):
             continue
-        frontend = str(meta.get("frontend_input") or "").lower()
-        if frontend not in {"select", "boolean"}:
+        options = meta.get("options")
+        if isinstance(options, list):
             continue
-        options = meta.get("options") or []
-        if options:
-            continue
-        v2l = meta.get("values_to_labels") or {}
-        meta["options"] = [
-            {"label": lbl, "value": key}
-            for key, lbl in list(v2l.items())[:200]
-            if str(lbl).strip()
-        ]
-        if meta["options"]:
-            continue
-        if code in {"brand", "condition"}:
-            continue
-        if df is None or code not in df.columns:
-            continue
-        seen: set[str] = set()
-        opts: list[dict[str, str]] = []
-        for value in df[code].dropna().astype(str):
-            cleaned = value.strip()
-            if not cleaned or cleaned in seen:
-                continue
-            seen.add(cleaned)
-            opts.append({"label": cleaned, "value": cleaned})
-            if len(opts) >= 200:
-                break
-        meta["options"] = opts
+        meta["options"] = []
 
 
 def _refresh_wide_meta_from_cache(
@@ -534,72 +508,26 @@ def _refresh_wide_meta_from_cache(
     if not isinstance(meta_map, dict) or not attr_codes:
         return
 
-    df = wide_df if isinstance(wide_df, pd.DataFrame) else None
+    if not isinstance(meta_cache, AttributeMetaCache):
+        return
 
-    for code in attr_codes:
-        cached_meta = (
-            meta_cache.get(code)
-            if isinstance(meta_cache, AttributeMetaCache)
-            else None
-        )
-        existing = meta_map.get(code)
-        if not isinstance(existing, dict):
-            existing = {}
-        else:
-            existing = dict(existing)
+    unique_codes: list[str] = []
+    for raw in attr_codes:
+        if not isinstance(raw, str):
+            continue
+        code = raw.strip()
+        if not code or code in unique_codes:
+            continue
+        unique_codes.append(code)
 
+    target_codes = [code for code in unique_codes if code != "categories"]
+    if target_codes:
+        meta_cache.build_and_set_static_for(target_codes, store_id=0)
+
+    for code in unique_codes:
+        cached_meta = meta_cache.get(code)
         if isinstance(cached_meta, dict):
-            merged = dict(existing)
-            for key, value in cached_meta.items():
-                if key == "options":
-                    cleaned_opts: list[dict[str, object]] = []
-                    for opt in value or []:
-                        if not isinstance(opt, dict):
-                            continue
-                        label = opt.get("label")
-                        if isinstance(label, str):
-                            label_clean = label.strip()
-                        else:
-                            label_clean = ""
-                        if not label_clean:
-                            value_obj = opt.get("value")
-                            if isinstance(value_obj, str):
-                                label_clean = value_obj.strip()
-                            else:
-                                label_clean = str(value_obj)
-                            if not label_clean:
-                                label_clean = str(value_obj)
-                        cleaned_opts.append(
-                            {"label": label_clean, "value": opt.get("value")}
-                        )
-                    merged["options"] = cleaned_opts
-                else:
-                    merged[key] = value
-            existing = merged
-
-        options_list = existing.get("options")
-        if not isinstance(options_list, list):
-            existing["options"] = []
-        if (
-            not existing.get("options")
-            and code not in {"brand", "condition"}
-            and df is not None
-            and code in df.columns
-        ):
-            seen: set[str] = set()
-            fallback: list[dict[str, str]] = []
-            series = df[code].dropna()
-            for raw in series.astype(str):
-                cleaned = raw.strip()
-                if not cleaned or cleaned in seen:
-                    continue
-                seen.add(cleaned)
-                fallback.append({"label": cleaned, "value": cleaned})
-                if len(fallback) >= 200:
-                    break
-            existing["options"] = fallback
-
-        meta_map[code] = existing
+            meta_map[code] = cached_meta
 
 
 def _coerce_for_ui(df: pd.DataFrame, meta_map: dict[str, dict]) -> pd.DataFrame:
@@ -648,54 +576,22 @@ def build_wide_colcfg(
 
     for code, original_meta in list(wide_meta.items()):
         meta = original_meta or {}
-        series = df_sample[code] if (df_sample is not None and code in df_sample.columns) else None
-
         t = (meta.get("frontend_input") or meta.get("backend_type") or "text").lower()
         opts = [
             str(opt.get("label"))
             for opt in (meta.get("options") or [])
             if str(opt.get("label", "")).strip()
         ]
-        if not opts:
-            v2l = meta.get("values_to_labels") or {}
-            opts = [
-                lbl
-                for lbl in {str(v).strip() for v in v2l.values()}
-                if lbl
-            ]
-        if (
-            not opts
-            and isinstance(sample_df, pd.DataFrame)
-            and (code in sample_df.columns)
-        ):
-            seen = set()
-            for v in sample_df[code].dropna().astype(str):
-                s = v.strip()
-                if s and s not in seen:
-                    seen.add(s)
-                    opts.append(s)
-
-        select_like = (t == "select") or (
-            opts and t in {"", "text", "varchar", "static"}
-        )
 
         if t == "multiselect":
-            is_list_series = False
-            if isinstance(series, pd.Series):
-                is_list_series = series.apply(
-                    lambda v: isinstance(v, (list, tuple, set)) or v in (None, "")
-                ).all()
-            if is_list_series:
-                cfg[code] = st.column_config.MultiselectColumn(
-                    _attr_label(meta, code), options=opts
-                )
-            else:
-                cfg[code] = st.column_config.TextColumn(_attr_label(meta, code))
+            cfg[code] = st.column_config.MultiselectColumn(
+                _attr_label(meta, code), options=opts
+            )
         elif t == "boolean":
             cfg[code] = st.column_config.CheckboxColumn(
                 _attr_label(meta, code)
             )
-        elif select_like and len(opts) >= 1:
+        elif t == "select":
             cfg[code] = st.column_config.SelectboxColumn(
                 _attr_label(meta, code), options=opts
             )
@@ -1594,20 +1490,7 @@ if "df_original" in st.session_state:
                                         cacheable = isinstance(
                                             meta_cache_obj, AttributeMetaCache
                                         )
-                                        if cacheable:
-                                            try:
-                                                meta_cache_obj.load(attr_cols)
-                                            except RuntimeError:
-                                                st.error(
-                                                    "❌ Magento returned non-JSON for attributes/options. "
-                                                    "Check REST base (/rest/V1) or ACL/WAF."
-                                                )
-                                                st.stop()
                                         wide_meta = step2_state.setdefault("wide_meta", {})
-                                        if cacheable:
-                                            wide_meta[set_id] = {
-                                                c: meta_cache_obj.get(c) for c in attr_cols
-                                            }
                                         meta_map = wide_meta.setdefault(set_id, {})
                                         if not isinstance(meta_map, dict):
                                             meta_map = {}
@@ -1629,128 +1512,43 @@ if "df_original" in st.session_state:
                                             )
                                             st.stop()
                                         _apply_categories_fallback(meta_map)
-                                        for code, meta in meta_map.items():
-                                            if not isinstance(meta, dict):
-                                                continue
-                                            frontend = (
-                                                meta.get("frontend_input") or "text"
-                                            ).lower()
-                                            if frontend not in {"select", "boolean"}:
-                                                continue
-                                            if meta.get("options"):
-                                                continue
-                                            v2l = meta.get("values_to_labels") or {}
-                                            options = [
-                                                {"label": lbl, "value": key}
-                                                for key, lbl in v2l.items()
-                                                if str(lbl).strip()
-                                            ]
-                                            if (
-                                                not options
-                                                and code not in {"brand", "condition"}
-                                                and code in wide_df.columns
-                                            ):
-                                                seen: set[str] = set()
-                                                inferred: list[dict[str, str]] = []
-                                                for value in (
-                                                    wide_df[code]
-                                                    .dropna()
-                                                    .astype(str)
-                                                ):
-                                                    cleaned = value.strip()
-                                                    if not cleaned or cleaned in seen:
-                                                        continue
-                                                    seen.add(cleaned)
-                                                    inferred.append(
-                                                        {"label": cleaned, "value": cleaned}
-                                                    )
-                                                    if len(inferred) >= 200:
-                                                        break
-                                                options = inferred
-                                            meta["options"] = options[:200]
                                         _ensure_wide_meta_options(
                                             meta_map,
                                             step2_state["wide"].get(set_id),
                                         )
-                                        if set_id not in step2_state["wide_colcfg"]:
-                                            meta_map = step2_state["wide_meta"].get(
-                                                set_id, {}
-                                            )
-                                            _apply_categories_fallback(meta_map)
-                                            meta_cache = (
-                                                step2_state.get("meta_cache")
-                                                or meta_cache_obj
-                                            )
-                                            dbg_brand = getattr(
-                                                meta_cache, "_debug_last", {}
-                                            ).get("brand", {})
-                                            dbg_cond = getattr(
-                                                meta_cache, "_debug_last", {}
-                                            ).get("condition", {})
-                                            st.write(
-                                                "MAGENTO RAW brand:",
-                                                {
-                                                    "raw_frontend_input": dbg_brand.get(
-                                                        "raw_meta_frontend_input"
-                                                    ),
-                                                    "raw_options_count": dbg_brand.get(
-                                                        "raw_options_count"
-                                                    ),
-                                                    "raw_options_sample": dbg_brand.get(
-                                                        "raw_options_sample"
-                                                    ),
-                                                },
-                                            )
-                                            st.write(
-                                                "AFTER PREP brand:",
-                                                {
-                                                    "frontend_input": dbg_brand.get(
-                                                        "prepared_frontend_input"
-                                                    ),
-                                                    "options_count": dbg_brand.get(
-                                                        "prepared_options_count"
-                                                    ),
-                                                    "sample": dbg_brand.get(
-                                                        "prepared_sample"
-                                                    ),
-                                                },
-                                            )
-                                            st.write(
-                                                "MAGENTO RAW condition:",
-                                                {
-                                                    "raw_frontend_input": dbg_cond.get(
-                                                        "raw_meta_frontend_input"
-                                                    ),
-                                                    "raw_options_count": dbg_cond.get(
-                                                        "raw_options_count"
-                                                    ),
-                                                    "raw_options_sample": dbg_cond.get(
-                                                        "raw_options_sample"
-                                                    ),
-                                                },
-                                            )
-                                            st.write(
-                                                "AFTER PREP condition:",
-                                                {
-                                                    "frontend_input": dbg_cond.get(
-                                                        "prepared_frontend_input"
-                                                    ),
-                                                    "options_count": dbg_cond.get(
-                                                        "prepared_options_count"
-                                                    ),
-                                                    "sample": dbg_cond.get(
-                                                        "prepared_sample"
-                                                    ),
-                                                },
-                                            )
-                                            step2_state["wide_colcfg"][set_id] = (
-                                                build_wide_colcfg(
-                                                    meta_map,
-                                                    sample_df=step2_state["wide"].get(
-                                                        set_id
-                                                    ),
-                                                )
-                                            )
+                                        wide_meta[set_id] = {
+                                            code: meta_map.get(code, {}) for code in attr_cols
+                                        }
+                                        meta_for_debug = wide_meta[set_id]
+                                        def _meta_shot(code: str) -> dict:
+                                            m = meta_for_debug.get(code, {})
+                                            if not isinstance(m, dict):
+                                                m = {}
+                                            return {
+                                                "frontend_input": m.get("frontend_input"),
+                                                "options_count": len(m.get("options") or []),
+                                                "first_options": (m.get("options") or [])[:5],
+                                                "has_maps": bool(m.get("options_map"))
+                                                and bool(m.get("values_to_labels")),
+                                                "options_source": m.get("options_source"),
+                                            }
+
+                                        counts: dict[str, int] = {}
+                                        for meta in meta_for_debug.values():
+                                            if not isinstance(meta, dict):
+                                                continue
+                                            t = str(meta.get("frontend_input") or "text").lower()
+                                            counts[t] = counts.get(t, 0) + 1
+
+                                        st.caption(f"DEBUG set_id={set_id}")
+                                        st.write("brand:", _meta_shot("brand"))
+                                        st.write("condition:", _meta_shot("condition"))
+                                        st.write("DEBUG types distribution:", counts)
+
+                                        step2_state["wide_colcfg"][set_id] = build_wide_colcfg(
+                                            meta_for_debug,
+                                            sample_df=step2_state["wide"].get(set_id),
+                                        )
                                     step2_state["meta_cache"] = meta_cache_obj
 
                                     for set_id, df0 in step2_state["dfs"].items():
@@ -1781,22 +1579,9 @@ if "df_original" in st.session_state:
                                             cacheable = isinstance(
                                                 meta_obj, AttributeMetaCache
                                             )
-                                            if cacheable:
-                                                try:
-                                                    meta_obj.load(attr_codes)
-                                                except RuntimeError:
-                                                    st.error(
-                                                        "❌ Magento returned non-JSON for attributes/options. "
-                                                        "Check REST base (/rest/V1) or ACL/WAF."
-                                                    )
-                                                    st.stop()
                                             wide_meta = step2_state.setdefault(
                                                 "wide_meta", {}
                                             )
-                                            if cacheable:
-                                                wide_meta[set_id] = {
-                                                    c: meta_obj.get(c) for c in attr_codes
-                                                }
                                             meta_map = wide_meta.setdefault(set_id, {})
                                             if not isinstance(meta_map, dict):
                                                 meta_map = {}
@@ -1818,124 +1603,44 @@ if "df_original" in st.session_state:
                                                 )
                                                 st.stop()
                                             _apply_categories_fallback(meta_map)
-                                            for code, meta in meta_map.items():
-                                                if not isinstance(meta, dict):
-                                                    continue
-                                                frontend = (
-                                                    meta.get("frontend_input") or "text"
-                                                ).lower()
-                                                if frontend not in {"select", "boolean"}:
-                                                    continue
-                                                if meta.get("options"):
-                                                    continue
-                                                v2l = meta.get("values_to_labels") or {}
-                                                options = [
-                                                    {"label": lbl, "value": key}
-                                                    for key, lbl in v2l.items()
-                                                    if str(lbl).strip()
-                                                ]
-                                                if (
-                                                    not options
-                                                    and code not in {"brand", "condition"}
-                                                    and code in wide_df.columns
-                                                ):
-                                                    seen: set[str] = set()
-                                                    inferred: list[dict[str, str]] = []
-                                                    for value in (
-                                                        wide_df[code]
-                                                        .dropna()
-                                                        .astype(str)
-                                                    ):
-                                                        cleaned = value.strip()
-                                                        if not cleaned or cleaned in seen:
-                                                            continue
-                                                        seen.add(cleaned)
-                                                        inferred.append(
-                                                            {"label": cleaned, "value": cleaned}
-                                                        )
-                                                        if len(inferred) >= 200:
-                                                            break
-                                                    options = inferred
-                                                meta["options"] = options[:200]
                                             _ensure_wide_meta_options(
                                                 meta_map,
                                                 step2_state["wide"].get(set_id),
                                             )
-                                            if set_id not in step2_state["wide_colcfg"]:
-                                                meta_cache = (
-                                                    step2_state.get("meta_cache")
-                                                    or meta_obj
-                                                )
-                                                dbg_brand = getattr(
-                                                    meta_cache, "_debug_last", {}
-                                                ).get("brand", {})
-                                                dbg_cond = getattr(
-                                                    meta_cache, "_debug_last", {}
-                                                ).get("condition", {})
-                                                st.write(
-                                                    "MAGENTO RAW brand:",
-                                                    {
-                                                        "raw_frontend_input": dbg_brand.get(
-                                                            "raw_meta_frontend_input"
-                                                        ),
-                                                        "raw_options_count": dbg_brand.get(
-                                                            "raw_options_count"
-                                                        ),
-                                                        "raw_options_sample": dbg_brand.get(
-                                                            "raw_options_sample"
-                                                        ),
-                                                    },
-                                                )
-                                                st.write(
-                                                    "AFTER PREP brand:",
-                                                    {
-                                                        "frontend_input": dbg_brand.get(
-                                                            "prepared_frontend_input"
-                                                        ),
-                                                        "options_count": dbg_brand.get(
-                                                            "prepared_options_count"
-                                                        ),
-                                                        "sample": dbg_brand.get(
-                                                            "prepared_sample"
-                                                        ),
-                                                    },
-                                                )
-                                                st.write(
-                                                    "MAGENTO RAW condition:",
-                                                    {
-                                                        "raw_frontend_input": dbg_cond.get(
-                                                            "raw_meta_frontend_input"
-                                                        ),
-                                                        "raw_options_count": dbg_cond.get(
-                                                            "raw_options_count"
-                                                        ),
-                                                        "raw_options_sample": dbg_cond.get(
-                                                            "raw_options_sample"
-                                                        ),
-                                                    },
-                                                )
-                                                st.write(
-                                                    "AFTER PREP condition:",
-                                                    {
-                                                        "frontend_input": dbg_cond.get(
-                                                            "prepared_frontend_input"
-                                                        ),
-                                                        "options_count": dbg_cond.get(
-                                                            "prepared_options_count"
-                                                        ),
-                                                        "sample": dbg_cond.get(
-                                                            "prepared_sample"
-                                                        ),
-                                                    },
-                                                )
-                                                step2_state["wide_colcfg"][set_id] = (
-                                                    build_wide_colcfg(
-                                                        meta_map,
-                                                        sample_df=step2_state["wide"].get(
-                                                            set_id
-                                                        ),
-                                                    )
-                                                )
+                                            wide_meta[set_id] = {
+                                                code: meta_map.get(code, {}) for code in attr_codes
+                                            }
+                                            meta_for_debug = wide_meta[set_id]
+
+                                            def _meta_shot(code: str) -> dict:
+                                                m = meta_for_debug.get(code, {})
+                                                if not isinstance(m, dict):
+                                                    m = {}
+                                                return {
+                                                    "frontend_input": m.get("frontend_input"),
+                                                    "options_count": len(m.get("options") or []),
+                                                    "first_options": (m.get("options") or [])[:5],
+                                                    "has_maps": bool(m.get("options_map"))
+                                                    and bool(m.get("values_to_labels")),
+                                                    "options_source": m.get("options_source"),
+                                                }
+
+                                            counts: dict[str, int] = {}
+                                            for meta in meta_for_debug.values():
+                                                if not isinstance(meta, dict):
+                                                    continue
+                                                t = str(meta.get("frontend_input") or "text").lower()
+                                                counts[t] = counts.get(t, 0) + 1
+
+                                            st.caption(f"DEBUG set_id={set_id}")
+                                            st.write("brand:", _meta_shot("brand"))
+                                            st.write("condition:", _meta_shot("condition"))
+                                            st.write("DEBUG types distribution:", counts)
+
+                                            step2_state["wide_colcfg"][set_id] = build_wide_colcfg(
+                                                meta_for_debug,
+                                                sample_df=step2_state["wide"].get(set_id),
+                                            )
 
                                     st.session_state["show_attrs"] = bool(
                                         step2_state["wide"]
@@ -1957,6 +1662,7 @@ if "df_original" in st.session_state:
                                         _apply_categories_fallback(meta_map)
                                         df_ref = _coerce_for_ui(wide_df, meta_map)
                                         _ensure_wide_meta_options(meta_map, df_ref)
+
                                         def _meta_shot(code: str) -> dict:
                                             m = meta_map.get(code, {}) if isinstance(meta_map, dict) else {}
                                             if not isinstance(m, dict):
@@ -1964,28 +1670,24 @@ if "df_original" in st.session_state:
                                             return {
                                                 "frontend_input": m.get("frontend_input"),
                                                 "options_count": len(m.get("options") or []),
-                                                "first_options": (m.get("options") or [])[:3],
+                                                "first_options": (m.get("options") or [])[:5],
+                                                "has_maps": bool(m.get("options_map"))
+                                                and bool(m.get("values_to_labels")),
+                                                "options_source": m.get("options_source"),
                                             }
 
-                                        st.caption(f"DEBUG set_id={set_id}")
-                                        st.write("DEBUG brand:", _meta_shot("brand"))
-                                        st.write("DEBUG condition:", _meta_shot("condition"))
+                                        counts: dict[str, int] = {}
+                                        for meta in (meta_map or {}).values():
+                                            if not isinstance(meta, dict):
+                                                continue
+                                            t = str(meta.get("frontend_input") or "text").lower()
+                                            counts[t] = counts.get(t, 0) + 1
 
-                                        missing = [
-                                            c
-                                            for c, m in (meta_map or {}).items()
-                                            if isinstance(m, dict)
-                                            and (
-                                                str(m.get("frontend_input") or "").lower()
-                                                in {"select", "boolean"}
-                                            )
-                                            and not (m.get("options") or [])
-                                        ]
-                                        if missing:
-                                            st.write(
-                                                "DEBUG missing options for:",
-                                                missing[:10],
-                                            )
+                                        st.caption(f"DEBUG set_id={set_id}")
+                                        st.write("brand:", _meta_shot("brand"))
+                                        st.write("condition:", _meta_shot("condition"))
+                                        st.write("DEBUG types distribution:", counts)
+
                                         colcfg = build_wide_colcfg(
                                             meta_map, sample_df=df_ref
                                         )
@@ -2005,14 +1707,6 @@ if "df_original" in st.session_state:
                                             for col in df_ref.columns
                                             if col not in ("sku", "name")
                                         ]
-                                        meta_cache = step2_state.get("meta_cache")
-                                        wide_meta_map = step2_state.get("wide_meta", {})
-                                        st.caption(
-                                            "brand alias: "
-                                            f"{getattr(meta_cache, '_aliases', {}).get('brand')}, "
-                                            "brand options: "
-                                            f"{len((wide_meta_map.get(set_id, {}) or {}).get('brand', {}).get('options', []))}"
-                                        )
                                         edited_df = st.data_editor(
                                             df_ref,
                                             key=f"step2_wide::{set_id}",

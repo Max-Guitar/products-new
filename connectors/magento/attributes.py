@@ -112,6 +112,123 @@ class AttributeMetaCache:
 
         self._store[code] = info
 
+    def build_and_set_static_for(self, codes: list[str], store_id: int = 0):
+        """Build synthetic metadata for ``codes`` and cache it as static."""
+
+        unique: list[str] = []
+        for raw in codes or []:
+            if not isinstance(raw, str):
+                continue
+            code = raw.strip()
+            if not code or code in unique:
+                continue
+            unique.append(code)
+
+        for code in unique:
+            raw_meta: Dict[str, Any] = {}
+            try:
+                raw_meta = (
+                    magento_get(
+                        self._session,
+                        self._base_url,
+                        f"/products/attributes/{code}",
+                    )
+                    or {}
+                )
+            except RuntimeError:
+                raise
+            except Exception:
+                raw_meta = {}
+
+            options_raw: list[dict] = []
+            options_source = "fallback"
+            for path in (
+                f"/products/attributes/{code}/options?storeId={store_id}",
+                f"/products/attributes/{code}/options",
+                f"/products/attributes/{code}/options?storeId=1",
+            ):
+                try:
+                    data = magento_get(self._session, self._base_url, path)
+                except RuntimeError:
+                    raise
+                except Exception:
+                    continue
+                if isinstance(data, list):
+                    options_raw = data
+                    options_source = "magento"
+                    break
+
+            cleaned: list[Dict[str, Any]] = []
+            seen: set[tuple[str, str]] = set()
+            for opt in options_raw or []:
+                if not isinstance(opt, dict):
+                    continue
+                value = opt.get("value")
+                if value in (None, ""):
+                    continue
+                label = str(opt.get("label", "")).strip()
+                if not label:
+                    label = str(value).strip()
+                if not label:
+                    continue
+                key = (str(value), label)
+                if key in seen:
+                    continue
+                seen.add(key)
+                cleaned.append({"label": label, "value": value})
+
+            frontend_input = str(raw_meta.get("frontend_input") or "text").lower()
+            if (raw_meta.get("frontend_input") or "").lower() == "boolean":
+                frontend_input = "boolean"
+            elif cleaned and frontend_input != "multiselect":
+                frontend_input = "select"
+
+            options_map: Dict[Any, Any] = {}
+            values_to_labels: Dict[Any, str] = {}
+            valid_examples: list[str] = []
+
+            for option in cleaned:
+                label = option.get("label")
+                value = option.get("value")
+                if not isinstance(label, str):
+                    continue
+                label_clean = label.strip()
+                if not label_clean:
+                    continue
+                if label_clean not in valid_examples and len(valid_examples) < 10:
+                    valid_examples.append(label_clean)
+
+                str_value = str(value)
+                values_to_labels[str_value] = label_clean
+                try:
+                    int_value = int(str_value)
+                except (TypeError, ValueError):
+                    int_value = None
+                if int_value is not None:
+                    values_to_labels[int_value] = label_clean
+
+                self._add_alias(options_map, label_clean, value)
+                self._add_alias(options_map, label_clean.lower(), value)
+                self._add_alias(options_map, str_value, value)
+                if int_value is not None:
+                    self._add_alias(options_map, int_value, value)
+                    self._add_alias(options_map, str(int_value), value)
+
+            prepared = {
+                "attribute_code": code,
+                "frontend_input": frontend_input,
+                "options": cleaned,
+                "options_map": options_map,
+                "values_to_labels": values_to_labels,
+                "valid_examples": valid_examples,
+                "options_source": options_source,
+            }
+
+            if frontend_input == "boolean" and not cleaned:
+                prepared.setdefault("options", [])
+
+            self.set_static(code, prepared)
+
     def _fetch_options(self, code: str, store_id: int = 0) -> list[dict]:
         for path in (
             f"/products/attributes/{code}/options?storeId={store_id}",
