@@ -1392,6 +1392,7 @@ if "df_original" in st.session_state:
                                             if isinstance(
                                                 meta_cache_obj, AttributeMetaCache
                                             ):
+                                                meta_cache_obj.load(attr_cols)
                                                 for code in attr_cols:
                                                     meta_for_set[code] = (
                                                         meta_cache_obj.get(code) or {}
@@ -1441,6 +1442,7 @@ if "df_original" in st.session_state:
                                             if set_id not in step2_state["wide_meta"]:
                                                 meta_for_set: dict[str, dict] = {}
                                                 if isinstance(meta_obj, AttributeMetaCache):
+                                                    meta_obj.load(attr_codes)
                                                     for code in attr_codes:
                                                         meta_for_set[code] = (
                                                             meta_obj.get(code) or {}
