@@ -574,22 +574,23 @@ def build_wide_colcfg(
 
     for code, original_meta in list(wide_meta.items()):
         meta = original_meta or {}
-        ftype = (meta.get("frontend_input") or meta.get("backend_type") or "text").lower()
+        column_label = _attr_label(meta, code)
+        ftype_raw = meta.get("frontend_input") or meta.get("backend_type") or "text"
+        ftype = str(ftype_raw).lower()
         labels = [
             opt.get("label")
             for opt in (meta.get("options") or [])
             if isinstance(opt, dict) and opt.get("label")
         ]
-        column_label = _attr_label(meta, code)
 
         if ftype == "multiselect" and labels:
             cfg[code] = st.column_config.MultiselectColumn(
                 column_label, options=labels
             )
-        elif ftype in {"select", "boolean"} and labels:
-            cfg[code] = st.column_config.SelectboxColumn(column_label, options=labels)
         elif ftype == "boolean":
             cfg[code] = st.column_config.CheckboxColumn(column_label)
+        elif ftype in {"select", "dropdown"} and labels:
+            cfg[code] = st.column_config.SelectboxColumn(column_label, options=labels)
         elif ftype in {"int", "integer", "decimal", "price", "float"}:
             cfg[code] = st.column_config.NumberColumn(column_label)
         else:
@@ -1507,6 +1508,20 @@ if "df_original" in st.session_state:
                                                 meta_cache_obj.build_and_set_static_for(
                                                     effective_codes, store_id=0
                                                 )
+                                            dbg_source = getattr(
+                                                meta_cache_obj, "_debug_http", {}
+                                            )
+                                            dbg_snapshot = (
+                                                dbg_source.copy()
+                                                if isinstance(dbg_source, dict)
+                                                else {}
+                                            )
+                                            st.write(
+                                                "SET ATTRS DEBUG:",
+                                                dbg_snapshot.get(f"set_{set_id}"),
+                                                dbg_snapshot.get(f"set_{set_id}_err"),
+                                            )
+                                            st.write("RESOLVED:", resolved_map)
                                         wide_meta = step2_state.setdefault("wide_meta", {})
                                         meta_map: dict[str, dict] = {}
                                         if cacheable:
@@ -1610,6 +1625,20 @@ if "df_original" in st.session_state:
                                                     meta_obj.build_and_set_static_for(
                                                         effective_codes, store_id=0
                                                     )
+                                                dbg_source = getattr(
+                                                    meta_obj, "_debug_http", {}
+                                                )
+                                                dbg_snapshot = (
+                                                    dbg_source.copy()
+                                                    if isinstance(dbg_source, dict)
+                                                    else {}
+                                                )
+                                                st.write(
+                                                    "SET ATTRS DEBUG:",
+                                                    dbg_snapshot.get(f"set_{set_id}"),
+                                                    dbg_snapshot.get(f"set_{set_id}_err"),
+                                                )
+                                                st.write("RESOLVED:", resolved_map)
                                             wide_meta = step2_state.setdefault(
                                                 "wide_meta", {}
                                             )
@@ -1688,6 +1717,12 @@ if "df_original" in st.session_state:
                                         df_ref = _coerce_for_ui(wide_df, meta_map)
                                         _ensure_wide_meta_options(meta_map, df_ref)
 
+                                        for col_name in ("brand", "condition"):
+                                            if col_name in df_ref.columns:
+                                                df_ref[col_name] = df_ref[col_name].astype(
+                                                    "string"
+                                                )
+
                                         def _meta_shot(code: str) -> dict:
                                             m = meta_map.get(code, {}) if isinstance(meta_map, dict) else {}
                                             if not isinstance(m, dict):
@@ -1714,12 +1749,6 @@ if "df_original" in st.session_state:
                                         st.write("DEBUG types distribution:", counts)
 
                                         meta_cache_obj = step2_state.get("meta_cache")
-                                        dbg_source = (
-                                            getattr(meta_cache_obj, "_debug_http", {})
-                                            if isinstance(meta_cache_obj, AttributeMetaCache)
-                                            else {}
-                                        )
-                                        dbg = dbg_source.copy() if isinstance(dbg_source, dict) else {}
                                         resolved_map = (
                                             (step2_state.get("resolved_codes") or {}).get(
                                                 set_id, {}
@@ -1730,6 +1759,12 @@ if "df_original" in st.session_state:
                                             if isinstance(meta_cache_obj, AttributeMetaCache)
                                             else []
                                         )
+                                        dbg_source = (
+                                            getattr(meta_cache_obj, "_debug_http", {})
+                                            if isinstance(meta_cache_obj, AttributeMetaCache)
+                                            else {}
+                                        )
+                                        dbg = dbg_source.copy() if isinstance(dbg_source, dict) else {}
                                         st.write("RESOLVED:", resolved_map)
                                         st.write(
                                             "HTTP brand (effective):",
@@ -1738,6 +1773,11 @@ if "df_original" in st.session_state:
                                         st.write(
                                             "HTTP condition (effective):",
                                             dbg.get(resolved_map.get("condition", "condition")),
+                                        )
+                                        st.write(
+                                            "SET ATTRS DEBUG:",
+                                            dbg.get(f"set_{set_id}"),
+                                            dbg.get(f"set_{set_id}_err"),
                                         )
                                         st.write(
                                             "META brand (effective):",
