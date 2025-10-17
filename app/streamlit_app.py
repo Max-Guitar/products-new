@@ -1196,6 +1196,10 @@ if "df_original" in st.session_state:
                                         )
                                     step2_state["meta_cache"] = meta_cache_obj
 
+                                    for set_id, df0 in step2_state["dfs"].items():
+                                        if "value" in df0.columns:
+                                            df0["value"] = df0["value"].astype(object)
+
                                     st.session_state["show_attrs"] = bool(
                                         step2_state["dfs"]
                                     )
