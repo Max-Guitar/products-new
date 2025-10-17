@@ -564,6 +564,30 @@ def _apply_categories_fallback(meta_map: dict[str, dict]) -> None:
         meta.pop("options", None)
 
 
+def colcfg_from_meta(
+    code: str, meta: dict | None, sample_df: pd.DataFrame | None = None
+):
+    meta = meta or {}
+    column_label = _attr_label(meta, code)
+    ftype_raw = meta.get("frontend_input") or meta.get("backend_type") or "text"
+    ftype = str(ftype_raw).lower()
+    labels = [
+        opt.get("label")
+        for opt in (meta.get("options") or [])
+        if isinstance(opt, dict) and opt.get("label")
+    ]
+
+    if ftype == "multiselect" and labels:
+        return st.column_config.MultiselectColumn(column_label, options=labels)
+    if ftype == "boolean":
+        return st.column_config.CheckboxColumn(column_label)
+    if ftype in {"select", "dropdown"} and labels:
+        return st.column_config.SelectboxColumn(column_label, options=labels)
+    if ftype in {"int", "integer", "decimal", "price", "float"}:
+        return st.column_config.NumberColumn(column_label)
+    return st.column_config.TextColumn(column_label)
+
+
 def build_wide_colcfg(
     wide_meta: dict[str, dict], sample_df: pd.DataFrame | None = None
 ):
@@ -574,27 +598,7 @@ def build_wide_colcfg(
 
     for code, original_meta in list(wide_meta.items()):
         meta = original_meta or {}
-        column_label = _attr_label(meta, code)
-        ftype_raw = meta.get("frontend_input") or meta.get("backend_type") or "text"
-        ftype = str(ftype_raw).lower()
-        labels = [
-            opt.get("label")
-            for opt in (meta.get("options") or [])
-            if isinstance(opt, dict) and opt.get("label")
-        ]
-
-        if ftype == "multiselect" and labels:
-            cfg[code] = st.column_config.MultiselectColumn(
-                column_label, options=labels
-            )
-        elif ftype == "boolean":
-            cfg[code] = st.column_config.CheckboxColumn(column_label)
-        elif ftype in {"select", "dropdown"} and labels:
-            cfg[code] = st.column_config.SelectboxColumn(column_label, options=labels)
-        elif ftype in {"int", "integer", "decimal", "price", "float"}:
-            cfg[code] = st.column_config.NumberColumn(column_label)
-        else:
-            cfg[code] = st.column_config.TextColumn(column_label)
+        cfg[code] = colcfg_from_meta(code, meta)
 
     return cfg
 
@@ -1717,11 +1721,15 @@ if "df_original" in st.session_state:
                                         df_ref = _coerce_for_ui(wide_df, meta_map)
                                         _ensure_wide_meta_options(meta_map, df_ref)
 
-                                        for col_name in ("brand", "condition"):
-                                            if col_name in df_ref.columns:
-                                                df_ref[col_name] = df_ref[col_name].astype(
-                                                    "string"
-                                                )
+                                        string_cols = [
+                                            col
+                                            for col in ("brand", "condition")
+                                            if col in df_ref.columns
+                                        ]
+                                        if string_cols:
+                                            df_ref[string_cols] = df_ref[
+                                                string_cols
+                                            ].astype("string")
 
                                         def _meta_shot(code: str) -> dict:
                                             m = meta_map.get(code, {}) if isinstance(meta_map, dict) else {}
