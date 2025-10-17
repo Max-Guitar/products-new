@@ -360,9 +360,20 @@ def _collect_options_map(column_meta: dict[str, dict]) -> dict[str, dict[str, ob
         for opt in opts:
             label = str(opt.get("label", "")).strip()
             value = opt.get("value")
-            if not label:
+            if label:
+                mapping[label] = value
+            if value is None:
                 continue
-            mapping[label] = value
+            str_value = str(value).strip()
+            if str_value:
+                mapping[str_value] = value
+            if isinstance(value, bool):
+                mapping[int(value)] = int(value)
+            else:
+                try:
+                    mapping[int(str_value)] = value
+                except (TypeError, ValueError):
+                    continue
         if mapping:
             options_map[column] = mapping
     return options_map
@@ -538,12 +549,30 @@ def build_attributes_df(
     for code, meta in column_meta_with_base.items():
         attr_meta[code] = {
             "frontend_input": (meta.get("frontend_input") or "").lower(),
+            "backend_type": (meta.get("backend_type") or "").lower(),
             "options_map": options_map.get(code, {}),
         }
     if label_to_id:
+        categories_map: dict[object, object] = {}
+        for label, value in label_to_id.items():
+            if label:
+                categories_map[label] = value
+            if value is None:
+                continue
+            str_value = str(value).strip()
+            if str_value:
+                categories_map[str_value] = value
+            if isinstance(value, bool):
+                categories_map[int(value)] = int(value)
+            else:
+                try:
+                    categories_map[int(str_value)] = value
+                except (TypeError, ValueError):
+                    continue
         attr_meta["categories"] = {
             "frontend_input": "multiselect",
-            "options_map": label_to_id,
+            "backend_type": "text",
+            "options_map": categories_map,
         }
 
     return display_df, column_config, disabled_columns, attr_meta
@@ -559,43 +588,56 @@ def get_editable_columns() -> list[str]:
 
 
 def normalize_for_magento(attr_code: str, val, meta: Mapping[str, Mapping[str, object]]):
-    attr_meta = meta.get(attr_code, {})
-    if val in (None, "", [], {}):
+    # meta[attr_code]: {"frontend_input": "...", "options_map": {"Label": 123, "123": 123, 123: 123}, "backend_type": "..."}
+    if val is None or (isinstance(val, str) and val.strip() == ""):
         return None
+    info = meta.get(attr_code, {})
+    ftype = info.get("frontend_input") or info.get("backend_type") or "text"
+    options = info.get("options_map") or {}
 
-    frontend_input = str(attr_meta.get("frontend_input", "")).lower()
-    options = attr_meta.get("options_map") or {}
-
-    if frontend_input in {"select", "boolean", "int"}:
-        if isinstance(val, str):
-            val = val.strip()
-            if val in options:
-                val = options[val]
+    def to_int(x):
+        if x is None or (isinstance(x, str) and x.strip() == ""):
+            return None
+        if isinstance(x, bool):
+            return int(x)
+        if isinstance(x, (int, float)) and not isinstance(x, bool):
+            return int(x)
+        s = str(x).strip()
+        # маппинг лейбла→id, "123"→123
+        if s in options:
+            return int(options[s])
         try:
-            return int(val)
-        except (TypeError, ValueError):
-            return int(str(val).strip())
+            return int(s)
+        except Exception:
+            return None
 
-    if frontend_input == "multiselect":
+    if ftype in ("select", "boolean", "int"):
+        # boolean допускаем "Yes/No", "true/false", "1/0"
+        if ftype == "boolean":
+            truthy = {"1", "true", "yes", "y", "on"}
+            falsy = {"0", "false", "no", "n", "off"}
+            if isinstance(val, str):
+                s = val.strip().lower()
+                if s in truthy:
+                    return 1
+                if s in falsy:
+                    return 0
+        out = to_int(val)
+        return out
+    if ftype == "multiselect":
         if isinstance(val, (list, tuple, set)):
             items = list(val)
         else:
-            items = [
-                item.strip()
-                for item in str(val).split(",")
-                if str(item).strip()
-            ]
-        ids = []
-        for item in items:
-            mapped = options.get(item, item)
-            try:
-                mapped_int = int(mapped)
-            except (TypeError, ValueError):
-                mapped_int = int(str(mapped).strip())
-            ids.append(mapped_int)
-        return ids
-
-    return val
+            items = [p.strip() for p in str(val).split(",")]
+        ids = [
+            to_int(x)
+            for x in items
+            if isinstance(x, (str, int, float, bool)) and str(x).strip() != ""
+        ]
+        ids = [i for i in ids if i is not None]
+        return ids if ids else None
+    # текстовые и прочие — как есть (обрежем пробелы)
+    return val.strip() if isinstance(val, str) else val
 
 
 def apply_product_update(session, api_base: str, sku: str, attributes: dict):
@@ -654,30 +696,47 @@ def save_step2_to_magento():
     diff = current_subset.loc[common_idx] != original_subset.loc[common_idx]
     meta = st.session_state.get("step2_meta", {})
 
-    changes: dict[str, list[dict[str, object]]] = {}
-    for row_id, row_mask in diff.iterrows():
-        if not row_mask.any():
+    errors: list[dict[str, object]] = []
+    ok_skus: list[str] = []
+    payload_by_sku: dict[str, list[dict[str, object]]] = {}
+
+    for row_id, mask in diff.iterrows():
+        if not mask.any():
             continue
-        sku_value = df_current.loc[row_id, "sku"]
-        if not sku_value:
+        sku = df_current.at[row_id, "sku"]
+        if not sku:
             continue
-        sku_value = str(sku_value)
+        sku = str(sku)
         for col in editable_cols:
-            if not row_mask.get(col):
+            if not mask.get(col):
                 continue
-            normalized = normalize_for_magento(
-                col,
-                df_current.loc[row_id, col],
-                meta,
-            )
-            if normalized is None:
+            raw = df_current.at[row_id, col]
+            try:
+                norm = normalize_for_magento(col, raw, meta)
+            except Exception as e:  # pragma: no cover - safety guard
+                errors.append(
+                    {
+                        "sku": sku,
+                        "attribute": col,
+                        "raw": repr(raw),
+                        "error": f"normalize: {e}",
+                    }
+                )
                 continue
-            changes.setdefault(sku_value, []).append(
-                {"attribute_code": col, "value": normalized}
+            if norm is None:
+                continue
+            payload_by_sku.setdefault(sku, []).append(
+                {"attribute_code": col, "value": norm}
             )
 
-    if not changes:
-        st.info("Нет изменений для сохранения.")
+    if not payload_by_sku:
+        if errors:
+            import pandas as _pd
+
+            st.warning("Some rows failed; review and fix:")
+            st.dataframe(_pd.DataFrame(errors))
+        else:
+            st.info("Нет изменений для сохранения.")
         return
 
     api_base = st.session_state.get("ai_api_base")
@@ -685,21 +744,31 @@ def save_step2_to_magento():
         st.warning("Magento API не инициализирован.")
         return
 
-    results = {"ok": [], "fail": []}
-    for sku, attrs in changes.items():
+    for sku, attrs in payload_by_sku.items():
         try:
+            if not attrs:
+                continue
             payload = {item["attribute_code"]: item["value"] for item in attrs}
             apply_product_update(session, api_base, sku, payload)
-            results["ok"].append(sku)
-        except Exception as exc:  # pragma: no cover - network interaction
-            results["fail"].append({"sku": sku, "error": str(exc)})
+            ok_skus.append(sku)
+        except Exception as e:  # pragma: no cover - network interaction
+            errors.append(
+                {
+                    "sku": sku,
+                    "attribute": "*batch*",
+                    "raw": repr(attrs),
+                    "error": str(e),
+                }
+            )
 
-    if results["ok"]:
-        st.success(f"Updated: {', '.join(results['ok'])}")
+    if ok_skus:
+        st.success(f"Updated: {', '.join(sorted(set(ok_skus)))}")
 
-    if results["fail"]:
-        st.warning("Часть обновлений не удалась.")
-        st.dataframe(pd.DataFrame(results["fail"]), use_container_width=True)
+    if errors:
+        import pandas as _pd
+
+        st.warning("Some rows failed; review and fix:")
+        st.dataframe(_pd.DataFrame(errors), use_container_width=True)
 
     st.session_state["step2_original"] = st.session_state["step2_df"].copy(deep=True)
 
