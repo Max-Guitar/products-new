@@ -377,6 +377,10 @@ def _ensure_step2_state() -> dict:
     state.setdefault("disabled", {})
     state.setdefault("row_meta", {})
     state.setdefault("set_names", {})
+    state.setdefault("wide", {})
+    state.setdefault("wide_orig", {})
+    state.setdefault("wide_meta", {})
+    state.setdefault("wide_colcfg", {})
     return state
 
 
@@ -420,6 +424,56 @@ def _build_value_column_config(row_meta_map: dict[str, dict]):
         return st.column_config.TextColumn("Value")
 
     return st.column_config.Column("Value")
+
+
+def make_wide(df_long: pd.DataFrame) -> pd.DataFrame:
+    """Convert attribute rows to a wide table with one row per SKU."""
+
+    if df_long.empty:
+        return pd.DataFrame(columns=["sku", "name"]).astype(object)
+
+    base = df_long[["sku", "name"]].drop_duplicates().set_index("sku")
+    pv = df_long.pivot_table(
+        index="sku",
+        columns="attribute_code",
+        values="value",
+        aggfunc=lambda x: x.iloc[-1],
+    )
+    out = base.join(pv, how="left").reset_index()
+    for column in out.columns:
+        out[column] = out[column].astype(object)
+    return out
+
+
+def build_wide_colcfg(wide_meta: dict[str, dict]):
+    cfg = {
+        "sku": st.column_config.TextColumn("SKU", disabled=True),
+        "name": st.column_config.TextColumn("Name", disabled=True),
+    }
+
+    for code, meta in wide_meta.items():
+        t = (meta.get("frontend_input") or meta.get("backend_type") or "text").lower()
+        opts = [
+            opt.get("label")
+            for opt in meta.get("options", [])
+            if isinstance(opt.get("label"), str) and opt.get("label").strip()
+        ]
+        if t == "select":
+            cfg[code] = st.column_config.SelectboxColumn(
+                _attr_label(meta, code), options=opts
+            )
+        elif t == "multiselect":
+            cfg[code] = st.column_config.MultiselectColumn(
+                _attr_label(meta, code), options=opts
+            )
+        elif t == "boolean":
+            cfg[code] = st.column_config.CheckboxColumn(_attr_label(meta, code))
+        elif t in {"int", "integer", "decimal", "price", "float"}:
+            cfg[code] = st.column_config.NumberColumn(_attr_label(meta, code))
+        else:
+            cfg[code] = st.column_config.TextColumn(_attr_label(meta, code))
+
+    return cfg
 
 
 def build_attributes_df(
@@ -657,18 +711,6 @@ def build_attributes_df(
 
     return dfs, column_configs, disabled, meta_cache, row_meta_by_set, set_names
 
-
-def _normalize_diff_value(value):
-    if isinstance(value, (list, tuple, set)):
-        normalized = [str(item).strip() for item in value if str(item).strip()]
-        return tuple(normalized)
-    if isinstance(value, float) and pd.isna(value):
-        return None
-    if isinstance(value, str):
-        return value.strip()
-    return value
-
-
 def _is_blank_value(value) -> bool:
     if value is None:
         return True
@@ -679,12 +721,6 @@ def _is_blank_value(value) -> bool:
     if isinstance(value, (list, tuple, set)):
         return all(_is_blank_value(item) for item in value)
     return False
-
-
-def _prepare_value_for_save(value):
-    if isinstance(value, tuple):
-        return [item for item in value]
-    return value
 
 
 def apply_product_update(session, api_base: str, sku: str, attributes: dict):
@@ -724,81 +760,96 @@ def save_step2_to_magento():
         st.info("Нет изменений для сохранения.")
         return
 
-    dfs: dict[int, pd.DataFrame] = step2_state.get("dfs", {})
-    originals: dict[int, pd.DataFrame] = step2_state.get("original", {})
-    row_meta: dict[int, dict[str, dict]] = step2_state.get("row_meta", {})
+    wide_map: dict[int, pd.DataFrame] = step2_state.get("wide", {})
+    wide_originals: dict[int, pd.DataFrame] = step2_state.get("wide_orig", {})
+    wide_meta: dict[int, dict[str, dict]] = step2_state.get("wide_meta", {})
     meta_cache = step2_state.get("meta_cache")
     if meta_cache is None:
         meta_cache = step2_state.get("meta")
 
-    if not dfs:
+    if not wide_map:
         st.info("Нет изменений для сохранения.")
         return
 
     payload_by_sku: dict[str, dict[str, object]] = {}
     errors: list[dict[str, object]] = []
 
-    for set_id, current_df in dfs.items():
+    def _diff_value(value):
+        if isinstance(value, (list, tuple)):
+            return tuple(value)
+        return value
+
+    for set_id, current_df in wide_map.items():
         if not isinstance(current_df, pd.DataFrame) or current_df.empty:
             continue
-        original_df = originals.get(set_id)
+        original_df = wide_originals.get(set_id)
         if not isinstance(original_df, pd.DataFrame) or original_df.empty:
             continue
 
-        common_idx = current_df.index.intersection(original_df.index)
-        if common_idx.empty:
+        attr_cols = [
+            col for col in current_df.columns if col not in ("sku", "name")
+        ]
+        if not attr_cols:
             continue
 
-        meta_for_set = row_meta.get(set_id, {})
+        original_aligned = original_df.reindex(index=current_df.index, columns=attr_cols)
+        current_values = current_df[attr_cols].applymap(_diff_value)
+        original_values = original_aligned.applymap(_diff_value)
+        changed_mask = current_values != original_values
+        if not changed_mask.any().any():
+            continue
 
-        for row_id in common_idx:
-            current_value = current_df.at[row_id, "value"]
-            original_value = original_df.at[row_id, "value"]
-            if _normalize_diff_value(current_value) == _normalize_diff_value(original_value):
+        meta_for_set = wide_meta.get(set_id, {})
+
+        for row_idx in current_df.index:
+            sku = str(current_df.at[row_idx, "sku"])
+            if not sku:
                 continue
-
-            sku = str(current_df.at[row_id, "sku"])
-            code = str(current_df.at[row_id, "attribute_code"])
-            info = meta_for_set.get(row_id, {})
-            prepared_value = _prepare_value_for_save(current_value)
-            try:
-                normalized = normalize_for_magento(code, prepared_value, meta_cache)
-            except Exception as exc:  # pragma: no cover - safety guard
-                errors.append(
-                    {
-                        "sku": sku,
-                        "attribute": code,
-                        "raw": repr(current_value),
-                        "hint_examples": f"normalize error: {exc}",
-                    }
-                )
-                continue
-
-            if normalized is None:
-                if _is_blank_value(current_value):
+            for code in attr_cols:
+                if not changed_mask.loc[row_idx, code]:
                     continue
-                meta_info = (
-                    meta_cache.get(code)
-                    if isinstance(meta_cache, AttributeMetaCache)
-                    else {}
-                )
-                examples = info.get("valid_examples") or meta_info.get("valid_examples") or []
-                if not examples:
-                    options = info.get("options") or _meta_options(meta_info)
-                    for label in options:
-                        if label and label not in examples:
-                            examples.append(label)
-                        if len(examples) >= 5:
-                            break
-                errors.append(
-                    {
-                        "sku": sku,
-                        "attribute": code,
-                        "raw": str(current_value),
-                        "hint_examples": ", ".join(examples[:5]),
-                    }
-                )
-                continue
+
+                raw_value = current_df.at[row_idx, code]
+                try:
+                    normalized = normalize_for_magento(code, raw_value, meta_cache)
+                except Exception as exc:  # pragma: no cover - safety guard
+                    errors.append(
+                        {
+                            "sku": sku,
+                            "attribute": code,
+                            "raw": repr(raw_value),
+                            "hint_examples": f"normalize error: {exc}",
+                        }
+                    )
+                    continue
+
+                if normalized is None:
+                    if _is_blank_value(raw_value):
+                        continue
+                    meta_info = (
+                        meta_for_set.get(code)
+                        if isinstance(meta_for_set, dict)
+                        else {}
+                    )
+                    if not meta_info and isinstance(meta_cache, AttributeMetaCache):
+                        meta_info = meta_cache.get(code) or {}
+                    examples = list(meta_info.get("valid_examples") or [])
+                    if not examples:
+                        options = _meta_options(meta_info)
+                        for label in options:
+                            if label and label not in examples:
+                                examples.append(label)
+                            if len(examples) >= 5:
+                                break
+                    errors.append(
+                        {
+                            "sku": sku,
+                            "attribute": code,
+                            "raw": str(raw_value),
+                            "hint_examples": ", ".join(examples[:5]),
+                        }
+                    )
+                    continue
 
             payload_by_sku.setdefault(sku, {})[code] = normalized
 
@@ -840,9 +891,9 @@ def save_step2_to_magento():
         )
 
     if ok_skus:
-        for set_id, df_current in dfs.items():
+        for set_id, df_current in wide_map.items():
             if isinstance(df_current, pd.DataFrame):
-                originals[set_id] = df_current.copy(deep=True)
+                step2_state["wide_orig"][set_id] = df_current.copy(deep=True)
 
 
 def load_items(session, base_url):
@@ -1194,21 +1245,75 @@ if "df_original" in st.session_state:
                                         step2_state["set_names"][set_id] = set_names.get(
                                             set_id, str(set_id)
                                         )
+                                        wide_df = make_wide(stored_df)
+                                        step2_state["wide"][set_id] = wide_df
+                                        step2_state["wide_orig"][set_id] = wide_df.copy(
+                                            deep=True
+                                        )
+                                        attr_cols = [
+                                            col
+                                            for col in wide_df.columns
+                                            if col not in ("sku", "name")
+                                        ]
+                                        meta_for_set: dict[str, dict] = {}
+                                        if isinstance(
+                                            meta_cache_obj, AttributeMetaCache
+                                        ):
+                                            for code in attr_cols:
+                                                meta_for_set[code] = (
+                                                    meta_cache_obj.get(code) or {}
+                                                )
+                                        else:
+                                            for code in attr_cols:
+                                                meta_for_set[code] = {}
+                                        step2_state["wide_meta"][set_id] = meta_for_set
+                                        step2_state["wide_colcfg"][set_id] = (
+                                            build_wide_colcfg(meta_for_set)
+                                        )
                                     step2_state["meta_cache"] = meta_cache_obj
 
                                     for set_id, df0 in step2_state["dfs"].items():
                                         if "value" in df0.columns:
                                             df0["value"] = df0["value"].astype(object)
 
+                                    if step2_state["dfs"] and not step2_state["wide"]:
+                                        meta_obj = step2_state.get("meta_cache")
+                                        for set_id, df_existing in step2_state["dfs"].items():
+                                            if not isinstance(df_existing, pd.DataFrame):
+                                                continue
+                                            wide_df = make_wide(df_existing)
+                                            step2_state["wide"][set_id] = wide_df
+                                            step2_state["wide_orig"][set_id] = wide_df.copy(
+                                                deep=True
+                                            )
+                                            attr_codes = [
+                                                col
+                                                for col in wide_df.columns
+                                                if col not in ("sku", "name")
+                                            ]
+                                            meta_for_set: dict[str, dict] = {}
+                                            if isinstance(meta_obj, AttributeMetaCache):
+                                                for code in attr_codes:
+                                                    meta_for_set[code] = (
+                                                        meta_obj.get(code) or {}
+                                                    )
+                                            else:
+                                                for code in attr_codes:
+                                                    meta_for_set[code] = {}
+                                            step2_state["wide_meta"][set_id] = meta_for_set
+                                            step2_state["wide_colcfg"][set_id] = (
+                                                build_wide_colcfg(meta_for_set)
+                                            )
+
                                     st.session_state["show_attrs"] = bool(
-                                        step2_state["dfs"]
+                                        step2_state["wide"]
                                     )
 
-                                if not step2_state["dfs"]:
+                                if not step2_state["wide"]:
                                     st.info("Нет атрибутов для отображения.")
                                 elif st.session_state.get("show_attrs"):
-                                    for set_id in sorted(step2_state["dfs"].keys()):
-                                        df_ref = step2_state["dfs"].get(set_id)
+                                    for set_id in sorted(step2_state["wide"].keys()):
+                                        df_ref = step2_state["wide"].get(set_id)
                                         if not isinstance(df_ref, pd.DataFrame):
                                             continue
 
@@ -1218,30 +1323,33 @@ if "df_original" in st.session_state:
                                         st.markdown(
                                             f"#### {_format_attr_set_title(set_title)} (ID {set_id})"
                                         )
+                                        column_order = [
+                                            "sku",
+                                            "name",
+                                        ] + [
+                                            col
+                                            for col in df_ref.columns
+                                            if col not in ("sku", "name")
+                                        ]
                                         edited_df = st.data_editor(
                                             df_ref,
-                                            key=f"step2_editor::{set_id}",
-                                            column_config=step2_state["column_config"][
-                                                set_id
-                                            ],
-                                            disabled=step2_state["disabled"][set_id],
-                                            column_order=[
-                                                "sku",
-                                                "name",
-                                                "attribute_code",
-                                                "value",
-                                            ],
+                                            key=f"step2_wide::{set_id}",
+                                            column_config=step2_state["wide_colcfg"].get(
+                                                set_id, {}
+                                            ),
+                                            disabled=["sku", "name"],
                                             use_container_width=True,
-                                            num_rows="fixed",
                                             hide_index=True,
+                                            num_rows="fixed",
+                                            column_order=column_order,
                                         )
 
                                         if isinstance(edited_df, pd.DataFrame):
                                             df_ref.update(edited_df)
-                                            if "value" in edited_df.columns:
+                                            for col in edited_df.columns:
                                                 df_ref.loc[
-                                                    edited_df.index, "value"
-                                                ] = edited_df["value"]
+                                                    edited_df.index, col
+                                                ] = edited_df[col]
 
                                     if st.button(
                                         "Save to Magento",
