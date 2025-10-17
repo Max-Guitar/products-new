@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple
-from urllib.parse import unquote
+from typing import Any, Dict
+from urllib.parse import urlencode, unquote
 
 import pytest
 
@@ -17,22 +17,31 @@ class DummySession:
 
 @pytest.fixture
 def mock_magento_get(monkeypatch):
-    responses: Dict[Tuple[str, Tuple[Tuple[str, Any], ...]], Dict[str, Any]] = {}
+    responses: Dict[str, Dict[str, Any]] = {}
+    backorders: Dict[str, int] = {}
 
-    def handler(session, base_url, path, params=None, timeout=60):
-        key = (path, tuple(sorted((params or {}).items())))
+    def _build_path(path: str, params: Dict[str, Any] | None) -> str:
+        if not params:
+            return path
+        query = urlencode(params, doseq=True)
+        if not query:
+            return path
+        separator = "&" if "?" in path else "?"
+        return f"{path}{separator}{query}"
+
+    def handler(session, base_url, path, headers=None):
         if path.startswith("/stockItems/"):
             sku = unquote(path.split("/stockItems/")[1])
-            return {"backorders": responses[("/stockItems/*", (("sku", sku),))]["backorders"]}
-        if key not in responses:
-            raise AssertionError(f"Unexpected request: {key}")
-        return responses[key]
+            return {"backorders": backorders.get(sku, 0)}
+        if path not in responses:
+            raise AssertionError(f"Unexpected request: {path}")
+        return responses[path]
 
     def register(path: str, params: Dict[str, Any], data: Dict[str, Any]):
-        responses[(path, tuple(sorted((params or {}).items())))] = data
+        responses[_build_path(path, params)] = data
 
     def register_backorder(sku: str, value: int):
-        responses[("/stockItems/*", (("sku", sku),))] = {"backorders": value}
+        backorders[sku] = value
 
     monkeypatch.setattr("services.inventory.magento_get", handler)
 
@@ -140,7 +149,7 @@ def test_get_backorders_parallel(monkeypatch):
     session = DummySession()
     base_url = "https://example.com"
 
-    def fake_get(session, base_url, path, params=None, timeout=60):
+    def fake_get(session, base_url, path, headers=None):
         sku = unquote(path.split("/stockItems/")[1])
         return {"backorders": {"SKU0": 0, "SKU1": 1, "SKU2": 2}.get(sku, 0)}
 

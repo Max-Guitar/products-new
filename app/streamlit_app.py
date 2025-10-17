@@ -634,22 +634,12 @@ def build_wide_colcfg(
     for code, original_meta in list(wide_meta.items()):
         meta = original_meta or {}
         series = df_sample[code] if (df_sample is not None and code in df_sample.columns) else None
-        frontend_input = (meta.get("frontend_input") or meta.get("backend_type") or "text").lower()
-        if (
-            frontend_input == "boolean"
-            and not meta.get("options")
-            and isinstance(series, pd.Series)
-            and not series.map(lambda v: isinstance(v, bool) or v in (None, "")).all()
-        ):
-            meta = dict(meta)
-            meta["frontend_input"] = "text"
-            wide_meta[code] = meta
 
         t = (meta.get("frontend_input") or meta.get("backend_type") or "text").lower()
         opts = [
-            opt.get("label")
+            str(opt.get("label"))
             for opt in (meta.get("options") or [])
-            if isinstance(opt.get("label"), str) and opt.get("label").strip()
+            if str(opt.get("label", "")).strip()
         ]
         if not opts:
             v2l = meta.get("values_to_labels") or {}
@@ -669,12 +659,10 @@ def build_wide_colcfg(
                 if s and s not in seen:
                     seen.add(s)
                     opts.append(s)
+
         select_like = (t == "select") or (
             opts and t in {"", "text", "varchar", "static"}
         )
-        bool_like = t == "boolean"
-        if bool_like and isinstance(series, pd.Series):
-            bool_like = series.map(type).eq(bool).all()
 
         if t == "multiselect":
             is_list_series = False
@@ -688,13 +676,11 @@ def build_wide_colcfg(
                 )
             else:
                 cfg[code] = st.column_config.TextColumn(_attr_label(meta, code))
-        elif bool_like:
-            # чекбоксу не нужен список опций
+        elif t == "boolean":
             cfg[code] = st.column_config.CheckboxColumn(
                 _attr_label(meta, code)
             )
         elif select_like and len(opts) >= 1:
-            # даже 1 значение — всё равно рисуем выпадающий список
             cfg[code] = st.column_config.SelectboxColumn(
                 _attr_label(meta, code), options=opts
             )
@@ -1593,14 +1579,17 @@ if "df_original" in st.session_state:
                                         cacheable = isinstance(
                                             meta_cache_obj, AttributeMetaCache
                                         )
-                                        if cacheable and attr_cols:
+                                        if cacheable:
                                             meta_cache_obj.load(attr_cols)
-                                        meta_map = step2_state["wide_meta"].setdefault(
-                                            set_id, {}
-                                        )
+                                        wide_meta = step2_state.setdefault("wide_meta", {})
+                                        if cacheable:
+                                            wide_meta[set_id] = {
+                                                c: meta_cache_obj.get(c) for c in attr_cols
+                                            }
+                                        meta_map = wide_meta.setdefault(set_id, {})
                                         if not isinstance(meta_map, dict):
                                             meta_map = {}
-                                            step2_state["wide_meta"][set_id] = meta_map
+                                            wide_meta[set_id] = meta_map
                                         for code in attr_cols:
                                             if code not in meta_map:
                                                 meta_map[code] = {}
@@ -1693,14 +1682,19 @@ if "df_original" in st.session_state:
                                             cacheable = isinstance(
                                                 meta_obj, AttributeMetaCache
                                             )
-                                            if cacheable and attr_codes:
+                                            if cacheable:
                                                 meta_obj.load(attr_codes)
-                                            meta_map = step2_state["wide_meta"].setdefault(
-                                                set_id, {}
+                                            wide_meta = step2_state.setdefault(
+                                                "wide_meta", {}
                                             )
+                                            if cacheable:
+                                                wide_meta[set_id] = {
+                                                    c: meta_obj.get(c) for c in attr_codes
+                                                }
+                                            meta_map = wide_meta.setdefault(set_id, {})
                                             if not isinstance(meta_map, dict):
                                                 meta_map = {}
-                                                step2_state["wide_meta"][set_id] = meta_map
+                                                wide_meta[set_id] = meta_map
                                             for code in attr_codes:
                                                 if code not in meta_map:
                                                     meta_map[code] = {}
@@ -1842,6 +1836,14 @@ if "df_original" in st.session_state:
                                             for col in df_ref.columns
                                             if col not in ("sku", "name")
                                         ]
+                                        meta_cache = step2_state.get("meta_cache")
+                                        wide_meta_map = step2_state.get("wide_meta", {})
+                                        st.caption(
+                                            "brand alias: "
+                                            f"{getattr(meta_cache, '_aliases', {}).get('brand')}, "
+                                            "brand options: "
+                                            f"{len((wide_meta_map.get(set_id, {}) or {}).get('brand', {}).get('options', []))}"
+                                        )
                                         edited_df = st.data_editor(
                                             df_ref,
                                             key=f"step2_wide::{set_id}",
