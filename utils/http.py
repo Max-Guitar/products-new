@@ -86,8 +86,19 @@ def build_magento_url(base_url: str, path: str) -> str:
     normalized = normalize_magento_path(path)
     base = base_url.rstrip("/")
     if not normalized:
-        return f"{base}/{_MAGENTO_REST_PREFIX}"
-    return f"{base}/{_MAGENTO_REST_PREFIX}/{normalized}"
+        final_url = f"{base}/{_MAGENTO_REST_PREFIX}"
+    else:
+        final_url = f"{base}/{_MAGENTO_REST_PREFIX}/{normalized}"
+
+    if re.search(r"/rest/(all|default)/V1/rest/(all|default)/V1", final_url):
+        final_url = re.sub(
+            r"/rest/(all|default)/V1/rest/(all|default)/V1",
+            "/rest/all/V1",
+            final_url,
+        )
+
+    _LOGGER.warning(f"Final Magento URL: {final_url}")
+    return final_url
 
 
 def magento_get(
