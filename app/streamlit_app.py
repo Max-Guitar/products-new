@@ -17,6 +17,7 @@ import pandas as pd
 import streamlit as st
 
 from connectors.magento.attributes import AttributeMetaCache
+from connectors.magento.client import get_default_products
 from services.ai_fill import (
     ALWAYS_ATTRS,
     SET_ATTRS,
@@ -1234,37 +1235,88 @@ def save_step2_to_magento():
                 step2_state["wide_synced"][set_id] = result_df
 
 
-def load_items(session, base_url):
-    attr_set_id = get_attr_set_id(session, base_url, name=_DEF_ATTR_SET_NAME)
+def load_items(
+    session,
+    base_url,
+    *,
+    attr_set_id: int | None = None,
+    products: list[dict] | None = None,
+):
+    if attr_set_id is None:
+        attr_set_id = get_attr_set_id(session, base_url, name=_DEF_ATTR_SET_NAME)
 
     rows = []
     prog = st.progress(0.0, text="Loading products…")
     total_hint = 0
-    for product, total in iter_products_by_attr_set(session, base_url, attr_set_id):
-        total_hint = total or total_hint
-        status = int(
-            _get_custom_attr_value(product, "status", product.get("status", 1)) or 1
-        )
-        visibility = int(
-            _get_custom_attr_value(product, "visibility", product.get("visibility", 4))
-            or 4
-        )
-        type_id = product.get("type_id", "simple")
-        if visibility == 1 or type_id not in _ALLOWED_TYPES:
-            continue
 
-        rows.append(
-            {
-                "sku": product.get("sku", ""),
-                "name": product.get("name", ""),
-                "created_at": product.get("created_at", ""),
-            }
-        )
+    if products is None:
+        iterator = iter_products_by_attr_set(session, base_url, attr_set_id)
+        for product, total in iterator:
+            total_hint = total or total_hint
+            status = int(
+                _get_custom_attr_value(product, "status", product.get("status", 1))
+                or 1
+            )
+            visibility = int(
+                _get_custom_attr_value(
+                    product, "visibility", product.get("visibility", 4)
+                )
+                or 4
+            )
+            type_id = product.get("type_id", "simple")
+            if visibility == 1 or type_id not in _ALLOWED_TYPES:
+                continue
 
-        if total_hint:
-            done = len(rows) / max(total_hint, 1)
-            done = min(done, 1.0)
-            prog.progress(done, text=f"Loading products… {int(done * 100)}%")
+            rows.append(
+                {
+                    "sku": product.get("sku", ""),
+                    "name": product.get("name", ""),
+                    "created_at": product.get("created_at", ""),
+                }
+            )
+
+            if total_hint:
+                done = len(rows) / max(total_hint, 1)
+                done = min(done, 1.0)
+                prog.progress(done, text=f"Loading products… {int(done * 100)}%")
+    else:
+        total_hint = len(products)
+        for idx, product in enumerate(products, start=1):
+            product_attr_id = product.get("attribute_set_id")
+            if product_attr_id is not None and attr_set_id is not None:
+                try:
+                    attr_value = int(product_attr_id)
+                except (TypeError, ValueError):
+                    attr_value = None
+                if attr_value is not None and attr_value != int(attr_set_id):
+                    continue
+
+            status = int(
+                _get_custom_attr_value(product, "status", product.get("status", 1))
+                or 1
+            )
+            visibility = int(
+                _get_custom_attr_value(
+                    product, "visibility", product.get("visibility", 4)
+                )
+                or 4
+            )
+            type_id = product.get("type_id", "simple")
+            if visibility == 1 or type_id not in _ALLOWED_TYPES:
+                continue
+
+            rows.append(
+                {
+                    "sku": product.get("sku", ""),
+                    "name": product.get("name", ""),
+                    "created_at": product.get("created_at", ""),
+                }
+            )
+
+            if total_hint:
+                done = idx / max(total_hint, 1)
+                done = min(done, 1.0)
+                prog.progress(done, text=f"Loading products… {int(done * 100)}%")
 
     prog.progress(1.0, text="Products loaded")
 
@@ -1341,9 +1393,39 @@ session = get_session(auth_token)
 st.markdown("### 🤖 AI Content Manager")
 st.info("Let’s find items that need attribute set assignment.")
 
-if st.button("Load items", type="primary"):
+if "step1_editor_mode" not in st.session_state:
+    st.session_state["step1_editor_mode"] = "all"
+
+c1, c2 = st.columns(2)
+btn_all = c1.button("Load items", type="primary", key="btn_load_all")
+btn_50 = c2.button("Load 50 (fast)", key="btn_load_50_fast")
+
+limit = 50 if btn_50 else None
+
+if btn_all or btn_50:
+    st.session_state["step1_editor_mode"] = "50" if limit == 50 else "all"
+    st.info(
+        f"Loading default products{f' (limit={limit})' if limit else ''}…"
+    )
     try:
-        df_items = load_items(session, base_url)
+        attr_set_id = get_attr_set_id(session, base_url, name=_DEF_ATTR_SET_NAME)
+        data = get_default_products(
+            session,
+            base_url,
+            attr_set_id=attr_set_id,
+            qty_min=0,
+            limit=limit,
+            minimal_fields=True,
+        )
+        st.success(
+            f"Loaded {len(data or [])} products{f' (limit={limit})' if limit else ''}"
+        )
+        df_items = load_items(
+            session,
+            base_url,
+            attr_set_id=attr_set_id,
+            products=data,
+        )
         if df_items.empty:
             st.warning("No items match the Default set filter criteria.")
             st.session_state.pop("df_original", None)
@@ -1436,6 +1518,7 @@ if "df_original" in st.session_state:
                 "created_at",
             ]
             col_cfg, disabled_cols = _build_column_config_for_step1_like(step="step1")
+            editor_key = f"editor_step1_{st.session_state.get('step1_editor_mode', 'all')}"
             edited_df = st.data_editor(
                 df_base,
                 column_config=col_cfg,
@@ -1443,7 +1526,7 @@ if "df_original" in st.session_state:
                 column_order=["sku", "name", "attribute set", "hint", "created_at"],
                 use_container_width=True,
                 num_rows="fixed",
-                key="editor_key_main",
+                key=editor_key,
             )
 
             if isinstance(edited_df, pd.DataFrame) and st.button("Show Attributes"):
