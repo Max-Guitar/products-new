@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from collections import defaultdict
 from collections.abc import Iterable
 from urllib.parse import quote
 
@@ -359,22 +360,66 @@ def _build_column_config_for_step1_like(step: str) -> tuple[dict, list[str]]:
         disabled = st.session_state.get("step1_disabled_cols_cache", [])
         return config, disabled
     if step == "step2":
-        config = st.session_state.get("step2_column_config_cache", {})
-        disabled = st.session_state.get("step2_disabled_cols_cache", [])
-        return config, disabled
+        return {}, []
     return {}, []
 
 
 def _reset_step2_state():
-    for key in (
-        "step2_df",
-        "step2_original",
-        "step2_column_config_cache",
-        "step2_disabled_cols_cache",
-        "step2_meta",
-        "show_attrs",
-    ):
-        st.session_state.pop(key, None)
+    st.session_state.pop("step2", None)
+    st.session_state.pop("show_attrs", None)
+
+
+def _ensure_step2_state() -> dict:
+    state = st.session_state.setdefault("step2", {})
+    state.setdefault("dfs", {})
+    state.setdefault("original", {})
+    state.setdefault("column_config", {})
+    state.setdefault("disabled", {})
+    state.setdefault("row_meta", {})
+    state.setdefault("set_names", {})
+    return state
+
+
+def _build_value_column_config(row_meta_map: dict[str, dict]):
+    if not row_meta_map:
+        return st.column_config.Column("Value")
+
+    frontend_inputs = {
+        (meta.get("frontend_input") or meta.get("backend_type") or "text").lower()
+        for meta in row_meta_map.values()
+    }
+
+    frontend_inputs.discard("")
+
+    def _options_union() -> list[str]:
+        collected: list[str] = []
+        seen: set[str] = set()
+        for meta in row_meta_map.values():
+            for option in meta.get("options", []) or []:
+                if isinstance(option, str):
+                    label = option.strip()
+                else:
+                    label = ""
+                if not label or label in seen:
+                    continue
+                seen.add(label)
+                collected.append(label)
+        return collected
+
+    if len(frontend_inputs) == 1:
+        input_type = frontend_inputs.pop()
+        options = _options_union()
+        if input_type == "select":
+            return st.column_config.SelectboxColumn("Value", options=options)
+        if input_type == "multiselect":
+            return st.column_config.MultiselectColumn("Value", options=options)
+        if input_type == "boolean":
+            return st.column_config.CheckboxColumn("Value")
+        if input_type in {"int", "integer", "decimal", "price", "float"}:
+            return st.column_config.NumberColumn("Value")
+        return st.column_config.TextColumn("Value")
+
+    return st.column_config.Column("Value")
 
 
 def build_attributes_df(
@@ -386,190 +431,13 @@ def build_attributes_df(
     category_options: list[dict],
     meta_cache: AttributeMetaCache,
 ):
-    core_codes = ["sku", "name", "brand", "condition"]
-    rows = []
-    column_meta: dict[str, dict] = {}
+    core_codes = ["brand", "condition"]
+    rows_by_set: dict[int, list[dict]] = defaultdict(list)
+    row_meta_by_set: dict[int, dict[str, dict]] = defaultdict(dict)
+    set_names: dict[int, str] = {}
 
-    id_to_label = {item["id"]: item["label"] for item in category_options}
-    label_to_id = {item["label"]: item["id"] for item in category_options}
-    category_labels = [item["label"] for item in category_options]
-
-    for _, row in df_changed.iterrows():
-        sku_value = str(row.get("sku", "")).strip()
-        if not sku_value:
-            continue
-
-        name_value = row.get("name")
-        attr_set_value = row.get("attribute set")
-        try:
-            with st.spinner(f"🔄 {sku_value}: загрузка атрибутов…"):
-                product = get_product_by_sku(session, api_base, sku_value)
-        except Exception as exc:  # pragma: no cover - UI interaction
-            st.warning(f"{sku_value}: не удалось получить атрибуты ({exc})")
-            continue
-
-        attr_set_id = None
-        if pd.notna(attr_set_value):
-            attr_set_id = attribute_sets.get(attr_set_value)
-        if attr_set_id is None:
-            attr_set_id = product.get("attribute_set_id")
-
-        allowed = compute_allowed_attrs(
-            attr_set_id,
-            SET_ATTRS,
-            attr_sets_map or {},
-            ALWAYS_ATTRS,
-        )
-
-        editor_codes: list[str] = []
-        for code in core_codes:
-            if code not in editor_codes:
-                editor_codes.append(code)
-        for code in sorted(allowed):
-            if code not in editor_codes:
-                editor_codes.append(code)
-
-        df_full = collect_attributes_table(
-            product,
-            editor_codes,
-            session,
-            api_base,
-        )
-        attr_rows = df_full.to_dict(orient="index") if not df_full.empty else {}
-
-        row_data = {
-            "sku": sku_value,
-            "name": str(name_value).strip()
-            if isinstance(name_value, str) and name_value.strip()
-            else str(product.get("name", "")),
-            "attribute set": attr_set_value
-            if isinstance(attr_set_value, str) and attr_set_value.strip()
-            else attr_sets_map.get(int(attr_set_id) if attr_set_id is not None else 0, ""),
-        }
-
-        loadable_codes = [
-            code
-            for code in editor_codes
-            if code not in {"sku", "name", "attribute set"}
-        ]
-        meta_cache.load(loadable_codes)
-
-        for code in editor_codes:
-            if code in {"sku", "name", "attribute set"}:
-                continue
-            meta = meta_cache.get(code) or {}
-            column_meta.setdefault(code, meta)
-            value = _value_for_editor(attr_rows.get(code, {}), meta)
-            row_data[code] = value
-
-        category_links = (
-            (product.get("extension_attributes") or {}).get("category_links") or []
-        )
-        categories = [
-            str(link.get("category_id", "")).strip()
-            for link in category_links
-            if str(link.get("category_id", "")).strip()
-        ]
-        row_data["categories"] = _categories_ids_to_labels(categories, id_to_label)
-
-        rows.append(row_data)
-
-    if not rows:
-        return pd.DataFrame(), {}, [], {}
-
-    df_table = pd.DataFrame(rows)
-    if "sku" not in df_table.columns:
-        df_table["sku"] = ""
-    if "name" not in df_table.columns:
-        df_table["name"] = ""
-
-    df_table["sku"] = df_table["sku"].astype(str)
-
-    for code in core_codes:
-        if code not in df_table.columns:
-            df_table[code] = ""
-
-    if "attribute set" not in df_table.columns:
-        df_table["attribute set"] = ""
-
-    if "categories" not in df_table.columns:
-        df_table["categories"] = [[] for _ in range(len(df_table))]
-
-    other_columns = sorted(
-        code
-        for code in column_meta.keys()
-        if code not in {"brand", "condition", "sku", "name", "categories"}
-    )
-
-    df_table["attribute_code"] = "__row__"
-
-    column_order: list[str] = ["sku", "attribute_code", "name", "attribute set"]
-    if "brand" in df_table.columns:
-        column_order.append("brand")
-    if "condition" in df_table.columns:
-        column_order.append("condition")
-    column_order.extend([col for col in other_columns if col in df_table.columns])
-    if "categories" in df_table.columns:
-        column_order.append("categories")
-
-    df_table = df_table[column_order]
-
-    column_meta_with_base = {code: column_meta.get(code, {}) for code in column_order}
-    column_config = _build_column_config(column_order, column_meta_with_base)
-
-    multiselect_columns = [
-        column
-        for column, meta in column_meta_with_base.items()
-        if (meta.get("frontend_input") or "").lower() == "multiselect"
-    ]
-
-    display_df = df_table.copy(deep=True)
-    for column in multiselect_columns:
-        if column in display_df.columns:
-            display_df[column] = display_df[column].apply(
-                _format_multiselect_display_value
-            )
-    if "categories" in display_df.columns:
-        display_df["categories"] = display_df["categories"].apply(
-            _format_multiselect_display_value
-        )
-
-    if "categories" in column_order:
-        category_help = "Comma-separated category labels"
-        if category_labels:
-            preview = ", ".join(category_labels[:5])
-            category_help += f". Examples: {preview}"
-        column_config["categories"] = st.column_config.Column(
-            "Categories",
-            help=category_help,
-        )
-
-    display_df = display_df.sort_values("sku").reset_index(drop=True)
-    display_df["__row_id"] = (
-        display_df["sku"].astype(str)
-        + "|"
-        + display_df["attribute_code"].astype(str)
-    )
-    display_df = display_df.set_index("__row_id", drop=False)
-
-    disabled_columns = ["sku", "attribute_code", "name", "attribute set", "__row_id"]
-
-    column_config.setdefault(
-        "attribute_code",
-        st.column_config.Column(
-            "Attribute Code",
-            help="Internal attribute code (read-only)",
-            disabled=True,
-        ),
-    )
-    column_config.setdefault(
-        "__row_id",
-        st.column_config.Column(
-            "Row ID",
-            help="Stable internal row identifier",
-            disabled=True,
-        ),
-    )
+    id_to_label = {str(item.get("id")): item.get("label") for item in category_options}
+    label_to_id = {item.get("label"): item.get("id") for item in category_options}
 
     if label_to_id:
         categories_aliases: dict[object, object] = {}
@@ -607,22 +475,216 @@ def build_attributes_df(
             "values_to_labels": categories_value_to_label,
             "valid_examples": valid_examples,
             "options": [
-                {"label": item.get("label"), "value": item.get("id")}
+                {
+                    "label": item.get("label"),
+                    "value": item.get("id"),
+                }
                 for item in category_options
             ],
         }
         meta_cache.set_static("categories", category_meta)
 
-    return display_df, column_config, disabled_columns, meta_cache
+    for _, row in df_changed.iterrows():
+        sku_value = str(row.get("sku", "")).strip()
+        if not sku_value:
+            continue
+
+        name_value = row.get("name")
+        attr_set_value = row.get("attribute set")
+        try:
+            with st.spinner(f"🔄 {sku_value}: загрузка атрибутов…"):
+                product = get_product_by_sku(session, api_base, sku_value)
+        except Exception as exc:  # pragma: no cover - UI interaction
+            st.warning(f"{sku_value}: не удалось получить атрибуты ({exc})")
+            continue
+
+        attr_set_id = None
+        if pd.notna(attr_set_value):
+            attr_set_id = attribute_sets.get(attr_set_value)
+        if attr_set_id is None:
+            attr_set_id = product.get("attribute_set_id")
+
+        if attr_set_id is None:
+            continue
+
+        try:
+            attr_set_id_int = int(attr_set_id)
+        except (TypeError, ValueError):
+            continue
+
+        set_names[attr_set_id_int] = attr_sets_map.get(attr_set_id_int, str(attr_set_id_int))
+
+        allowed = compute_allowed_attrs(
+            attr_set_id_int,
+            SET_ATTRS,
+            attr_sets_map or {},
+            ALWAYS_ATTRS,
+        )
+
+        editor_codes: list[str] = []
+        for code in core_codes:
+            if code not in editor_codes:
+                editor_codes.append(code)
+        for code in sorted(allowed):
+            if code not in editor_codes:
+                editor_codes.append(code)
+
+        df_full = collect_attributes_table(
+            product,
+            editor_codes,
+            session,
+            api_base,
+        )
+        attr_rows = df_full.to_dict(orient="index") if not df_full.empty else {}
+
+        loadable_codes = [
+            code
+            for code in editor_codes
+            if code not in {"sku", "name"}
+        ]
+        meta_cache.load(loadable_codes)
+
+        base_name = (
+            str(name_value).strip()
+            if isinstance(name_value, str) and name_value.strip()
+            else str(product.get("name", ""))
+        )
+
+        for code in editor_codes:
+            if code in {"sku", "name", "attribute set"}:
+                continue
+            meta = meta_cache.get(code) or {}
+            value = _value_for_editor(attr_rows.get(code, {}), meta)
+            frontend_input = (
+                meta.get("frontend_input")
+                or meta.get("backend_type")
+                or "text"
+            ).lower()
+
+            if frontend_input in {"int", "integer"}:
+                try:
+                    value = int(str(value).strip()) if str(value).strip() else None
+                except (TypeError, ValueError):
+                    value = str(value).strip() if isinstance(value, str) else value
+            elif frontend_input in {"decimal", "price", "float"}:
+                try:
+                    value = float(str(value).strip()) if str(value).strip() else None
+                except (TypeError, ValueError):
+                    value = str(value).strip() if isinstance(value, str) else value
+            elif frontend_input == "boolean":
+                value = bool(value)
+            elif frontend_input == "multiselect":
+                if not isinstance(value, list):
+                    value = _split_multiselect_input(value)
+            elif value is None:
+                value = ""
+
+            row_id = f"{sku_value}|{code}"
+            row_meta_by_set[attr_set_id_int][row_id] = {
+                "attribute_code": code,
+                "frontend_input": frontend_input,
+                "backend_type": (meta.get("backend_type") or "").lower(),
+                "options": _meta_options(meta),
+                "valid_examples": meta.get("valid_examples") or [],
+            }
+            rows_by_set[attr_set_id_int].append(
+                {
+                    "__row_id": row_id,
+                    "sku": sku_value,
+                    "name": base_name,
+                    "attribute_code": code,
+                    "value": value,
+                }
+            )
+
+        category_links = (
+            (product.get("extension_attributes") or {}).get("category_links") or []
+        )
+        categories = [
+            str(link.get("category_id", "")).strip()
+            for link in category_links
+            if str(link.get("category_id", "")).strip()
+        ]
+        category_labels = _categories_ids_to_labels(categories, id_to_label)
+        row_id = f"{sku_value}|categories"
+        row_meta_by_set[attr_set_id_int][row_id] = {
+            "attribute_code": "categories",
+            "frontend_input": "multiselect",
+            "backend_type": "text",
+            "options": [
+                item.get("label")
+                for item in category_options
+                if isinstance(item.get("label"), str) and item.get("label").strip()
+            ],
+            "valid_examples": category_labels[:5],
+        }
+        rows_by_set[attr_set_id_int].append(
+            {
+                "__row_id": row_id,
+                "sku": sku_value,
+                "name": base_name,
+                "attribute_code": "categories",
+                "value": category_labels,
+            }
+        )
+
+    if not rows_by_set:
+        return {}, {}, {}, meta_cache, {}, {}
+
+    dfs: dict[int, pd.DataFrame] = {}
+    column_configs: dict[int, dict] = {}
+    disabled: dict[int, list[str]] = {}
+
+    for set_id, rows in rows_by_set.items():
+        if not rows:
+            continue
+        df = pd.DataFrame(rows)
+        if df.empty:
+            continue
+        df = df.sort_values(["sku", "attribute_code"]).reset_index(drop=True)
+        df = df.set_index("__row_id", drop=True)
+        df = df[["sku", "name", "attribute_code", "value"]]
+        dfs[set_id] = df
+        column_configs[set_id] = {
+            "sku": st.column_config.TextColumn("SKU", disabled=True),
+            "name": st.column_config.TextColumn("Name", disabled=True),
+            "attribute_code": st.column_config.TextColumn(
+                "Attribute Code", disabled=True
+            ),
+            "value": _build_value_column_config(row_meta_by_set.get(set_id, {})),
+        }
+        disabled[set_id] = ["sku", "name", "attribute_code"]
+
+    return dfs, column_configs, disabled, meta_cache, row_meta_by_set, set_names
 
 
-def get_editable_columns() -> list[str]:
-    df = st.session_state.get("step2_df")
-    if not isinstance(df, pd.DataFrame):
-        return []
-    _, disabled = _build_column_config_for_step1_like(step="step2")
-    disabled_set = set(disabled or [])
-    return [col for col in df.columns if col not in disabled_set]
+def _normalize_diff_value(value):
+    if isinstance(value, (list, tuple, set)):
+        normalized = [str(item).strip() for item in value if str(item).strip()]
+        return tuple(normalized)
+    if isinstance(value, float) and pd.isna(value):
+        return None
+    if isinstance(value, str):
+        return value.strip()
+    return value
+
+
+def _is_blank_value(value) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, float) and pd.isna(value):
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, tuple, set)):
+        return all(_is_blank_value(item) for item in value)
+    return False
+
+
+def _prepare_value_for_save(value):
+    if isinstance(value, tuple):
+        return [item for item in value]
+    return value
 
 
 def apply_product_update(session, api_base: str, sku: str, attributes: dict):
@@ -657,106 +719,91 @@ def apply_product_update(session, api_base: str, sku: str, attributes: dict):
 
 
 def save_step2_to_magento():
-    df_current = st.session_state.get("step2_df")
-    df_original = st.session_state.get("step2_original")
-    if not isinstance(df_current, pd.DataFrame) or df_current.empty:
-        st.info("Нет изменений для сохранения.")
-        return
-    if not isinstance(df_original, pd.DataFrame) or df_original.empty:
-        st.info("Нет исходных данных для сохранения.")
-        return
-
-    editable_cols = get_editable_columns()
-    if not editable_cols:
-        st.info("Нет редактируемых колонок.")
-        return
-
-    current_subset = df_current[editable_cols]
-    original_subset = df_original[editable_cols]
-    common_idx = current_subset.index.intersection(original_subset.index)
-    if common_idx.empty:
+    step2_state = st.session_state.get("step2")
+    if not isinstance(step2_state, dict):
         st.info("Нет изменений для сохранения.")
         return
 
-    diff = current_subset.loc[common_idx] != original_subset.loc[common_idx]
-    meta_cache = st.session_state.get("step2_meta")
+    dfs: dict[int, pd.DataFrame] = step2_state.get("dfs", {})
+    originals: dict[int, pd.DataFrame] = step2_state.get("original", {})
+    row_meta: dict[int, dict[str, dict]] = step2_state.get("row_meta", {})
+    meta_cache = step2_state.get("meta_cache")
+    if meta_cache is None:
+        meta_cache = step2_state.get("meta")
 
-    def _is_blank(value) -> bool:
-        if value is None:
-            return True
-        if isinstance(value, str):
-            return not value.strip()
-        if isinstance(value, (list, tuple, set)):
-            return all(_is_blank(item) for item in value)
-        if isinstance(value, float) and pd.isna(value):
-            return True
-        return False
+    if not dfs:
+        st.info("Нет изменений для сохранения.")
+        return
 
+    payload_by_sku: dict[str, dict[str, object]] = {}
     errors: list[dict[str, object]] = []
-    ok_skus: list[str] = []
-    payload_by_sku: dict[str, list[dict[str, object]]] = {}
 
-    for row_id, mask in diff.iterrows():
-        if not mask.any():
+    for set_id, current_df in dfs.items():
+        if not isinstance(current_df, pd.DataFrame) or current_df.empty:
             continue
-        sku = df_current.at[row_id, "sku"]
-        if not sku:
+        original_df = originals.get(set_id)
+        if not isinstance(original_df, pd.DataFrame) or original_df.empty:
             continue
-        sku = str(sku)
-        for col in editable_cols:
-            if not mask.get(col):
+
+        common_idx = current_df.index.intersection(original_df.index)
+        if common_idx.empty:
+            continue
+
+        meta_for_set = row_meta.get(set_id, {})
+
+        for row_id in common_idx:
+            current_value = current_df.at[row_id, "value"]
+            original_value = original_df.at[row_id, "value"]
+            if _normalize_diff_value(current_value) == _normalize_diff_value(original_value):
                 continue
-            raw = df_current.at[row_id, col]
+
+            sku = str(current_df.at[row_id, "sku"])
+            code = str(current_df.at[row_id, "attribute_code"])
+            info = meta_for_set.get(row_id, {})
+            prepared_value = _prepare_value_for_save(current_value)
             try:
-                norm = normalize_for_magento(col, raw, meta_cache)
-            except Exception as e:  # pragma: no cover - safety guard
+                normalized = normalize_for_magento(code, prepared_value, meta_cache)
+            except Exception as exc:  # pragma: no cover - safety guard
                 errors.append(
                     {
                         "sku": sku,
-                        "attribute": col,
-                        "raw": repr(raw),
-                        "error": f"normalize: {e}",
+                        "attribute": code,
+                        "raw": repr(current_value),
+                        "hint_examples": f"normalize error: {exc}",
                     }
                 )
                 continue
-            if norm is None:
-                if _is_blank(raw):
+
+            if normalized is None:
+                if _is_blank_value(current_value):
                     continue
-                info = (
-                    meta_cache.get(col)
+                meta_info = (
+                    meta_cache.get(code)
                     if isinstance(meta_cache, AttributeMetaCache)
                     else {}
                 )
-                valid_examples = info.get("valid_examples") or []
-                if not valid_examples:
-                    options = info.get("options") or []
-                    for opt in options:
-                        label = opt.get("label")
-                        if isinstance(label, str) and label.strip():
-                            valid_examples.append(label.strip())
-                        if len(valid_examples) >= 5:
+                examples = info.get("valid_examples") or meta_info.get("valid_examples") or []
+                if not examples:
+                    options = info.get("options") or _meta_options(meta_info)
+                    for label in options:
+                        if label and label not in examples:
+                            examples.append(label)
+                        if len(examples) >= 5:
                             break
                 errors.append(
                     {
                         "sku": sku,
-                        "attribute": col,
-                        "raw": str(raw),
-                        "valid_examples": ", ".join(valid_examples[:5]),
+                        "attribute": code,
+                        "raw": str(current_value),
+                        "hint_examples": ", ".join(examples[:5]),
                     }
                 )
                 continue
-            payload_by_sku.setdefault(sku, []).append(
-                {"attribute_code": col, "value": norm}
-            )
 
-    if not payload_by_sku:
-        if errors:
-            import pandas as _pd
+            payload_by_sku.setdefault(sku, {})[code] = normalized
 
-            st.warning("Some rows failed; review and fix:")
-            st.dataframe(_pd.DataFrame(errors))
-        else:
-            st.info("Нет изменений для сохранения.")
+    if not payload_by_sku and not errors:
+        st.info("Нет изменений для сохранения.")
         return
 
     api_base = st.session_state.get("ai_api_base")
@@ -764,33 +811,38 @@ def save_step2_to_magento():
         st.warning("Magento API не инициализирован.")
         return
 
+    ok_skus: set[str] = set()
     for sku, attrs in payload_by_sku.items():
         try:
-            if not attrs:
-                continue
-            payload = {item["attribute_code"]: item["value"] for item in attrs}
-            apply_product_update(session, api_base, sku, payload)
-            ok_skus.append(sku)
-        except Exception as e:  # pragma: no cover - network interaction
+            apply_product_update(session, api_base, sku, attrs)
+            ok_skus.add(sku)
+        except Exception as exc:  # pragma: no cover - network interaction
             errors.append(
                 {
                     "sku": sku,
                     "attribute": "*batch*",
                     "raw": repr(attrs),
-                    "error": str(e),
+                    "hint_examples": str(exc),
                 }
             )
 
     if ok_skus:
-        st.success(f"Updated: {', '.join(sorted(set(ok_skus)))}")
+        st.success("Updated SKUs:")
+        st.markdown("\n".join(f"- `{sku}`" for sku in sorted(ok_skus)))
 
     if errors:
         import pandas as _pd
 
         st.warning("Some rows failed; review and fix:")
-        st.dataframe(_pd.DataFrame(errors), use_container_width=True)
+        st.dataframe(
+            _pd.DataFrame(errors, columns=["sku", "attribute", "raw", "hint_examples"]),
+            use_container_width=True,
+        )
 
-    st.session_state["step2_original"] = st.session_state["step2_df"].copy(deep=True)
+    if ok_skus:
+        for set_id, df_current in dfs.items():
+            if isinstance(df_current, pd.DataFrame):
+                originals[set_id] = df_current.copy(deep=True)
 
 
 def load_items(session, base_url):
@@ -1094,15 +1146,18 @@ if "df_original" in st.session_state:
                                         "step2_category_options"
                                     ] = categories_options
 
-                                if "step2_df" not in st.session_state:
+                                step2_state = _ensure_step2_state()
+                                if not step2_state.get("dfs"):
                                     meta_cache_obj = AttributeMetaCache(
                                         session, api_base
                                     )
                                     (
-                                        df_step2,
-                                        column_config,
-                                        disabled_cols,
-                                        meta_info,
+                                        dfs_by_set,
+                                        column_configs,
+                                        disabled_cols_map,
+                                        meta_cache_obj,
+                                        row_meta_map,
+                                        set_names,
                                     ) = build_attributes_df(
                                         df_changed,
                                         session,
@@ -1112,47 +1167,75 @@ if "df_original" in st.session_state:
                                         categories_options,
                                         meta_cache_obj,
                                     )
-                                    st.session_state["step2_df"] = df_step2.copy(deep=True)
-                                    st.session_state["step2_original"] = df_step2.copy(
-                                        deep=True
-                                    )
-                                    st.session_state[
-                                        "step2_column_config_cache"
-                                    ] = column_config
-                                    st.session_state[
-                                        "step2_disabled_cols_cache"
-                                    ] = disabled_cols
-                                    st.session_state["step2_meta"] = meta_info
-                                    st.session_state["show_attrs"] = True
 
-                                df_step2_current = st.session_state.get("step2_df")
-                                if not isinstance(
-                                    df_step2_current, pd.DataFrame
-                                ) or df_step2_current.empty:
+                                    if dfs_by_set:
+                                        for set_id, df_set in dfs_by_set.items():
+                                            if set_id in step2_state["dfs"]:
+                                                continue
+                                            step2_state["dfs"][set_id] = df_set.copy(deep=True)
+                                            step2_state["original"][set_id] = df_set.copy(
+                                                deep=True
+                                            )
+                                            step2_state["column_config"][set_id] = (
+                                                column_configs.get(set_id, {})
+                                            )
+                                            step2_state["disabled"][set_id] = (
+                                                disabled_cols_map.get(set_id, [])
+                                            )
+                                            step2_state["row_meta"][set_id] = (
+                                                row_meta_map.get(set_id, {})
+                                            )
+                                            step2_state["set_names"][set_id] = set_names.get(
+                                                set_id, str(set_id)
+                                            )
+                                        step2_state["meta_cache"] = meta_cache_obj
+                                        step2_state["meta"] = meta_cache_obj
+                                        st.session_state["show_attrs"] = True
+                                    else:
+                                        st.session_state["show_attrs"] = False
+
+                                dfs_by_set = step2_state.get("dfs", {})
+                                if not dfs_by_set:
                                     st.info("Нет атрибутов для отображения.")
                                 elif st.session_state.get("show_attrs"):
-                                    col_cfg, disabled_cols = (
-                                        _build_column_config_for_step1_like(step="step2")
-                                    )
-                                    edited_df = st.data_editor(
-                                        st.session_state["step2_df"],
-                                        key="step2_editor",
-                                        column_config=col_cfg,
-                                        disabled=disabled_cols,
-                                        use_container_width=True,
-                                        num_rows="fixed",
-                                        hide_index=False,
-                                    )
+                                    sorted_items = sorted(dfs_by_set.items(), key=lambda x: x[0])
+                                    for set_id, df_set in sorted_items:
+                                        set_title = step2_state["set_names"].get(
+                                            set_id, str(set_id)
+                                        )
+                                        st.markdown(
+                                            f"#### {_format_attr_set_title(set_title)} (ID {set_id})"
+                                        )
+                                        column_cfg = step2_state["column_config"].get(
+                                            set_id, {}
+                                        )
+                                        disabled_cols = step2_state["disabled"].get(
+                                            set_id,
+                                            ["sku", "name", "attribute_code"],
+                                        )
+                                        edited_df = st.data_editor(
+                                            df_set,
+                                            key=f"step2_editor::{set_id}",
+                                            column_config=column_cfg,
+                                            disabled=disabled_cols,
+                                            column_order=[
+                                                "sku",
+                                                "name",
+                                                "attribute_code",
+                                                "value",
+                                            ],
+                                            use_container_width=True,
+                                            num_rows="fixed",
+                                            hide_index=True,
+                                        )
 
-                                    if (
-                                        isinstance(edited_df, pd.DataFrame)
-                                        and not edited_df.equals(
-                                            st.session_state["step2_df"]
-                                        )
-                                    ):
-                                        st.session_state["step2_df"] = edited_df.copy(
-                                            deep=True
-                                        )
+                                        if isinstance(edited_df, pd.DataFrame):
+                                            edited_copy = edited_df.copy(deep=True)
+                                            try:
+                                                edited_copy.index = df_set.index
+                                            except Exception:  # pragma: no cover - defensive
+                                                pass
+                                            step2_state["dfs"][set_id] = edited_copy
 
                                     if st.button(
                                         "Save to Magento",
