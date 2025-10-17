@@ -478,7 +478,9 @@ def apply_wide_edits_to_long(
     return updated
 
 
-def build_wide_colcfg(wide_meta: dict[str, dict]):
+def build_wide_colcfg(
+    wide_meta: dict[str, dict], sample_df: pd.DataFrame | None = None
+):
     cfg = {
         "sku": st.column_config.TextColumn("SKU", disabled=True),
         "name": st.column_config.TextColumn("Name", disabled=True),
@@ -488,9 +490,27 @@ def build_wide_colcfg(wide_meta: dict[str, dict]):
         t = (meta.get("frontend_input") or meta.get("backend_type") or "text").lower()
         opts = [
             opt.get("label")
-            for opt in meta.get("options", [])
+            for opt in (meta.get("options") or [])
             if isinstance(opt.get("label"), str) and opt.get("label").strip()
         ]
+        if not opts:
+            v2l = meta.get("values_to_labels") or {}
+            opts = [
+                lbl
+                for lbl in {str(v).strip() for v in v2l.values()}
+                if lbl
+            ]
+        if (
+            not opts
+            and isinstance(sample_df, pd.DataFrame)
+            and (code in sample_df.columns)
+        ):
+            seen = set()
+            for v in sample_df[code].dropna().astype(str):
+                s = v.strip()
+                if s and s not in seen:
+                    seen.add(s)
+                    opts.append(s)
         if t == "select":
             cfg[code] = st.column_config.SelectboxColumn(
                 _attr_label(meta, code), options=opts
@@ -1385,7 +1405,10 @@ if "df_original" in st.session_state:
                                                 build_wide_colcfg(
                                                     step2_state["wide_meta"].get(
                                                         set_id, {}
-                                                    )
+                                                    ),
+                                                    sample_df=step2_state["wide"].get(
+                                                        set_id
+                                                    ),
                                                 )
                                             )
                                     step2_state["meta_cache"] = meta_cache_obj
@@ -1431,7 +1454,10 @@ if "df_original" in st.session_state:
                                                     build_wide_colcfg(
                                                         step2_state["wide_meta"].get(
                                                             set_id, {}
-                                                        )
+                                                        ),
+                                                        sample_df=step2_state["wide"].get(
+                                                            set_id
+                                                        ),
                                                     )
                                                 )
 
