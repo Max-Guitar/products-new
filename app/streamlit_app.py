@@ -511,7 +511,15 @@ def build_wide_colcfg(
                 if s and s not in seen:
                     seen.add(s)
                     opts.append(s)
-        if t == "select":
+        select_like = (t == "select") or (opts and t in {"", "text", "varchar", "static"})
+        bool_like = (t == "boolean") or (
+            t not in {"multiselect"}
+            and set({s.lower() for s in opts}) <= {"yes", "no", "0", "1", "true", "false"}
+        )
+
+        if bool_like:
+            cfg[code] = st.column_config.CheckboxColumn(_attr_label(meta, code))
+        elif select_like:
             cfg[code] = st.column_config.SelectboxColumn(
                 _attr_label(meta, code), options=opts
             )
@@ -519,8 +527,6 @@ def build_wide_colcfg(
             cfg[code] = st.column_config.MultiselectColumn(
                 _attr_label(meta, code), options=opts
             )
-        elif t == "boolean":
-            cfg[code] = st.column_config.CheckboxColumn(_attr_label(meta, code))
         elif t in {"int", "integer", "decimal", "price", "float"}:
             cfg[code] = st.column_config.NumberColumn(_attr_label(meta, code))
         else:
