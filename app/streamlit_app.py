@@ -76,9 +76,15 @@ def _attr_label(meta: dict, code: str) -> str:
 def _meta_options(meta: dict) -> list:
     options = []
     for opt in meta.get("options", []) or []:
+        if not isinstance(opt, dict):
+            continue
         label = opt.get("label")
-        if isinstance(label, str) and label.strip():
-            options.append(label.strip())
+        if not isinstance(label, str) or not label.strip():
+            label = str(opt.get("value", "")).strip()
+        else:
+            label = label.strip()
+        if label:
+            options.append(label)
     # preserve order but deduplicate while keeping first occurrence
     seen = set()
     unique = []
@@ -549,19 +555,13 @@ def _refresh_wide_meta_from_cache(
                         if not isinstance(opt, dict):
                             continue
                         label = opt.get("label")
-                        label_str = (
-                            label.strip()
-                            if isinstance(label, str)
-                            else ""
-                        )
-                        if not label_str:
+                        if not isinstance(label, str) or not label.strip():
+                            label = str(opt.get("value", "")).strip()
+                        else:
+                            label = label.strip()
+                        if not label:
                             continue
-                        cleaned_opts.append(
-                            {
-                                "label": label_str,
-                                "value": opt.get("value"),
-                            }
-                        )
+                        cleaned_opts.append({"label": label, "value": opt.get("value")})
                     merged["options"] = cleaned_opts
                 else:
                     merged[key] = value
@@ -1580,7 +1580,14 @@ if "df_original" in st.session_state:
                                             meta_cache_obj, AttributeMetaCache
                                         )
                                         if cacheable:
-                                            meta_cache_obj.load(attr_cols)
+                                            try:
+                                                meta_cache_obj.load(attr_cols)
+                                            except RuntimeError:
+                                                st.error(
+                                                    "❌ Magento returned non-JSON for attributes/options. "
+                                                    "Check REST base (/rest/V1) or ACL/WAF."
+                                                )
+                                                st.stop()
                                         wide_meta = step2_state.setdefault("wide_meta", {})
                                         if cacheable:
                                             wide_meta[set_id] = {
@@ -1593,12 +1600,19 @@ if "df_original" in st.session_state:
                                         for code in attr_cols:
                                             if code not in meta_map:
                                                 meta_map[code] = {}
-                                        _refresh_wide_meta_from_cache(
-                                            meta_cache_obj if cacheable else None,
-                                            meta_map,
-                                            attr_cols,
-                                            wide_df,
-                                        )
+                                        try:
+                                            _refresh_wide_meta_from_cache(
+                                                meta_cache_obj if cacheable else None,
+                                                meta_map,
+                                                attr_cols,
+                                                wide_df,
+                                            )
+                                        except RuntimeError:
+                                            st.error(
+                                                "❌ Magento returned non-JSON for attributes/options. "
+                                                "Check REST base (/rest/V1) or ACL/WAF."
+                                            )
+                                            st.stop()
                                         _apply_categories_fallback(meta_map)
                                         for code, meta in meta_map.items():
                                             if not isinstance(meta, dict):
@@ -1683,7 +1697,14 @@ if "df_original" in st.session_state:
                                                 meta_obj, AttributeMetaCache
                                             )
                                             if cacheable:
-                                                meta_obj.load(attr_codes)
+                                                try:
+                                                    meta_obj.load(attr_codes)
+                                                except RuntimeError:
+                                                    st.error(
+                                                        "❌ Magento returned non-JSON for attributes/options. "
+                                                        "Check REST base (/rest/V1) or ACL/WAF."
+                                                    )
+                                                    st.stop()
                                             wide_meta = step2_state.setdefault(
                                                 "wide_meta", {}
                                             )
@@ -1698,12 +1719,19 @@ if "df_original" in st.session_state:
                                             for code in attr_codes:
                                                 if code not in meta_map:
                                                     meta_map[code] = {}
-                                            _refresh_wide_meta_from_cache(
-                                                meta_obj if cacheable else None,
-                                                meta_map,
-                                                attr_codes,
-                                                wide_df,
-                                            )
+                                            try:
+                                                _refresh_wide_meta_from_cache(
+                                                    meta_obj if cacheable else None,
+                                                    meta_map,
+                                                    attr_codes,
+                                                    wide_df,
+                                                )
+                                            except RuntimeError:
+                                                st.error(
+                                                    "❌ Magento returned non-JSON for attributes/options. "
+                                                    "Check REST base (/rest/V1) or ACL/WAF."
+                                                )
+                                                st.stop()
                                             _apply_categories_fallback(meta_map)
                                             for code, meta in meta_map.items():
                                                 if not isinstance(meta, dict):
@@ -1774,49 +1802,35 @@ if "df_original" in st.session_state:
                                         _apply_categories_fallback(meta_map)
                                         df_ref = _coerce_for_ui(wide_df, meta_map)
                                         _ensure_wide_meta_options(meta_map, df_ref)
+                                        def _meta_shot(code: str) -> dict:
+                                            m = meta_map.get(code, {}) if isinstance(meta_map, dict) else {}
+                                            if not isinstance(m, dict):
+                                                m = {}
+                                            return {
+                                                "frontend_input": m.get("frontend_input"),
+                                                "options_count": len(m.get("options") or []),
+                                                "first_options": (m.get("options") or [])[:3],
+                                            }
+
+                                        st.caption(f"DEBUG set_id={set_id}")
+                                        st.write("DEBUG brand:", _meta_shot("brand"))
+                                        st.write("DEBUG condition:", _meta_shot("condition"))
+
                                         missing = [
-                                            code
-                                            for code, meta in meta_map.items()
-                                            if isinstance(meta, dict)
+                                            c
+                                            for c, m in (meta_map or {}).items()
+                                            if isinstance(m, dict)
                                             and (
-                                                str(meta.get("frontend_input") or "").lower()
+                                                str(m.get("frontend_input") or "").lower()
                                                 in {"select", "boolean"}
                                             )
-                                            and not (meta.get("options") or [])
+                                            and not (m.get("options") or [])
                                         ]
-                                        small = [
-                                            code
-                                            for code, meta in meta_map.items()
-                                            if isinstance(meta, dict)
-                                            and (
-                                                str(meta.get("frontend_input") or "").lower()
-                                                in {"select"}
-                                            )
-                                            and len(meta.get("options") or []) <= 1
-                                        ]
-                                        st.caption(
-                                            f"DEBUG set {set_id}: select/boolean with empty options: "
-                                            f"{len(missing)}; select with ≤1 option: {len(small)}"
-                                        )
-                                        if missing[:10]:
+                                        if missing:
                                             st.write(
-                                                "DEBUG missing examples:",
-                                                {
-                                                    code: (
-                                                        wide_df[code]
-                                                        .dropna()
-                                                        .astype(str)
-                                                        .unique()[:5]
-                                                        .tolist()
-                                                    )
-                                                    for code in missing[:5]
-                                                    if code in wide_df.columns
-                                                },
+                                                "DEBUG missing options for:",
+                                                missing[:10],
                                             )
-                                        st.write("DEBUG brand meta:", meta_map.get("brand"))
-                                        st.write(
-                                            "DEBUG condition meta:", meta_map.get("condition")
-                                        )
                                         colcfg = build_wide_colcfg(
                                             meta_map, sample_df=df_ref
                                         )
