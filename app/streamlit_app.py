@@ -1,6 +1,6 @@
 from __future__ import annotations
 import sys
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 from pathlib import Path
 from urllib.parse import quote
 
@@ -11,12 +11,12 @@ if str(ROOT) not in sys.path:
 import pandas as pd
 import streamlit as st
 
+from connectors.magento.attributes import AttributeMetaCache
 from services.ai_fill import (
     ALWAYS_ATTRS,
     SET_ATTRS,
     collect_attributes_table,
     compute_allowed_attrs,
-    get_attribute_meta,
     get_attribute_sets_map,
     get_product_by_sku,
     list_categories,
@@ -30,6 +30,7 @@ from services.inventory import (
     iter_products_by_attr_set,
     list_attribute_sets,
 )
+from services.normalizers import normalize_for_magento
 from utils.http import get_session
 
 
@@ -205,6 +206,36 @@ def _value_for_editor(attr_row: dict, meta: dict):
     frontend_input = (meta.get("frontend_input") or "").lower()
     raw = attr_row.get("raw_value") if attr_row else None
     label = attr_row.get("label") if attr_row else None
+    value_to_label = meta.get("values_to_labels") or {}
+
+    def _lookup(value):
+        if value is None:
+            return None
+        candidates = []
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            candidates.append(stripped)
+            candidates.append(stripped.lower())
+            try:
+                candidates.append(int(stripped))
+            except (TypeError, ValueError):
+                pass
+        else:
+            candidates.append(value)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                candidates.append(int(value))
+                candidates.append(str(int(value)))
+        for candidate in candidates:
+            if candidate in value_to_label:
+                mapped = value_to_label[candidate]
+                if isinstance(mapped, str):
+                    return mapped
+                return str(mapped)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return None
 
     if frontend_input == "boolean":
         if isinstance(raw, bool):
@@ -216,7 +247,7 @@ def _value_for_editor(attr_row: dict, meta: dict):
 
     if frontend_input == "multiselect":
         selected = []
-        values = []
+        values: list[str] = []
         if isinstance(raw, (list, tuple, set)):
             values = [str(item) for item in raw]
         elif raw not in (None, ""):
@@ -224,29 +255,19 @@ def _value_for_editor(attr_row: dict, meta: dict):
         elif label:
             values = [item.strip() for item in str(label).split(",")]
 
-        id_to_label = {}
-        for opt in meta.get("options", []) or []:
-            opt_value = opt.get("value")
-            opt_label = opt.get("label")
-            if opt_value is not None and opt_label:
-                id_to_label[str(opt_value)] = str(opt_label)
-
         for value in values:
             if not value:
                 continue
-            selected.append(id_to_label.get(str(value), str(value)))
+            mapped = _lookup(value)
+            if mapped is None:
+                mapped = str(value)
+            selected.append(mapped)
         return selected
 
     if frontend_input == "select":
-        id_to_label = {}
-        for opt in meta.get("options", []) or []:
-            opt_value = opt.get("value")
-            opt_label = opt.get("label")
-            if opt_value is not None and opt_label:
-                id_to_label[str(opt_value)] = str(opt_label)
-
-        if raw not in (None, "") and str(raw) in id_to_label:
-            return id_to_label[str(raw)]
+        mapped = _lookup(raw)
+        if mapped:
+            return mapped
         if label:
             return str(label)
         if raw not in (None, ""):
@@ -256,6 +277,8 @@ def _value_for_editor(attr_row: dict, meta: dict):
     value = label if label not in (None, "") else raw
     if value is None:
         return ""
+    if isinstance(value, str):
+        return value
     return str(value)
 
 
@@ -352,33 +375,6 @@ def _reset_step2_state():
         st.session_state.pop(key, None)
 
 
-def _collect_options_map(column_meta: dict[str, dict]) -> dict[str, dict[str, object]]:
-    options_map: dict[str, dict[str, object]] = {}
-    for column, meta in column_meta.items():
-        opts = meta.get("options") or []
-        mapping: dict[str, object] = {}
-        for opt in opts:
-            label = str(opt.get("label", "")).strip()
-            value = opt.get("value")
-            if label:
-                mapping[label] = value
-            if value is None:
-                continue
-            str_value = str(value).strip()
-            if str_value:
-                mapping[str_value] = value
-            if isinstance(value, bool):
-                mapping[int(value)] = int(value)
-            else:
-                try:
-                    mapping[int(str_value)] = value
-                except (TypeError, ValueError):
-                    continue
-        if mapping:
-            options_map[column] = mapping
-    return options_map
-
-
 def build_attributes_df(
     df_changed: pd.DataFrame,
     session,
@@ -386,11 +382,11 @@ def build_attributes_df(
     attribute_sets: dict,
     attr_sets_map: dict,
     category_options: list[dict],
+    meta_cache: AttributeMetaCache,
 ):
     core_codes = ["sku", "name", "brand", "condition"]
     rows = []
     column_meta: dict[str, dict] = {}
-    meta_cache: dict[str, dict] = {}
 
     id_to_label = {item["id"]: item["label"] for item in category_options}
     label_to_id = {item["label"]: item["id"] for item in category_options}
@@ -449,13 +445,17 @@ def build_attributes_df(
             else attr_sets_map.get(int(attr_set_id) if attr_set_id is not None else 0, ""),
         }
 
+        loadable_codes = [
+            code
+            for code in editor_codes
+            if code not in {"sku", "name", "attribute set"}
+        ]
+        meta_cache.load(loadable_codes)
+
         for code in editor_codes:
-            if code in {"sku", "name"}:
+            if code in {"sku", "name", "attribute set"}:
                 continue
-            meta = meta_cache.get(code)
-            if meta is None:
-                meta = get_attribute_meta(session, api_base, code) or {}
-                meta_cache[code] = meta
+            meta = meta_cache.get(code) or {}
             column_meta.setdefault(code, meta)
             value = _value_for_editor(attr_rows.get(code, {}), meta)
             row_data[code] = value
@@ -499,7 +499,9 @@ def build_attributes_df(
         if code not in {"brand", "condition", "sku", "name", "categories"}
     )
 
-    column_order: list[str] = ["sku", "name", "attribute set"]
+    df_table["attribute_code"] = "__row__"
+
+    column_order: list[str] = ["sku", "attribute_code", "name", "attribute set"]
     if "brand" in df_table.columns:
         column_order.append("brand")
     if "condition" in df_table.columns:
@@ -541,41 +543,75 @@ def build_attributes_df(
         )
 
     display_df = display_df.sort_values("sku").reset_index(drop=True)
+    display_df["__row_id"] = (
+        display_df["sku"].astype(str)
+        + "|"
+        + display_df["attribute_code"].astype(str)
+    )
+    display_df = display_df.set_index("__row_id", drop=False)
 
-    disabled_columns = ["sku", "name", "attribute set"]
+    disabled_columns = ["sku", "attribute_code", "name", "attribute set", "__row_id"]
 
-    options_map = _collect_options_map(column_meta_with_base)
-    attr_meta: dict[str, dict[str, object]] = {}
-    for code, meta in column_meta_with_base.items():
-        attr_meta[code] = {
-            "frontend_input": (meta.get("frontend_input") or "").lower(),
-            "backend_type": (meta.get("backend_type") or "").lower(),
-            "options_map": options_map.get(code, {}),
-        }
+    column_config.setdefault(
+        "attribute_code",
+        st.column_config.Column(
+            "Attribute Code",
+            help="Internal attribute code (read-only)",
+            disabled=True,
+        ),
+    )
+    column_config.setdefault(
+        "__row_id",
+        st.column_config.Column(
+            "Row ID",
+            help="Stable internal row identifier",
+            disabled=True,
+        ),
+    )
+
     if label_to_id:
-        categories_map: dict[object, object] = {}
+        categories_aliases: dict[object, object] = {}
+        categories_value_to_label: dict[object, str] = {}
+        valid_examples: list[str] = []
         for label, value in label_to_id.items():
-            if label:
-                categories_map[label] = value
-            if value is None:
+            if not label:
                 continue
+            clean_label = str(label).strip()
+            if not clean_label:
+                continue
+            if clean_label not in valid_examples and len(valid_examples) < 5:
+                valid_examples.append(clean_label)
+            categories_aliases[clean_label] = value
+            categories_aliases[clean_label.lower()] = value
+            categories_value_to_label[clean_label] = clean_label
+            categories_value_to_label[clean_label.lower()] = clean_label
             str_value = str(value).strip()
             if str_value:
-                categories_map[str_value] = value
-            if isinstance(value, bool):
-                categories_map[int(value)] = int(value)
-            else:
+                categories_aliases[str_value] = value
+                categories_value_to_label[str_value] = clean_label
                 try:
-                    categories_map[int(str_value)] = value
+                    int_value = int(str_value)
                 except (TypeError, ValueError):
-                    continue
-        attr_meta["categories"] = {
+                    int_value = None
+                if int_value is not None:
+                    categories_aliases[int_value] = value
+                    categories_aliases[str(int_value)] = value
+                    categories_value_to_label[int_value] = clean_label
+
+        category_meta = {
             "frontend_input": "multiselect",
             "backend_type": "text",
-            "options_map": categories_map,
+            "options_map": categories_aliases,
+            "values_to_labels": categories_value_to_label,
+            "valid_examples": valid_examples,
+            "options": [
+                {"label": item.get("label"), "value": item.get("id")}
+                for item in category_options
+            ],
         }
+        meta_cache.set_static("categories", category_meta)
 
-    return display_df, column_config, disabled_columns, attr_meta
+    return display_df, column_config, disabled_columns, meta_cache
 
 
 def get_editable_columns() -> list[str]:
@@ -585,59 +621,6 @@ def get_editable_columns() -> list[str]:
     _, disabled = _build_column_config_for_step1_like(step="step2")
     disabled_set = set(disabled or [])
     return [col for col in df.columns if col not in disabled_set]
-
-
-def normalize_for_magento(attr_code: str, val, meta: Mapping[str, Mapping[str, object]]):
-    # meta[attr_code]: {"frontend_input": "...", "options_map": {"Label": 123, "123": 123, 123: 123}, "backend_type": "..."}
-    if val is None or (isinstance(val, str) and val.strip() == ""):
-        return None
-    info = meta.get(attr_code, {})
-    ftype = info.get("frontend_input") or info.get("backend_type") or "text"
-    options = info.get("options_map") or {}
-
-    def to_int(x):
-        if x is None or (isinstance(x, str) and x.strip() == ""):
-            return None
-        if isinstance(x, bool):
-            return int(x)
-        if isinstance(x, (int, float)) and not isinstance(x, bool):
-            return int(x)
-        s = str(x).strip()
-        # маппинг лейбла→id, "123"→123
-        if s in options:
-            return int(options[s])
-        try:
-            return int(s)
-        except Exception:
-            return None
-
-    if ftype in ("select", "boolean", "int"):
-        # boolean допускаем "Yes/No", "true/false", "1/0"
-        if ftype == "boolean":
-            truthy = {"1", "true", "yes", "y", "on"}
-            falsy = {"0", "false", "no", "n", "off"}
-            if isinstance(val, str):
-                s = val.strip().lower()
-                if s in truthy:
-                    return 1
-                if s in falsy:
-                    return 0
-        out = to_int(val)
-        return out
-    if ftype == "multiselect":
-        if isinstance(val, (list, tuple, set)):
-            items = list(val)
-        else:
-            items = [p.strip() for p in str(val).split(",")]
-        ids = [
-            to_int(x)
-            for x in items
-            if isinstance(x, (str, int, float, bool)) and str(x).strip() != ""
-        ]
-        ids = [i for i in ids if i is not None]
-        return ids if ids else None
-    # текстовые и прочие — как есть (обрежем пробелы)
-    return val.strip() if isinstance(val, str) else val
 
 
 def apply_product_update(session, api_base: str, sku: str, attributes: dict):
@@ -694,7 +677,18 @@ def save_step2_to_magento():
         return
 
     diff = current_subset.loc[common_idx] != original_subset.loc[common_idx]
-    meta = st.session_state.get("step2_meta", {})
+    meta_cache = st.session_state.get("step2_meta")
+
+    def _is_blank(value) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return not value.strip()
+        if isinstance(value, (list, tuple, set)):
+            return all(_is_blank(item) for item in value)
+        if isinstance(value, float) and pd.isna(value):
+            return True
+        return False
 
     errors: list[dict[str, object]] = []
     ok_skus: list[str] = []
@@ -712,7 +706,7 @@ def save_step2_to_magento():
                 continue
             raw = df_current.at[row_id, col]
             try:
-                norm = normalize_for_magento(col, raw, meta)
+                norm = normalize_for_magento(col, raw, meta_cache)
             except Exception as e:  # pragma: no cover - safety guard
                 errors.append(
                     {
@@ -724,6 +718,30 @@ def save_step2_to_magento():
                 )
                 continue
             if norm is None:
+                if _is_blank(raw):
+                    continue
+                info = (
+                    meta_cache.get(col)
+                    if isinstance(meta_cache, AttributeMetaCache)
+                    else {}
+                )
+                valid_examples = info.get("valid_examples") or []
+                if not valid_examples:
+                    options = info.get("options") or []
+                    for opt in options:
+                        label = opt.get("label")
+                        if isinstance(label, str) and label.strip():
+                            valid_examples.append(label.strip())
+                        if len(valid_examples) >= 5:
+                            break
+                errors.append(
+                    {
+                        "sku": sku,
+                        "attribute": col,
+                        "raw": str(raw),
+                        "valid_examples": ", ".join(valid_examples[:5]),
+                    }
+                )
                 continue
             payload_by_sku.setdefault(sku, []).append(
                 {"attribute_code": col, "value": norm}
@@ -1075,6 +1093,9 @@ if "df_original" in st.session_state:
                                     ] = categories_options
 
                                 if "step2_df" not in st.session_state:
+                                    meta_cache_obj = AttributeMetaCache(
+                                        session, api_base
+                                    )
                                     (
                                         df_step2,
                                         column_config,
@@ -1087,22 +1108,8 @@ if "df_original" in st.session_state:
                                         attribute_sets,
                                         attr_sets_map,
                                         categories_options,
+                                        meta_cache_obj,
                                     )
-                                    if not df_step2.empty:
-                                        if {"sku", "attribute_code"}.issubset(
-                                            df_step2.columns
-                                        ):
-                                            df_step2["__row_id"] = (
-                                                df_step2["sku"].astype(str)
-                                                + "|"
-                                                + df_step2["attribute_code"].astype(str)
-                                            )
-                                        else:
-                                            df_step2["__row_id"] = df_step2.index.astype(str)
-                                        df_step2 = df_step2.set_index("__row_id", drop=False)
-                                        if "__row_id" not in disabled_cols:
-                                            disabled_cols = list(disabled_cols)
-                                            disabled_cols.append("__row_id")
                                     st.session_state["step2_df"] = df_step2.copy(deep=True)
                                     st.session_state["step2_original"] = df_step2.copy(
                                         deep=True
