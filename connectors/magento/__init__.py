@@ -1,3 +1,1 @@
-"""Magento-specific connector helpers."""
-
-__all__ = []
+"""Magento connector package."""
