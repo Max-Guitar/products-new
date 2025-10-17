@@ -5,7 +5,12 @@ from typing import Any, Dict, Iterable, Optional
 
 import requests
 
-from .client import magento_get
+try:
+    from connectors.magento.client import magento_get
+except ModuleNotFoundError:
+    from connectors.magento import client as _client
+
+    magento_get = _client.magento_get
 from services.country_aliases import country_aliases
 
 

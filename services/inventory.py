@@ -8,7 +8,7 @@ from urllib.parse import quote
 import pandas as pd
 import requests
 
-from connectors.magento import magento_get
+from connectors.magento.client import magento_get
 
 
 _DEF_ATTR_SET_NAME = "Default"

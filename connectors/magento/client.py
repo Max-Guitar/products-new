@@ -1,4 +1,5 @@
-"""Connector helpers for Magento REST API."""
+"""Client helpers for Magento REST API requests."""
+
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
@@ -16,6 +17,7 @@ def magento_get(
     timeout: int = 60,
 ) -> Dict[str, Any]:
     """Perform a GET request to a Magento REST endpoint."""
+
     base = base_url.rstrip("/")
     if not path.startswith("/"):
         path = "/" + path

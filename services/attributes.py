@@ -7,7 +7,7 @@ from typing import Any, Dict, List
 import pandas as pd
 import requests
 
-from connectors.magento import magento_get
+from connectors.magento.client import magento_get
 
 
 def _get_custom_attr_map(product: Dict[str, Any]) -> Dict[str, Any]:
