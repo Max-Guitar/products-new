@@ -1640,14 +1640,15 @@ if "df_original" in st.session_state:
                                 step2_state.setdefault("staged", {})
 
                                 if not step2_state["dfs"]:
-                                    meta_cache_obj = AttributeMetaCache(
+                                    meta_cache = AttributeMetaCache(
                                         session, api_base
                                     )
+                                    meta_cache_obj: AttributeMetaCache = meta_cache
                                     (
                                         dfs_by_set,
                                         column_configs,
                                         disabled_cols_map,
-                                        meta_cache_obj,
+                                        meta_cache,
                                         row_meta_map,
                                         set_names,
                                     ) = build_attributes_df(
@@ -1657,7 +1658,7 @@ if "df_original" in st.session_state:
                                         attribute_sets,
                                         attr_sets_map,
                                         categories_options,
-                                        meta_cache_obj,
+                                        meta_cache,
                                     )
 
                                     for set_id, df_set in dfs_by_set.items():
@@ -1705,7 +1706,7 @@ if "df_original" in st.session_state:
                                             if col not in ("sku", "name")
                                         ]
                                         cacheable = isinstance(
-                                            meta_cache_obj, AttributeMetaCache
+                                            meta_cache, AttributeMetaCache
                                         )
                                         if DEBUG:
                                             st.write(
@@ -1714,7 +1715,7 @@ if "df_original" in st.session_state:
                                             )
                                         resolved_map: dict[str, str] = {}
                                         if cacheable:
-                                            resolved_map = meta_cache_obj.resolve_codes_in_set(
+                                            resolved_map = meta_cache.resolve_codes_in_set(
                                                 set_id, ["brand", "condition"]
                                             )
                                             effective_codes: list[str] = []
@@ -1727,11 +1728,11 @@ if "df_original" in st.session_state:
                                                     seen_effective.add(effective)
                                                     effective_codes.append(effective)
                                             if effective_codes:
-                                                meta_cache_obj.build_and_set_static_for(
+                                                meta_cache.build_and_set_static_for(
                                                     effective_codes, store_id=0
                                                 )
                                             dbg_source = getattr(
-                                                meta_cache_obj, "_debug_http", {}
+                                                meta_cache, "_debug_http", {}
                                             )
                                             dbg_snapshot = (
                                                 dbg_source.copy()
@@ -1750,7 +1751,7 @@ if "df_original" in st.session_state:
                                         if cacheable:
                                             for code in attr_cols:
                                                 actual_code = resolved_map.get(code, code)
-                                                cached = meta_cache_obj.get(actual_code) or {}
+                                                cached = meta_cache.get(actual_code) or {}
                                                 if not isinstance(cached, dict):
                                                     cached = {}
                                                 meta_map[code] = cached
@@ -1797,7 +1798,7 @@ if "df_original" in st.session_state:
                                             meta_for_debug,
                                             sample_df=step2_state["wide"].get(set_id),
                                         )
-                                    step2_state["meta_cache"] = meta_cache_obj
+                                    step2_state["meta_cache"] = meta_cache
 
                                     for set_id, df0 in step2_state["dfs"].items():
                                         if "value" in df0.columns:
@@ -1981,9 +1982,9 @@ if "df_original" in st.session_state:
                                                 }
                                             )
                                             if isinstance(
-                                                meta_cache_obj, AttributeMetaCache
+                                                meta_obj, AttributeMetaCache
                                             ):
-                                                meta_cache_obj.set_static(
+                                                meta_obj.set_static(
                                                     "categories",
                                                     {
                                                         "attribute_code": "categories",
