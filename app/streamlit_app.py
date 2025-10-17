@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import math
 import sys
 from pathlib import Path
 
@@ -551,6 +553,113 @@ def _coerce_for_ui(df: pd.DataFrame, meta_map: dict[str, dict]) -> pd.DataFrame:
         else:
             out[code] = out[code].astype(object)
     return out
+
+
+def _ensure_list_of_strings(value: object) -> list[str]:
+    if isinstance(value, (list, tuple, set)):
+        values = list(value)
+    elif value in (None, ""):
+        values = []
+    else:
+        values = [value]
+
+    normalized: list[str] = []
+    for item in values:
+        if item in (None, ""):
+            continue
+        if isinstance(item, float) and math.isnan(item):
+            continue
+        normalized.append(str(item))
+    return normalized
+
+
+def _ensure_config_options(
+    column: str, cfg_obj, options: list[str]
+):  # pragma: no cover - UI helper
+    if not options:
+        return cfg_obj
+    if hasattr(cfg_obj, "_config") and isinstance(cfg_obj._config, dict):
+        cfg_obj._config["options"] = options
+        return cfg_obj
+    try:
+        cfg_obj.options = options
+        return cfg_obj
+    except Exception:
+        label = (
+            getattr(cfg_obj, "label", None)
+            or getattr(cfg_obj, "_label", None)
+            or column
+        )
+        if isinstance(cfg_obj, st.column_config.SelectboxColumn):
+            return st.column_config.SelectboxColumn(label, options=options)
+        if isinstance(cfg_obj, st.column_config.MultiselectColumn):
+            return st.column_config.MultiselectColumn(label, options=options)
+    return cfg_obj
+
+
+def _coerce_column_for_config(
+    df: pd.DataFrame, column: str, cfg_obj
+) -> tuple[pd.DataFrame, object]:  # pragma: no cover - UI helper
+    if isinstance(cfg_obj, st.column_config.CheckboxColumn):
+        df[column] = df[column].fillna(False).astype(bool)
+        return df, cfg_obj
+    if isinstance(cfg_obj, st.column_config.SelectboxColumn):
+        df[column] = df[column].astype("string")
+        options = getattr(cfg_obj, "options", None) or []
+        str_options = [str(opt) for opt in options]
+        return df, _ensure_config_options(column, cfg_obj, str_options)
+    if isinstance(cfg_obj, st.column_config.MultiselectColumn):
+        df[column] = df[column].apply(_ensure_list_of_strings)
+        options = getattr(cfg_obj, "options", None) or []
+        str_options = [str(opt) for opt in options]
+        return df, _ensure_config_options(column, cfg_obj, str_options)
+    return df, cfg_obj
+
+
+def _probe_editor_groups(
+    df: pd.DataFrame,
+    columns: list[str],
+    column_config: dict[str, object],
+    disabled: list[str],
+    key_prefix: str,
+):  # pragma: no cover - UI helper
+    def _try(columns_chunk: list[str], suffix: str) -> bool:
+        sub_df = df[columns_chunk]
+        sub_cfg = {
+            col: column_config[col]
+            for col in columns_chunk
+            if col in column_config
+        }
+        sub_disabled = [col for col in disabled if col in columns_chunk]
+        try:
+            st.data_editor(
+                sub_df,
+                column_config=sub_cfg,
+                disabled=sub_disabled,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed",
+                key=f"{key_prefix}::{suffix}",
+            )
+        except Exception as exc:
+            st.warning(
+                f"Editor failed for columns {columns_chunk}: {exc}")
+            return False
+        return True
+
+    def _split(columns_chunk: list[str], suffix: str) -> set[str]:
+        if not columns_chunk:
+            return set()
+        if _try(columns_chunk, suffix):
+            return set()
+        if len(columns_chunk) == 1:
+            return {columns_chunk[0]}
+        mid = len(columns_chunk) // 2
+        left = _split(columns_chunk[:mid], suffix + "L")
+        right = _split(columns_chunk[mid:], suffix + "R")
+        return left | right
+
+    return _split(columns, "root")
 
 
 def _apply_categories_fallback(meta_map: dict[str, dict]) -> None:
@@ -1837,11 +1946,126 @@ if "df_original" in st.session_state:
                                             "sku",
                                             "name",
                                         ] + attr_cols
+
+                                        working_cfg = (
+                                            step2_state["wide_colcfg"].get(set_id, {})
+                                            if isinstance(
+                                                step2_state.get("wide_colcfg"), dict
+                                            )
+                                            else {}
+                                        )
+                                        if not isinstance(working_cfg, dict):
+                                            working_cfg = {}
+                                        working_cfg = {
+                                            key: value
+                                            for key, value in working_cfg.items()
+                                            if key in df_ref.columns
+                                        }
+                                        aligned_df = df_ref[
+                                            [col for col in df_ref.columns if col in working_cfg]
+                                        ].copy()
+
+                                        missing_cfg_cols = set(aligned_df.columns) - set(
+                                            working_cfg.keys()
+                                        )
+                                        if missing_cfg_cols:
+                                            aligned_df = aligned_df.drop(
+                                                columns=sorted(missing_cfg_cols)
+                                            )
+                                        column_order = [
+                                            col
+                                            for col in column_order
+                                            if col in aligned_df.columns
+                                        ]
+
+                                        disabled_cols = [
+                                            col
+                                            for col in ["sku", "name"]
+                                            if col in aligned_df.columns
+                                        ]
+
+                                        for col in column_order:
+                                            if col not in aligned_df.columns:
+                                                continue
+                                            cfg_obj = working_cfg.get(col)
+                                            dtype = str(aligned_df[col].dtype)
+                                            preview = aligned_df[col].head(3).tolist()
+                                            cfg_class = (
+                                                type(cfg_obj).__name__
+                                                if cfg_obj is not None
+                                                else "None"
+                                            )
+                                            st.write(
+                                                f"PROBE column={col} dtype={dtype} cfg={cfg_class}",
+                                                preview,
+                                            )
+                                            if cfg_obj is None:
+                                                continue
+                                            probe_key = (
+                                                f"probe_{set_id}_{hashlib.md5(col.encode()).hexdigest()}"
+                                            )
+                                            try:
+                                                st.data_editor(
+                                                    aligned_df[[col]],
+                                                    column_config={col: cfg_obj},
+                                                    key=probe_key,
+                                                    use_container_width=True,
+                                                    hide_index=True,
+                                                    num_rows="fixed",
+                                                )
+                                            except Exception as exc:
+                                                st.warning(
+                                                    f"Column '{col}' probe failed: {exc}"
+                                                )
+                                                aligned_df, fixed_cfg = _coerce_column_for_config(
+                                                    aligned_df, col, cfg_obj
+                                                )
+                                                working_cfg[col] = fixed_cfg
+                                                retry_key = probe_key + "_retry"
+                                                try:
+                                                    st.data_editor(
+                                                        aligned_df[[col]],
+                                                        column_config={col: working_cfg[col]},
+                                                        key=retry_key,
+                                                        use_container_width=True,
+                                                        hide_index=True,
+                                                        num_rows="fixed",
+                                                    )
+                                                except Exception as retry_exc:
+                                                    st.warning(
+                                                        f"Column '{col}' retry failed: {retry_exc}"
+                                                    )
+
+                                        problem_columns = _probe_editor_groups(
+                                            aligned_df,
+                                            column_order,
+                                            working_cfg,
+                                            disabled_cols,
+                                            f"probe_group_{set_id}",
+                                        )
+
+                                        for bad_col in sorted(problem_columns):
+                                            cfg_obj = working_cfg.get(bad_col)
+                                            label = (
+                                                getattr(cfg_obj, "label", None)
+                                                or getattr(cfg_obj, "_label", None)
+                                                or bad_col
+                                            )
+                                            working_cfg[bad_col] = st.column_config.TextColumn(
+                                                label
+                                            )
+                                            if bad_col in aligned_df.columns:
+                                                aligned_df[bad_col] = aligned_df[
+                                                    bad_col
+                                                ].astype("string")
+
+                                        step2_state["wide_colcfg"][set_id] = working_cfg
+
                                         edited_df = st.data_editor(
-                                            df_ref,
+                                            aligned_df,
                                             key=f"step2_wide::{set_id}",
-                                            column_config=colcfg,
-                                            disabled=["sku", "name"],
+                                            column_config=working_cfg,
+                                            disabled=disabled_cols,
                                             use_container_width=True,
                                             hide_index=True,
                                             num_rows="fixed",
