@@ -682,20 +682,19 @@ def build_wide_colcfg(
                 is_list_series = series.apply(
                     lambda v: isinstance(v, (list, tuple, set)) or v in (None, "")
                 ).all()
-            if is_list_series and len(opts) > 1:
+            if is_list_series:
                 cfg[code] = st.column_config.MultiselectColumn(
                     _attr_label(meta, code), options=opts
                 )
             else:
                 cfg[code] = st.column_config.TextColumn(_attr_label(meta, code))
         elif bool_like:
-            if len(opts) > 1:
-                cfg[code] = st.column_config.CheckboxColumn(
-                    _attr_label(meta, code)
-                )
-            else:
-                cfg[code] = st.column_config.TextColumn(_attr_label(meta, code))
-        elif select_like and len(opts) > 1:
+            # чекбоксу не нужен список опций
+            cfg[code] = st.column_config.CheckboxColumn(
+                _attr_label(meta, code)
+            )
+        elif select_like and len(opts) >= 1:
+            # даже 1 значение — всё равно рисуем выпадающий список
             cfg[code] = st.column_config.SelectboxColumn(
                 _attr_label(meta, code), options=opts
             )
