@@ -12,11 +12,13 @@ if str(ROOT) not in sys.path:
 from collections import defaultdict
 from collections.abc import Iterable
 from urllib.parse import quote
+import re
 
 import pandas as pd
 import streamlit as st
 
 from connectors.magento.attributes import AttributeMetaCache
+from connectors.magento.categories import ensure_categories_meta
 from connectors.magento.client import get_default_products
 from services.ai_fill import (
     ALWAYS_ATTRS,
@@ -26,7 +28,6 @@ from services.ai_fill import (
     compute_allowed_attrs,
     get_attribute_sets_map,
     get_product_by_sku,
-    list_categories,
     probe_api_base,
 )
 from services.inventory import (
@@ -55,6 +56,9 @@ _ATTRIBUTE_SET_ICONS = {
     "Electric guitar": "🎸",
 }
 _DEFAULT_ATTRIBUTE_ICON = "🧩"
+
+
+ID_RX = re.compile(r"#(\d+)\)?$")
 
 
 DEBUG = False
@@ -113,49 +117,6 @@ def _format_attr_set_title(name: str) -> str:
     return f"{icon} {clean_name}"
 
 
-def _format_category_label(name: str, cat_id: str) -> str:
-    base = name.strip() if isinstance(name, str) and name.strip() else ""
-    if not base:
-        return f"#{cat_id}"
-    return f"{base} (#{cat_id})"
-
-
-def _prepare_category_options(raw_categories: list[dict]) -> list[dict]:
-    prepared = []
-    seen_labels = set()
-    for item in raw_categories:
-        cat_id = str(item.get("id", "")).strip()
-        if not cat_id:
-            continue
-        name = str(item.get("name", "")).strip()
-        label = _format_category_label(name, cat_id)
-        if label in seen_labels:
-            label = f"{label}#{cat_id}"
-        seen_labels.add(label)
-        prepared.append({"id": cat_id, "name": name or label, "label": label})
-    prepared.sort(key=lambda x: (x["name"].lower(), x["id"]))
-    return prepared
-
-
-def _categories_ids_to_labels(values, id_to_label: dict[str, str]) -> list[str]:
-    if isinstance(values, (list, tuple, set)):
-        raw_values = list(values)
-    elif values in (None, ""):
-        raw_values = []
-    else:
-        raw_values = [values]
-
-    labels = []
-    for value in raw_values:
-        cat_id = str(value).strip()
-        if not cat_id:
-            continue
-        label = id_to_label.get(cat_id, _format_category_label("", cat_id))
-        if label not in labels:
-            labels.append(label)
-    return labels
-
-
 def _split_multiselect_input(values) -> list[str]:
     if isinstance(values, (list, tuple, set)):
         iterable = [str(item).strip() for item in values]
@@ -178,23 +139,108 @@ def _format_multiselect_display_value(values) -> str:
     return ", ".join(parts)
 
 
-def _categories_labels_to_ids(values, label_to_id: dict[str, str]) -> list[str]:
-    raw_values = _split_multiselect_input(values)
+def _parse_category_token(token: object) -> int | None:
+    if token is None:
+        return None
+    if isinstance(token, bool):
+        return None
+    if isinstance(token, int):
+        return token
+    if isinstance(token, float):
+        if math.isnan(token):
+            return None
+        try:
+            return int(token)
+        except (TypeError, ValueError):
+            return None
+    text = str(token).strip()
+    if not text:
+        return None
+    match = ID_RX.search(text)
+    if match:
+        try:
+            return int(match.group(1))
+        except (TypeError, ValueError):
+            return None
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return None
 
-    ids = []
-    for value in raw_values:
-        label = str(value).strip()
-        if not label:
+
+def _cat_to_ids(value: object) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        result: list[int] = []
+        for item in value:
+            cid = _parse_category_token(item)
+            if cid is not None and cid not in result:
+                result.append(cid)
+        return result
+    cid = _parse_category_token(value)
+    return [cid] if cid is not None else []
+
+
+def _ids_to_labels(ids: list[int], values_to_labels: dict[str, str]) -> list[str]:
+    labels: list[str] = []
+    for cid in ids or []:
+        key = str(cid)
+        label = values_to_labels.get(key)
+        if label and label not in labels:
+            labels.append(label)
+    return labels
+
+
+def _labels_to_ids(labels: list[str], options_map: dict[str, int]) -> list[int]:
+    if not labels:
+        return []
+    ids: list[int] = []
+    for label in labels:
+        if label is None:
             continue
-        if label in label_to_id:
-            cat_id = label_to_id[label]
-        elif label.startswith("#"):
-            cat_id = label.lstrip("#")
+        text = str(label).strip()
+        if not text:
+            continue
+        if text in options_map:
+            cid = options_map[text]
         else:
-            cat_id = label
-        if cat_id not in ids:
-            ids.append(cat_id)
+            lower = text.casefold()
+            cid = options_map.get(lower)
+            if cid is None:
+                try:
+                    cid = int(text)
+                except (TypeError, ValueError):
+                    continue
+        if isinstance(cid, float) and math.isnan(cid):
+            continue
+        try:
+            cid_int = int(cid)
+        except (TypeError, ValueError):
+            continue
+        if cid_int not in ids:
+            ids.append(cid_int)
     return ids
+
+
+def _categories_value_to_ids(value: object, options_map: dict[str, int]) -> list[int]:
+    ids = _cat_to_ids(value)
+    if ids:
+        return ids
+    labels: list[str] = []
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            if item is None:
+                continue
+            text = str(item).strip()
+            if text:
+                labels.append(text)
+    else:
+        labels = _split_multiselect_input(value)
+    labels = [label for label in labels if label]
+    if not labels:
+        return []
+    return _labels_to_ids(labels, options_map)
 
 
 def _convert_df_for_storage(
@@ -212,8 +258,19 @@ def _convert_df_for_storage(
             storage[column] = storage[column].apply(_split_multiselect_input)
 
     if "categories" in storage.columns:
+        options_map: dict[str, int] = {}
+        for key, value in (label_to_id or {}).items():
+            try:
+                options_map[key] = int(value)
+                options_map[key.casefold()] = int(value)
+            except (AttributeError, TypeError, ValueError):
+                continue
+
         storage["categories"] = storage["categories"].apply(
-            lambda values: _categories_labels_to_ids(values, label_to_id)
+            lambda labels: _labels_to_ids(
+                list(labels) if isinstance(labels, (list, tuple, set)) else _split_multiselect_input(labels),
+                options_map,
+            )
         )
     return storage
 
@@ -530,27 +587,6 @@ def _refresh_wide_meta_from_cache(
     if target_codes:
         meta_cache.build_and_set_static_for(target_codes, store_id=0)
 
-    df_ref = wide_df if isinstance(wide_df, pd.DataFrame) else None
-    cats_series = df_ref.get("categories") if isinstance(df_ref, pd.DataFrame) else None
-    all_labels = sorted(
-        {
-            str(x)
-            for row in (cats_series if cats_series is not None else [])
-            for x in (row or [])
-            if isinstance(x, (str, int))
-        }
-    )
-    meta_cache.set_static(
-        "categories",
-        {
-            "attribute_code": "categories",
-            "frontend_input": "multiselect",
-            "options": [{"label": l, "value": l} for l in all_labels],
-            "options_map": {l: l for l in all_labels},
-            "values_to_labels": {l: l for l in all_labels},
-        },
-    )
-
     for code in unique_codes:
         cached_meta = meta_cache.get(code)
         if isinstance(cached_meta, dict):
@@ -570,11 +606,32 @@ def _coerce_for_ui(df: pd.DataFrame, meta_map: dict[str, dict]) -> pd.DataFrame:
                 else False
             )
         elif t == "multiselect":
-            out[code] = out[code].apply(
-                lambda v: v
-                if isinstance(v, (list, tuple, set))
-                else ([] if v in (None, "") else [str(v).strip()])
-            )
+            if code == "categories":
+                values_to_labels = meta.get("values_to_labels") or {}
+                raw_map = meta.get("options_map") or {}
+                options_map: dict[str, int] = {}
+                if isinstance(raw_map, dict):
+                    for key, value in raw_map.items():
+                        if not isinstance(key, str):
+                            continue
+                        options_map[key] = value
+                        options_map[key.casefold()] = value
+                        try:
+                            options_map[str(int(value))] = int(value)
+                        except (TypeError, ValueError):
+                            continue
+                out[code] = out[code].apply(
+                    lambda v: _ids_to_labels(
+                        _categories_value_to_ids(v, options_map),
+                        values_to_labels,
+                    )
+                )
+            else:
+                out[code] = out[code].apply(
+                    lambda v: v
+                    if isinstance(v, (list, tuple, set))
+                    else ([] if v in (None, "") else [str(v).strip()])
+                )
         else:
             out[code] = out[code].astype(object)
     return out
@@ -746,7 +803,6 @@ def build_attributes_df(
     api_base: str,
     attribute_sets: dict,
     attr_sets_map: dict,
-    category_options: list[dict],
     meta_cache: AttributeMetaCache,
 ):
     core_codes = ["brand", "condition"]
@@ -754,54 +810,26 @@ def build_attributes_df(
     row_meta_by_set: dict[int, dict[str, dict]] = defaultdict(dict)
     set_names: dict[int, str] = {}
 
-    id_to_label = {str(item.get("id")): item.get("label") for item in category_options}
-    label_to_id = {item.get("label"): item.get("id") for item in category_options}
-
-    if label_to_id:
-        categories_aliases: dict[object, object] = {}
-        categories_value_to_label: dict[object, str] = {}
-        valid_examples: list[str] = []
-        for label, value in label_to_id.items():
-            if not label:
-                continue
-            clean_label = str(label).strip()
-            if not clean_label:
-                continue
-            if clean_label not in valid_examples and len(valid_examples) < 5:
-                valid_examples.append(clean_label)
-            categories_aliases[clean_label] = value
-            categories_aliases[clean_label.lower()] = value
-            categories_value_to_label[clean_label] = clean_label
-            categories_value_to_label[clean_label.lower()] = clean_label
-            str_value = str(value).strip()
-            if str_value:
-                categories_aliases[str_value] = value
-                categories_value_to_label[str_value] = clean_label
-                try:
-                    int_value = int(str_value)
-                except (TypeError, ValueError):
-                    int_value = None
-                if int_value is not None:
-                    categories_aliases[int_value] = value
-                    categories_aliases[str(int_value)] = value
-                    categories_value_to_label[int_value] = clean_label
-
-        category_meta = {
-            "frontend_input": "multiselect",
-            "backend_type": "text",
-            "options_map": categories_aliases,
-            "values_to_labels": categories_value_to_label,
-            "valid_examples": valid_examples,
-            "options": [
-                {
-                    "label": item.get("label"),
-                    "value": item.get("id"),
-                }
-                for item in category_options
-            ],
-        }
-        if isinstance(meta_cache, AttributeMetaCache):
-            meta_cache.set_static("categories", category_meta)
+    cats_meta = meta_cache.get("categories") if isinstance(meta_cache, AttributeMetaCache) else {}
+    if not isinstance(cats_meta, dict):
+        cats_meta = {}
+    cat_values_to_labels: dict[str, str] = cats_meta.get("values_to_labels") or {}
+    raw_options_map: dict[str, int] = cats_meta.get("options_map") or {}
+    cat_options_map: dict[str, int] = {}
+    for key, value in raw_options_map.items():
+        if not isinstance(key, str):
+            continue
+        cat_options_map[key] = value
+        cat_options_map[key.casefold()] = value
+        try:
+            cat_options_map[str(int(value))] = int(value)
+        except (TypeError, ValueError):
+            continue
+    cat_labels = [
+        opt.get("label")
+        for opt in (cats_meta.get("options") or [])
+        if isinstance(opt, dict) and opt.get("label")
+    ]
 
     for _, row in df_changed.iterrows():
         sku_value = str(row.get("sku", "")).strip()
@@ -924,17 +952,16 @@ def build_attributes_df(
             for link in category_links
             if str(link.get("category_id", "")).strip()
         ]
-        category_labels = _categories_ids_to_labels(categories, id_to_label)
+        categories_ids = _cat_to_ids(categories)
+        if not categories_ids and categories:
+            categories_ids = _labels_to_ids(categories, cat_options_map)
+        category_labels = _ids_to_labels(categories_ids, cat_values_to_labels)
         row_id = f"{sku_value}|categories"
         row_meta_by_set[attr_set_id_int][row_id] = {
             "attribute_code": "categories",
             "frontend_input": "multiselect",
             "backend_type": "text",
-            "options": [
-                item.get("label")
-                for item in category_options
-                if isinstance(item.get("label"), str) and item.get("label").strip()
-            ],
+            "options": cat_labels,
             "valid_examples": category_labels[:5],
         }
         rows_by_set[attr_set_id_int].append(
@@ -1604,39 +1631,6 @@ if "df_original" in st.session_state:
                             if setup_failed or not api_base or not attr_sets_map:
                                 st.session_state["show_attributes_trigger"] = False
                             else:
-                                categories_options = st.session_state.get(
-                                    "step2_category_options"
-                                )
-                                categories_failed = st.session_state.get(
-                                    "step2_categories_failed", False
-                                )
-                                if not categories_options:
-                                    try:
-                                        with st.spinner("📂 Загрузка категорий…"):
-                                            raw_categories = list_categories(
-                                                session, api_base
-                                            )
-                                        categories_options = _prepare_category_options(
-                                            raw_categories
-                                        )
-                                        categories_failed = False
-                                    except Exception as exc:  # pragma: no cover - UI interaction
-                                        st.warning(
-                                            f"Не удалось загрузить категории: {exc}"
-                                        )
-                                        categories_options = []
-                                        categories_failed = True
-                                    st.session_state[
-                                        "step2_category_options"
-                                    ] = categories_options
-                                    st.session_state[
-                                        "step2_categories_failed"
-                                    ] = categories_failed
-                                else:
-                                    st.session_state[
-                                        "step2_categories_failed"
-                                    ] = categories_failed
-
                                 step2_state = _ensure_step2_state()
                                 step2_state.setdefault("staged", {})
 
@@ -1648,6 +1642,41 @@ if "df_original" in st.session_state:
                                     # Первый запуск — создаём и сохраняем
                                     meta_cache = AttributeMetaCache(session, api_base)
                                     step2_state["meta_cache"] = meta_cache
+
+                                categories_meta = step2_state.get("categories_meta")
+                                if not isinstance(categories_meta, dict) or not categories_meta.get(
+                                    "options"
+                                ):
+                                    try:
+                                        with st.spinner("📂 Загрузка категорий…"):
+                                            categories_meta = ensure_categories_meta(
+                                                meta_cache,
+                                                session,
+                                                api_base,
+                                                store_id=0,
+                                            )
+                                        if not isinstance(categories_meta, dict):
+                                            categories_meta = (
+                                                meta_cache.get("categories")
+                                                if isinstance(
+                                                    meta_cache, AttributeMetaCache
+                                                )
+                                                else {}
+                                            )
+                                        st.session_state["step2_categories_failed"] = False
+                                    except Exception as exc:  # pragma: no cover - UI interaction
+                                        st.warning(
+                                            f"Не удалось загрузить категории: {exc}"
+                                        )
+                                        categories_meta = (
+                                            meta_cache.get("categories")
+                                            if isinstance(meta_cache, AttributeMetaCache)
+                                            else {}
+                                        )
+                                        st.session_state["step2_categories_failed"] = True
+                                    step2_state["categories_meta"] = categories_meta
+                                else:
+                                    st.session_state["step2_categories_failed"] = False
 
                                 if not step2_state["dfs"]:
                                     (
@@ -1663,7 +1692,6 @@ if "df_original" in st.session_state:
                                         api_base,
                                         attribute_sets,
                                         attr_sets_map,
-                                        categories_options,
                                         meta_cache,
                                     )
 
@@ -1944,6 +1972,14 @@ if "df_original" in st.session_state:
                                     st.warning("Нет атрибутов для отображения.")
                                 elif st.session_state.get("show_attrs"):
                                     wide_meta = step2_state.setdefault("wide_meta", {})
+                                    categories_meta = step2_state.get("categories_meta", {})
+                                    if not isinstance(categories_meta, dict):
+                                        categories_meta = {}
+                                    labels_all = [
+                                        opt.get("label")
+                                        for opt in (categories_meta.get("options") or [])
+                                        if isinstance(opt, dict) and opt.get("label")
+                                    ]
                                     for set_id in sorted(step2_state["wide"].keys()):
                                         wide_df = step2_state["wide"].get(set_id)
                                         if not isinstance(wide_df, pd.DataFrame):
@@ -1965,47 +2001,15 @@ if "df_original" in st.session_state:
                                         df_ref = _coerce_for_ui(wide_df, meta_map)
                                         _ensure_wide_meta_options(meta_map, df_ref)
 
-                                        all_labels: list[str] = []
                                         if (
                                             isinstance(df_ref, pd.DataFrame)
                                             and "categories" in df_ref.columns
                                         ):
                                             df_ref["categories"] = df_ref["categories"].apply(
-                                                _to_list_str
+                                                lambda v: list(v)
+                                                if isinstance(v, (list, tuple, set))
+                                                else ([] if v in (None, "") else [str(v).strip()])
                                             )
-                                            cats_series = df_ref.get("categories")
-                                            all_labels = sorted(
-                                                {
-                                                    str(x)
-                                                    for row in (
-                                                        cats_series
-                                                        if cats_series is not None
-                                                        else []
-                                                    )
-                                                    for x in (row or [])
-                                                    if isinstance(x, (str, int))
-                                                }
-                                            )
-                                            if isinstance(
-                                                meta_cache, AttributeMetaCache
-                                            ):
-                                                meta_cache.set_static(
-                                                    "categories",
-                                                    {
-                                                        "attribute_code": "categories",
-                                                        "frontend_input": "multiselect",
-                                                        "options": [
-                                                            {"label": l, "value": l}
-                                                            for l in all_labels
-                                                        ],
-                                                        "options_map": {
-                                                            l: l for l in all_labels
-                                                        },
-                                                        "values_to_labels": {
-                                                            l: l for l in all_labels
-                                                        },
-                                                    },
-                                                )
 
                                         string_cols = [
                                             col
@@ -2048,7 +2052,7 @@ if "df_original" in st.session_state:
                                             )
                                             column_config["categories"] = (
                                                 st.column_config.MultiselectColumn(
-                                                    label, options=all_labels
+                                                    label, options=labels_all
                                                 )
                                             )
                                         step2_state["wide_colcfg"][set_id] = column_config
