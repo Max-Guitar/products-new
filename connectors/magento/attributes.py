@@ -55,6 +55,8 @@ class AttributeMetaCache:
                     self._base_url,
                     f"/products/attributes/{lookup_code}",
                 )
+            except RuntimeError:
+                raise
             except Exception:  # pragma: no cover - network failure safety
                 meta = {}
             prepared = self._prepare_meta(code, meta or {})
@@ -81,32 +83,47 @@ class AttributeMetaCache:
             try:
                 data = magento_get(self._session, self._base_url, path) or []
                 if isinstance(data, list):
-                    return [
-                        opt
-                        for opt in data
-                        if str(opt.get("label", "")).strip()
-                    ]
+                    return data
+            except RuntimeError:
+                raise
             except Exception:
                 continue
         return []
 
     def _prepare_meta(self, code: str, meta: Dict[str, Any]) -> Dict[str, Any]:
         code_eff = self._aliases.get(code, code)
-        options_raw = meta.get("options") or self._fetch_options(code_eff)
+        options_raw = meta.get("options")
+        if not options_raw:
+            options_raw = self._fetch_options(code_eff)
+
+        prepared: Dict[str, Any] = {
+            "attribute_code": code,
+            "frontend_input": (meta.get("frontend_input") or "text").lower(),
+            "options": [],
+            "options_map": {},
+            "values_to_labels": {},
+            "valid_examples": [],
+        }
 
         cleaned_options: list[Dict[str, Any]] = []
-        options_map: Dict[Any, Any] = {}
         values_to_labels: Dict[Any, str] = {}
+        options_map: Dict[Any, Any] = {}
         valid_examples: list[str] = []
 
         for opt in options_raw or []:
             if not isinstance(opt, dict):
                 continue
-            label = str(opt.get("label", ""))
-            label_clean = label.strip()
             value = opt.get("value")
-            if not label_clean or value in (None, ""):
+            if value in (None, ""):
                 continue
+
+            raw_label = opt.get("label", "")
+            label_clean = str(raw_label).strip()
+            if not label_clean:
+                label_clean = str(value).strip()
+            if not label_clean:
+                continue
+
             cleaned_options.append({"label": label_clean, "value": value})
 
             str_value = str(value).strip()
@@ -119,6 +136,7 @@ class AttributeMetaCache:
                 int_value = None
 
             target = int_value if int_value is not None else str_value
+
             values_to_labels[str_value] = label_clean
             if int_value is not None:
                 values_to_labels[int_value] = label_clean
@@ -141,14 +159,10 @@ class AttributeMetaCache:
                     self._add_alias(options_map, alias, target)
                     self._add_alias(options_map, alias.upper(), target)
 
-        prepared: Dict[str, Any] = {
-            "attribute_code": code,
-            "frontend_input": (meta.get("frontend_input") or "text").lower(),
-            "options": cleaned_options,
-            "options_map": options_map,
-            "values_to_labels": values_to_labels,
-            "valid_examples": valid_examples,
-        }
+        prepared["options"] = cleaned_options
+        prepared["values_to_labels"] = values_to_labels
+        prepared["options_map"] = options_map
+        prepared["valid_examples"] = valid_examples
 
         backend_type = meta.get("backend_type")
         if backend_type:

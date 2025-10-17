@@ -22,6 +22,7 @@ def magento_get(
     base_url: str,
     path: str,
     headers: Optional[Dict[str, str]] = None,
+    timeout: int = 30,
 ) -> Any:
     """Perform a GET request to a Magento REST endpoint with auth headers."""
 
@@ -39,6 +40,12 @@ def magento_get(
     if headers:
         auth_headers.update(headers)
 
-    response = session.get(url, headers=auth_headers, timeout=30)
+    response = session.get(url, headers=auth_headers, timeout=timeout)
     response.raise_for_status()
+
+    content_type = response.headers.get("Content-Type", "")
+    if "application/json" not in content_type:
+        snippet = response.text[:200]
+        raise RuntimeError(f"Non-JSON from Magento for {path}: {snippet}")
+
     return response.json()
