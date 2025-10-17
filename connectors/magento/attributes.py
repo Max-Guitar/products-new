@@ -261,16 +261,84 @@ class AttributeMetaCache:
 
     def list_set_attributes(self, set_id: int):
         try:
-            return (
-                magento_get(
+            items = magento_get(
+                self._session,
+                self._base_url,
+                f"/products/attribute-sets/{set_id}/attributes",
+            ) or []
+            self._debug_http[f"set_{set_id}"] = {
+                "count": len(items) if isinstance(items, list) else 0,
+                "sample": (items[:3] if isinstance(items, list) else []),
+            }
+            return items
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self._debug_http[f"set_{set_id}_err"] = str(exc)
+            return []
+
+    def find_attribute_code(self, want: str) -> str | None:
+        """Best-effort search for a real Magento attribute code."""
+
+        if not isinstance(want, str) or not want.strip():
+            return None
+
+        want_key = want.strip().lower()
+        aliases_map = {
+            "brand": ["manufacturer", "brand"],
+            "condition": ["product_condition", "condition", "mg_condition"],
+        }
+        aliases = aliases_map.get(want_key, [want_key])
+        alias_keys = {alias.strip().lower() for alias in aliases if isinstance(alias, str)}
+
+        for code in aliases:
+            try:
+                payload = magento_get(
                     self._session,
                     self._base_url,
-                    f"/products/attribute-sets/{set_id}/attributes",
+                    f"/products/attributes/{code}",
                 )
-                or []
+            except Exception:
+                continue
+            if isinstance(payload, dict) and payload.get("attribute_code") == code:
+                return code
+
+        try:
+            all_attrs_resp = magento_get(
+                self._session,
+                self._base_url,
+                "/products/attributes?searchCriteria[pageSize]=2000",
             )
         except Exception:
-            return []
+            all_attrs_resp = None
+
+        if isinstance(all_attrs_resp, dict):
+            all_attrs = all_attrs_resp.get("items") or []
+        else:
+            all_attrs = all_attrs_resp
+
+        want_labels = {
+            "brand": {"brand", "merk", "manufacturer", "fabrikant"},
+            "condition": {"condition", "staat", "conditie"},
+        }.get(want_key, {want_key})
+
+        if isinstance(all_attrs, list):
+            for attr in all_attrs:
+                if not isinstance(attr, dict):
+                    continue
+                code = attr.get("attribute_code")
+                if isinstance(code, str) and code:
+                    code_key = code.strip().lower()
+                    if code_key in alias_keys:
+                        return code
+                label_raw = attr.get("default_frontend_label") or attr.get(
+                    "frontend_label"
+                )
+                if not isinstance(label_raw, str):
+                    continue
+                label = label_raw.strip().lower()
+                if label and label in want_labels and isinstance(code, str) and code:
+                    return code
+
+        return None
 
     def resolve_codes_in_set(
         self, set_id: int, desired: list[str]
@@ -279,45 +347,26 @@ class AttributeMetaCache:
 
         attrs = self.list_set_attributes(set_id) or []
         by_code: Dict[str, Dict[str, Any]] = {}
-        by_label: Dict[str, Dict[str, Any]] = {}
         for attr in attrs:
             if not isinstance(attr, dict):
                 continue
             code = attr.get("attribute_code")
             if isinstance(code, str) and code:
                 by_code[code] = attr
-            label_raw = attr.get("frontend_label", "")
-            if isinstance(label_raw, str):
-                label_key = label_raw.strip().lower()
-                if label_key and label_key not in by_label:
-                    by_label[label_key] = attr
 
         resolved: dict[str, str] = {}
         for want in desired or []:
             if not isinstance(want, str):
                 continue
-            if want in by_code:
-                resolved[want] = want
+            want_clean = want.strip()
+            if not want_clean:
                 continue
-            if want == "brand" and "manufacturer" in by_code:
-                resolved[want] = "manufacturer"
+            if want_clean in by_code:
+                resolved[want_clean] = want_clean
                 continue
-            for label_key in ("brand", "merk", "manufacturer", "fabrikant"):
-                attr = by_label.get(label_key)
-                if attr:
-                    real_code = attr.get("attribute_code")
-                    if isinstance(real_code, str) and real_code:
-                        resolved[want] = real_code
-                        break
-            if want == "condition" and want not in resolved:
-                for candidate in (
-                    "product_condition",
-                    "condition_new",
-                    "mg_condition",
-                ):
-                    if candidate in by_code:
-                        resolved[want] = candidate
-                        break
+            candidate = self.find_attribute_code(want_clean)
+            if candidate:
+                resolved[want_clean] = candidate
 
         return resolved
 
