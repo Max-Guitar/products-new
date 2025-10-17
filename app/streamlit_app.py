@@ -1147,7 +1147,8 @@ if "df_original" in st.session_state:
                                     ] = categories_options
 
                                 step2_state = _ensure_step2_state()
-                                if not step2_state.get("dfs"):
+
+                                if not step2_state["dfs"]:
                                     meta_cache_obj = AttributeMetaCache(
                                         session, api_base
                                     )
@@ -1168,56 +1169,55 @@ if "df_original" in st.session_state:
                                         meta_cache_obj,
                                     )
 
-                                    if dfs_by_set:
-                                        for set_id, df_set in dfs_by_set.items():
-                                            if set_id in step2_state["dfs"]:
-                                                continue
-                                            step2_state["dfs"][set_id] = df_set.copy(deep=True)
-                                            step2_state["original"][set_id] = df_set.copy(
-                                                deep=True
+                                    for set_id, df_set in dfs_by_set.items():
+                                        step2_state["dfs"][set_id] = df_set.copy(deep=True)
+                                        step2_state["original"][set_id] = df_set.copy(
+                                            deep=True
+                                        )
+                                        step2_state["column_config"][set_id] = (
+                                            column_configs.get(set_id, {})
+                                        )
+                                        step2_state["disabled"][set_id] = (
+                                            disabled_cols_map.get(
+                                                set_id,
+                                                [
+                                                    "sku",
+                                                    "name",
+                                                    "attribute_code",
+                                                ],
                                             )
-                                            step2_state["column_config"][set_id] = (
-                                                column_configs.get(set_id, {})
-                                            )
-                                            step2_state["disabled"][set_id] = (
-                                                disabled_cols_map.get(set_id, [])
-                                            )
-                                            step2_state["row_meta"][set_id] = (
-                                                row_meta_map.get(set_id, {})
-                                            )
-                                            step2_state["set_names"][set_id] = set_names.get(
-                                                set_id, str(set_id)
-                                            )
-                                        step2_state["meta_cache"] = meta_cache_obj
-                                        step2_state["meta"] = meta_cache_obj
-                                        st.session_state["show_attrs"] = True
-                                    else:
-                                        st.session_state["show_attrs"] = False
+                                        )
+                                        step2_state["row_meta"][set_id] = row_meta_map.get(
+                                            set_id, {}
+                                        )
+                                        step2_state["set_names"][set_id] = set_names.get(
+                                            set_id, str(set_id)
+                                        )
+                                    step2_state["meta_cache"] = meta_cache_obj
 
-                                dfs_by_set = step2_state.get("dfs", {})
-                                if not dfs_by_set:
+                                    st.session_state["show_attrs"] = bool(
+                                        step2_state["dfs"]
+                                    )
+
+                                if not step2_state["dfs"]:
                                     st.info("Нет атрибутов для отображения.")
                                 elif st.session_state.get("show_attrs"):
-                                    sorted_items = sorted(dfs_by_set.items(), key=lambda x: x[0])
-                                    for set_id, df_set in sorted_items:
+                                    for set_id, df_set in sorted(
+                                        step2_state["dfs"].items()
+                                    ):
                                         set_title = step2_state["set_names"].get(
                                             set_id, str(set_id)
                                         )
                                         st.markdown(
                                             f"#### {_format_attr_set_title(set_title)} (ID {set_id})"
                                         )
-                                        column_cfg = step2_state["column_config"].get(
-                                            set_id, {}
-                                        )
-                                        disabled_cols = step2_state["disabled"].get(
-                                            set_id,
-                                            ["sku", "name", "attribute_code"],
-                                        )
                                         edited_df = st.data_editor(
                                             df_set,
                                             key=f"step2_editor::{set_id}",
-                                            column_config=column_cfg,
-                                            disabled=disabled_cols,
+                                            column_config=step2_state["column_config"][
+                                                set_id
+                                            ],
+                                            disabled=step2_state["disabled"][set_id],
                                             column_order=[
                                                 "sku",
                                                 "name",
@@ -1230,12 +1230,9 @@ if "df_original" in st.session_state:
                                         )
 
                                         if isinstance(edited_df, pd.DataFrame):
-                                            edited_copy = edited_df.copy(deep=True)
-                                            try:
-                                                edited_copy.index = df_set.index
-                                            except Exception:  # pragma: no cover - defensive
-                                                pass
-                                            step2_state["dfs"][set_id] = edited_copy
+                                            step2_state["dfs"][set_id] = edited_df.copy(
+                                                deep=True
+                                            )
 
                                     if st.button(
                                         "Save to Magento",
