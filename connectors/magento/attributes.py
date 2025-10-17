@@ -54,17 +54,23 @@ class AttributeMetaCache:
         self._data[code] = info
 
     def _fetch_options_list(self, code: str, store_id: int = 0) -> list[dict]:
-        try:
-            return (
-                magento_get(
-                    self._session,
-                    self._base_url,
-                    f"/products/attributes/{code}/options?storeId={store_id}",
-                )
-                or []
-            )
-        except Exception:
-            return []
+        paths = [
+            f"/products/attributes/{code}/options?storeId={store_id}",
+            f"/products/attributes/{code}/options?storeId=1",
+            f"/products/attributes/{code}/options",
+        ]
+        for path in paths:
+            try:
+                data = magento_get(self._session, self._base_url, path) or []
+                if isinstance(data, list) and all(isinstance(x, dict) for x in data):
+                    return [
+                        item
+                        for item in data
+                        if str(item.get("label", "")).strip() != ""
+                    ]
+            except Exception:
+                continue
+        return []
 
     def _prepare_meta(self, code: str, meta: Dict[str, Any]) -> Dict[str, Any]:
         prepared = dict(meta)
@@ -72,13 +78,17 @@ class AttributeMetaCache:
 
         raw_options = list(prepared.get("options") or [])
         if not raw_options:
-            fetch_code = prepared.get("attribute_code") or code
-            raw_options = self._fetch_options_list(fetch_code)
-            if not raw_options and code == "brand":
-                raw_options = self._fetch_options_list("manufacturer")
+            attr_code = (prepared.get("attribute_code") or "").strip() or code
+            probe_codes = [attr_code] + (["manufacturer"] if attr_code == "brand" else [])
+            for probe in probe_codes:
+                raw_options = self._fetch_options_list(probe) or []
+                if raw_options:
+                    prepared["options"] = raw_options
+                    break
 
         options: list[dict[str, Any]] = []
-        for opt in raw_options:
+        option_source = list(prepared.get("options") or raw_options)
+        for opt in option_source:
             if not isinstance(opt, dict):
                 continue
             label_raw = opt.get("label")

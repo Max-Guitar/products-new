@@ -1612,6 +1612,41 @@ if "df_original" in st.session_state:
                                             wide_df,
                                         )
                                         _apply_categories_fallback(meta_map)
+                                        for code, meta in meta_map.items():
+                                            if not isinstance(meta, dict):
+                                                continue
+                                            frontend = (
+                                                meta.get("frontend_input") or "text"
+                                            ).lower()
+                                            if frontend not in {"select", "boolean"}:
+                                                continue
+                                            if meta.get("options"):
+                                                continue
+                                            v2l = meta.get("values_to_labels") or {}
+                                            options = [
+                                                {"label": lbl, "value": key}
+                                                for key, lbl in v2l.items()
+                                                if str(lbl).strip()
+                                            ]
+                                            if not options and code in wide_df.columns:
+                                                seen: set[str] = set()
+                                                inferred: list[dict[str, str]] = []
+                                                for value in (
+                                                    wide_df[code]
+                                                    .dropna()
+                                                    .astype(str)
+                                                ):
+                                                    cleaned = value.strip()
+                                                    if not cleaned or cleaned in seen:
+                                                        continue
+                                                    seen.add(cleaned)
+                                                    inferred.append(
+                                                        {"label": cleaned, "value": cleaned}
+                                                    )
+                                                    if len(inferred) >= 200:
+                                                        break
+                                                options = inferred
+                                            meta["options"] = options[:200]
                                         _ensure_wide_meta_options(
                                             meta_map,
                                             step2_state["wide"].get(set_id),
@@ -1677,6 +1712,41 @@ if "df_original" in st.session_state:
                                                 wide_df,
                                             )
                                             _apply_categories_fallback(meta_map)
+                                            for code, meta in meta_map.items():
+                                                if not isinstance(meta, dict):
+                                                    continue
+                                                frontend = (
+                                                    meta.get("frontend_input") or "text"
+                                                ).lower()
+                                                if frontend not in {"select", "boolean"}:
+                                                    continue
+                                                if meta.get("options"):
+                                                    continue
+                                                v2l = meta.get("values_to_labels") or {}
+                                                options = [
+                                                    {"label": lbl, "value": key}
+                                                    for key, lbl in v2l.items()
+                                                    if str(lbl).strip()
+                                                ]
+                                                if not options and code in wide_df.columns:
+                                                    seen: set[str] = set()
+                                                    inferred: list[dict[str, str]] = []
+                                                    for value in (
+                                                        wide_df[code]
+                                                        .dropna()
+                                                        .astype(str)
+                                                    ):
+                                                        cleaned = value.strip()
+                                                        if not cleaned or cleaned in seen:
+                                                            continue
+                                                        seen.add(cleaned)
+                                                        inferred.append(
+                                                            {"label": cleaned, "value": cleaned}
+                                                        )
+                                                        if len(inferred) >= 200:
+                                                            break
+                                                    options = inferred
+                                                meta["options"] = options[:200]
                                             _ensure_wide_meta_options(
                                                 meta_map,
                                                 step2_state["wide"].get(set_id),
@@ -1699,8 +1769,8 @@ if "df_original" in st.session_state:
                                     st.info("Нет атрибутов для отображения.")
                                 elif st.session_state.get("show_attrs"):
                                     for set_id in sorted(step2_state["wide"].keys()):
-                                        df_ref = step2_state["wide"].get(set_id)
-                                        if not isinstance(df_ref, pd.DataFrame):
+                                        wide_df = step2_state["wide"].get(set_id)
+                                        if not isinstance(wide_df, pd.DataFrame):
                                             continue
 
                                         meta_map = step2_state["wide_meta"].get(
@@ -1709,23 +1779,51 @@ if "df_original" in st.session_state:
                                         if not isinstance(meta_map, dict):
                                             meta_map = {}
                                         _apply_categories_fallback(meta_map)
-                                        df_ref = _coerce_for_ui(df_ref, meta_map)
+                                        df_ref = _coerce_for_ui(wide_df, meta_map)
                                         _ensure_wide_meta_options(meta_map, df_ref)
                                         missing = [
-                                            c
-                                            for c, m in meta_map.items()
-                                            if (
-                                                str(m.get("frontend_input") or "").lower()
+                                            code
+                                            for code, meta in meta_map.items()
+                                            if isinstance(meta, dict)
+                                            and (
+                                                str(meta.get("frontend_input") or "").lower()
                                                 in {"select", "boolean"}
                                             )
-                                            and not (m.get("options") or [])
+                                            and not (meta.get("options") or [])
                                         ]
-                                        if missing:
-                                            st.caption(
-                                                "DEBUG: no options for "
-                                                f"{len(missing)} attrs: "
-                                                + ", ".join(missing[:10])
+                                        small = [
+                                            code
+                                            for code, meta in meta_map.items()
+                                            if isinstance(meta, dict)
+                                            and (
+                                                str(meta.get("frontend_input") or "").lower()
+                                                in {"select"}
                                             )
+                                            and len(meta.get("options") or []) <= 1
+                                        ]
+                                        st.caption(
+                                            f"DEBUG set {set_id}: select/boolean with empty options: "
+                                            f"{len(missing)}; select with ≤1 option: {len(small)}"
+                                        )
+                                        if missing[:10]:
+                                            st.write(
+                                                "DEBUG missing examples:",
+                                                {
+                                                    code: (
+                                                        wide_df[code]
+                                                        .dropna()
+                                                        .astype(str)
+                                                        .unique()[:5]
+                                                        .tolist()
+                                                    )
+                                                    for code in missing[:5]
+                                                    if code in wide_df.columns
+                                                },
+                                            )
+                                        st.write("DEBUG brand meta:", meta_map.get("brand"))
+                                        st.write(
+                                            "DEBUG condition meta:", meta_map.get("condition")
+                                        )
                                         colcfg = build_wide_colcfg(
                                             meta_map, sample_df=df_ref
                                         )
