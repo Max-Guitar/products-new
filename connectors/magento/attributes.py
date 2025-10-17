@@ -1,57 +1,24 @@
 """Magento attribute metadata cache with alias-aware option lookup."""
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import requests
 
 try:
     from connectors.magento.client import (
-        MAGENTO_ADMIN_TOKEN,
-        get_api_base,
         magento_get,
+        magento_get_logged,
     )
 except ModuleNotFoundError:  # pragma: no cover - fallback for notebooks
     from connectors.magento import client as _client
 
-    MAGENTO_ADMIN_TOKEN = _client.MAGENTO_ADMIN_TOKEN
-    get_api_base = _client.get_api_base
     magento_get = _client.magento_get
+    magento_get_logged = _client.magento_get_logged
 from services.country_aliases import country_aliases
 
 
 CANDIDATE_BRAND_CODES = ["brand", "manufacturer", "brand_name"]
-
-
-def magento_get_logged(
-    session: requests.Session,
-    base_url: str,
-    path: str,
-    headers: Optional[Dict[str, str]] = None,
-    timeout: int = 30,
-) -> Tuple[int, Optional[str], str, requests.Response]:
-    """Perform a GET request to Magento capturing HTTP details without enforcing JSON."""
-
-    if not path.startswith("/"):
-        path = "/" + path
-    url = get_api_base(base_url) + path
-
-    auth_headers: Dict[str, str] = {"Accept": "application/json"}
-    token = MAGENTO_ADMIN_TOKEN.strip()
-    if token:
-        auth_headers["Authorization"] = f"Bearer {token}"
-    elif session.headers.get("Authorization"):
-        auth_headers["Authorization"] = session.headers["Authorization"]
-
-    if headers:
-        auth_headers.update(headers)
-
-    response = session.get(url, headers=auth_headers, timeout=timeout)
-    status = response.status_code
-    content_type = response.headers.get("Content-Type")
-    body_snippet = response.text
-
-    return status, content_type, body_snippet, response
 
 
 class AttributeMetaCache:
@@ -165,6 +132,7 @@ class AttributeMetaCache:
         for code in unique:
             meta_status: Optional[int] = None
             meta_ctype: Optional[str] = None
+            meta_url: Optional[str] = None
             raw_meta: Dict[str, Any] = {}
             try:
                 meta_status, meta_ctype, _body, resp = magento_get_logged(
@@ -173,6 +141,7 @@ class AttributeMetaCache:
                     f"/products/attributes/{code}",
                     headers={"Accept": "application/json"},
                 )
+                meta_url = getattr(resp, "url", None)
                 if "application/json" in (meta_ctype or ""):
                     try:
                         raw_meta = resp.json()
@@ -185,6 +154,7 @@ class AttributeMetaCache:
             raw_opts: list[Dict[str, Any]] = []
             opts_status: Optional[int] = None
             opts_ctype: Optional[str] = None
+            opts_url: Optional[str] = None
             for path in (
                 f"/products/attributes/{code}/options?storeId={store_id}",
                 f"/products/attributes/{code}/options",
@@ -198,6 +168,7 @@ class AttributeMetaCache:
                         path,
                     )
                     opts_status, opts_ctype = status, ctype
+                    opts_url = getattr(resp, "url", None)
                     if "application/json" in (ctype or ""):
                         try:
                             data = resp.json()
@@ -212,11 +183,13 @@ class AttributeMetaCache:
             self._debug_http[code] = {
                 "meta_status": meta_status,
                 "meta_ctype": meta_ctype,
+                "meta_url": meta_url,
                 "paths_tried": tried,
                 "opts_status": opts_status,
                 "opts_ctype": opts_ctype,
                 "opts_count": len(raw_opts) if isinstance(raw_opts, list) else -1,
                 "opts_sample": (raw_opts or [])[:5],
+                "opts_url": opts_url,
             }
 
             cleaned: list[Dict[str, Any]] = []
@@ -261,16 +234,35 @@ class AttributeMetaCache:
 
     def list_set_attributes(self, set_id: int):
         try:
-            items = magento_get(
+            status, content_type, _body, response = magento_get_logged(
                 self._session,
                 self._base_url,
                 f"/products/attribute-sets/{set_id}/attributes",
-            ) or []
+            )
+            payload: Any
+            try:
+                if "json" in (content_type or "").lower():
+                    payload = response.json()
+                else:
+                    payload = []
+            except ValueError:
+                payload = []
+
+            if isinstance(payload, dict):
+                items = payload.get("items") or []
+            else:
+                items = payload
+
+            sample = items[:3] if isinstance(items, list) else []
+            count = len(items) if isinstance(items, list) else 0
             self._debug_http[f"set_{set_id}"] = {
-                "count": len(items) if isinstance(items, list) else 0,
-                "sample": (items[:3] if isinstance(items, list) else []),
+                "status": status,
+                "content_type": content_type,
+                "count": count,
+                "sample": sample,
+                "url": getattr(response, "url", None),
             }
-            return items
+            return items or []
         except Exception as exc:  # pragma: no cover - defensive logging
             self._debug_http[f"set_{set_id}_err"] = str(exc)
             return []
