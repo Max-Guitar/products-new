@@ -511,9 +511,12 @@ def build_wide_colcfg(
                 if s and s not in seen:
                     seen.add(s)
                     opts.append(s)
-        select_like = (t == "select") or (opts and t in {"", "text", "varchar", "static"})
+        select_like = (t == "select") or (
+            opts and t in {"", "text", "varchar", "static"}
+        )
         bool_like = (t == "boolean") or (
-            opts and {s.lower() for s in opts} <= {"yes", "no", "0", "1", "true", "false"}
+            opts
+            and ({s.lower() for s in opts} <= {"yes", "no", "0", "1", "true", "false"})
         )
 
         if bool_like:
@@ -1392,12 +1395,15 @@ if "df_original" in st.session_state:
                                             for col in wide_df.columns
                                             if col not in ("sku", "name")
                                         ]
+                                        if isinstance(
+                                            meta_cache_obj, AttributeMetaCache
+                                        ) and attr_cols:
+                                            meta_cache_obj.load(attr_cols)
                                         meta_for_set: dict[str, dict] = {}
                                         if set_id not in step2_state["wide_meta"]:
                                             if isinstance(
                                                 meta_cache_obj, AttributeMetaCache
                                             ):
-                                                meta_cache_obj.load(attr_cols)
                                                 for code in attr_cols:
                                                     meta_for_set[code] = (
                                                         meta_cache_obj.get(code) or {}
@@ -1444,10 +1450,13 @@ if "df_original" in st.session_state:
                                                 for col in wide_df.columns
                                                 if col not in ("sku", "name")
                                             ]
+                                            if isinstance(
+                                                meta_obj, AttributeMetaCache
+                                            ) and attr_codes:
+                                                meta_obj.load(attr_codes)
                                             if set_id not in step2_state["wide_meta"]:
                                                 meta_for_set: dict[str, dict] = {}
                                                 if isinstance(meta_obj, AttributeMetaCache):
-                                                    meta_obj.load(attr_codes)
                                                     for code in attr_codes:
                                                         meta_for_set[code] = (
                                                             meta_obj.get(code) or {}
@@ -1480,6 +1489,40 @@ if "df_original" in st.session_state:
                                         if not isinstance(df_ref, pd.DataFrame):
                                             continue
 
+                                        meta_map = step2_state["wide_meta"].get(
+                                            set_id, {}
+                                        )
+                                        if not isinstance(meta_map, dict):
+                                            meta_map = {}
+                                        # DEBUG
+                                        st.write(
+                                            f"DEBUG set_id={set_id} keys:",
+                                            list(meta_map.keys())[:20],
+                                        )
+                                        st.write(
+                                            "DEBUG brand meta:",
+                                            meta_map.get("brand"),
+                                        )
+                                        st.write(
+                                            "DEBUG condition meta:",
+                                            meta_map.get("condition"),
+                                        )
+                                        st.write(
+                                            "DEBUG types:",
+                                            {
+                                                k: (
+                                                    v.get("frontend_input"),
+                                                    len(v.get("options") or []),
+                                                )
+                                                for k, v in meta_map.items()
+                                            },
+                                        )
+
+                                        colcfg = build_wide_colcfg(
+                                            meta_map, sample_df=df_ref
+                                        )
+                                        step2_state["wide_colcfg"][set_id] = colcfg
+
                                         set_title = step2_state["set_names"].get(
                                             set_id, str(set_id)
                                         )
@@ -1497,9 +1540,7 @@ if "df_original" in st.session_state:
                                         edited_df = st.data_editor(
                                             df_ref,
                                             key=f"step2_wide::{set_id}",
-                                            column_config=step2_state["wide_colcfg"].get(
-                                                set_id, {}
-                                            ),
+                                            column_config=colcfg,
                                             disabled=["sku", "name"],
                                             use_container_width=True,
                                             hide_index=True,
