@@ -572,29 +572,28 @@ def build_wide_colcfg(
         "name": st.column_config.TextColumn("Name", disabled=True),
     }
 
-    df_sample = sample_df if isinstance(sample_df, pd.DataFrame) else None
-
     for code, original_meta in list(wide_meta.items()):
         meta = original_meta or {}
-        t = (meta.get("frontend_input") or meta.get("backend_type") or "text").lower()
-        opts = _meta_options(meta)
+        ftype = (meta.get("frontend_input") or meta.get("backend_type") or "text").lower()
+        labels = [
+            opt.get("label")
+            for opt in (meta.get("options") or [])
+            if isinstance(opt, dict) and opt.get("label")
+        ]
+        column_label = _attr_label(meta, code)
 
-        if t == "multiselect":
+        if ftype == "multiselect" and labels:
             cfg[code] = st.column_config.MultiselectColumn(
-                _attr_label(meta, code), options=opts
+                column_label, options=labels
             )
-        elif t == "boolean":
-            cfg[code] = st.column_config.CheckboxColumn(
-                _attr_label(meta, code)
-            )
-        elif t == "select":
-            cfg[code] = st.column_config.SelectboxColumn(
-                _attr_label(meta, code), options=opts
-            )
-        elif t in {"int", "integer", "decimal", "price", "float"}:
-            cfg[code] = st.column_config.NumberColumn(_attr_label(meta, code))
+        elif ftype in {"select", "boolean"} and labels:
+            cfg[code] = st.column_config.SelectboxColumn(column_label, options=labels)
+        elif ftype == "boolean":
+            cfg[code] = st.column_config.CheckboxColumn(column_label)
+        elif ftype in {"int", "integer", "decimal", "price", "float"}:
+            cfg[code] = st.column_config.NumberColumn(column_label)
         else:
-            cfg[code] = st.column_config.TextColumn(_attr_label(meta, code))
+            cfg[code] = st.column_config.TextColumn(column_label)
 
     return cfg
 
@@ -1490,27 +1489,40 @@ if "df_original" in st.session_state:
                                             "DEBUG attr_cols:",
                                             sorted(attr_cols),
                                         )
+                                        resolved_map: dict[str, str] = {}
                                         if cacheable:
-                                            fetch_codes = [
-                                                code
-                                                for code in attr_cols
-                                                if isinstance(code, str)
-                                            ]
-                                            if fetch_codes:
+                                            resolved_map = meta_cache_obj.resolve_codes_in_set(
+                                                set_id, ["brand", "condition"]
+                                            )
+                                            effective_codes: list[str] = []
+                                            seen_effective: set[str] = set()
+                                            for code in attr_cols:
+                                                if not isinstance(code, str):
+                                                    continue
+                                                effective = resolved_map.get(code, code)
+                                                if effective and effective not in seen_effective:
+                                                    seen_effective.add(effective)
+                                                    effective_codes.append(effective)
+                                            if effective_codes:
                                                 meta_cache_obj.build_and_set_static_for(
-                                                    fetch_codes, store_id=0
+                                                    effective_codes, store_id=0
                                                 )
                                         wide_meta = step2_state.setdefault("wide_meta", {})
                                         meta_map: dict[str, dict] = {}
                                         if cacheable:
                                             for code in attr_cols:
-                                                cached = meta_cache_obj.get(code) or {}
+                                                actual_code = resolved_map.get(code, code)
+                                                cached = meta_cache_obj.get(actual_code) or {}
                                                 if not isinstance(cached, dict):
                                                     cached = {}
                                                 meta_map[code] = cached
                                         else:
                                             meta_map = {code: {} for code in attr_cols}
                                         wide_meta[set_id] = meta_map
+                                        resolved_storage = step2_state.setdefault(
+                                            "resolved_codes", {}
+                                        )
+                                        resolved_storage[set_id] = resolved_map
                                         _apply_categories_fallback(meta_map)
                                         _ensure_wide_meta_options(
                                             meta_map,
@@ -1580,15 +1592,23 @@ if "df_original" in st.session_state:
                                                 "DEBUG attr_cols:",
                                                 sorted(attr_codes),
                                             )
+                                            resolved_map: dict[str, str] = {}
                                             if cacheable:
-                                                fetch_codes = [
-                                                    code
-                                                    for code in attr_codes
-                                                    if isinstance(code, str)
-                                                ]
-                                                if fetch_codes:
+                                                resolved_map = meta_obj.resolve_codes_in_set(
+                                                    set_id, ["brand", "condition"]
+                                                )
+                                                effective_codes: list[str] = []
+                                                seen_effective: set[str] = set()
+                                                for code in attr_codes:
+                                                    if not isinstance(code, str):
+                                                        continue
+                                                    effective = resolved_map.get(code, code)
+                                                    if effective and effective not in seen_effective:
+                                                        seen_effective.add(effective)
+                                                        effective_codes.append(effective)
+                                                if effective_codes:
                                                     meta_obj.build_and_set_static_for(
-                                                        fetch_codes, store_id=0
+                                                        effective_codes, store_id=0
                                                     )
                                             wide_meta = step2_state.setdefault(
                                                 "wide_meta", {}
@@ -1596,7 +1616,8 @@ if "df_original" in st.session_state:
                                             meta_map: dict[str, dict] = {}
                                             if cacheable:
                                                 for code in attr_codes:
-                                                    cached = meta_obj.get(code) or {}
+                                                    actual_code = resolved_map.get(code, code)
+                                                    cached = meta_obj.get(actual_code) or {}
                                                     if not isinstance(cached, dict):
                                                         cached = {}
                                                     meta_map[code] = cached
@@ -1605,6 +1626,10 @@ if "df_original" in st.session_state:
                                                     code: {} for code in attr_codes
                                                 }
                                             wide_meta[set_id] = meta_map
+                                            resolved_storage = step2_state.setdefault(
+                                                "resolved_codes", {}
+                                            )
+                                            resolved_storage[set_id] = resolved_map
                                             _apply_categories_fallback(meta_map)
                                             _ensure_wide_meta_options(
                                                 meta_map,
@@ -1695,20 +1720,36 @@ if "df_original" in st.session_state:
                                             else {}
                                         )
                                         dbg = dbg_source.copy() if isinstance(dbg_source, dict) else {}
+                                        resolved_map = (
+                                            (step2_state.get("resolved_codes") or {}).get(
+                                                set_id, {}
+                                            )
+                                        )
                                         attrs_in_set = (
                                             meta_cache_obj.list_set_attributes(set_id)
                                             if isinstance(meta_cache_obj, AttributeMetaCache)
                                             else []
                                         )
-                                        st.write("HTTP brand:", dbg.get("brand"))
-                                        st.write("HTTP condition:", dbg.get("condition"))
+                                        st.write("RESOLVED:", resolved_map)
                                         st.write(
-                                            "META brand:",
-                                            meta_map.get("brand"),
+                                            "HTTP brand (effective):",
+                                            dbg.get(resolved_map.get("brand", "brand")),
                                         )
                                         st.write(
-                                            "META condition:",
-                                            meta_map.get("condition"),
+                                            "HTTP condition (effective):",
+                                            dbg.get(resolved_map.get("condition", "condition")),
+                                        )
+                                        st.write(
+                                            "META brand (effective):",
+                                            step2_state["wide_meta"][set_id].get("brand")
+                                            if set_id in step2_state.get("wide_meta", {})
+                                            else None,
+                                        )
+                                        st.write(
+                                            "META condition (effective):",
+                                            step2_state["wide_meta"][set_id].get("condition")
+                                            if set_id in step2_state.get("wide_meta", {})
+                                            else None,
                                         )
                                         st.write(
                                             "SET attrs (brand/condition/manufacturer):",

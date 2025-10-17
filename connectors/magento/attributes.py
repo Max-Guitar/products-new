@@ -261,16 +261,65 @@ class AttributeMetaCache:
 
     def list_set_attributes(self, set_id: int):
         try:
-            data = magento_get(
-                self._session,
-                self._base_url,
-                f"/products/attribute-sets/attributes/{set_id}",
+            return (
+                magento_get(
+                    self._session,
+                    self._base_url,
+                    f"/products/attribute-sets/{set_id}/attributes",
+                )
+                or []
             )
-            if isinstance(data, list):
-                return data
-            return []
         except Exception:
             return []
+
+    def resolve_codes_in_set(
+        self, set_id: int, desired: list[str]
+    ) -> dict[str, str]:
+        """Resolve logical attribute names to actual attribute codes for a set."""
+
+        attrs = self.list_set_attributes(set_id) or []
+        by_code: Dict[str, Dict[str, Any]] = {}
+        by_label: Dict[str, Dict[str, Any]] = {}
+        for attr in attrs:
+            if not isinstance(attr, dict):
+                continue
+            code = attr.get("attribute_code")
+            if isinstance(code, str) and code:
+                by_code[code] = attr
+            label_raw = attr.get("frontend_label", "")
+            if isinstance(label_raw, str):
+                label_key = label_raw.strip().lower()
+                if label_key and label_key not in by_label:
+                    by_label[label_key] = attr
+
+        resolved: dict[str, str] = {}
+        for want in desired or []:
+            if not isinstance(want, str):
+                continue
+            if want in by_code:
+                resolved[want] = want
+                continue
+            if want == "brand" and "manufacturer" in by_code:
+                resolved[want] = "manufacturer"
+                continue
+            for label_key in ("brand", "merk", "manufacturer", "fabrikant"):
+                attr = by_label.get(label_key)
+                if attr:
+                    real_code = attr.get("attribute_code")
+                    if isinstance(real_code, str) and real_code:
+                        resolved[want] = real_code
+                        break
+            if want == "condition" and want not in resolved:
+                for candidate in (
+                    "product_condition",
+                    "condition_new",
+                    "mg_condition",
+                ):
+                    if candidate in by_code:
+                        resolved[want] = candidate
+                        break
+
+        return resolved
 
     def _fetch_options(self, code: str, store_id: int = 0) -> list[dict]:
         for path in (
