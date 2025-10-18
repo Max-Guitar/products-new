@@ -1080,11 +1080,26 @@ def apply_product_update(session, api_base: str, sku: str, attributes: dict):
     if not attributes:
         return
 
+    attrs = dict(attributes or {})
+
+    attr_set_id = attrs.pop("attribute_set_id", None)
+    if isinstance(attr_set_id, float) and pd.isna(attr_set_id):
+        attr_set_id = None
+    if isinstance(attr_set_id, str):
+        cleaned = attr_set_id.strip()
+        attr_set_id = cleaned or None
+
     payload: dict[str, object] = {"sku": sku}
+    if attr_set_id is not None:
+        try:
+            payload["attribute_set_id"] = int(attr_set_id)
+        except (TypeError, ValueError):
+            payload["attribute_set_id"] = attr_set_id
+
     custom_attributes = []
     extension_attributes: dict[str, object] = {}
 
-    for code, value in attributes.items():
+    for code, value in attrs.items():
         if code == "categories":
             category_links = [
                 {"position": idx, "category_id": str(cat_id)}
@@ -1151,6 +1166,9 @@ def save_step2_to_magento():
     if meta_cache is None:
         meta_cache = step2_state.get("meta")
 
+    if isinstance(meta_cache, AttributeMetaCache):
+        meta_cache.build_and_set_static_for(["country_of_manufacture"], store_id=0)
+
     if not wide_map:
         st.info("Нет изменений для сохранения.")
         return
@@ -1162,7 +1180,11 @@ def save_step2_to_magento():
         if not isinstance(wide_df, pd.DataFrame) or wide_df.empty:
             continue
 
-        attr_cols = [col for col in wide_df.columns if col not in ("sku", "name")]
+        attr_cols = [
+            col
+            for col in wide_df.columns
+            if col not in ("sku", "name", "attribute_set_id")
+        ]
         if not attr_cols:
             continue
 
@@ -1179,6 +1201,19 @@ def save_step2_to_magento():
             sku_value = str(sku).strip() if isinstance(sku, str) else str(sku)
             if not sku_value:
                 continue
+
+            attr_set_value = row.get("attribute_set_id", set_id)
+            if isinstance(attr_set_value, float) and pd.isna(attr_set_value):
+                attr_set_value = set_id
+            if attr_set_value in (None, ""):
+                attr_set_value = set_id
+            try:
+                attr_set_clean = int(attr_set_value)
+            except (TypeError, ValueError):
+                attr_set_clean = attr_set_value
+            payload_by_sku.setdefault(sku_value, {})["attribute_set_id"] = (
+                attr_set_clean
+            )
 
             baseline_row: pd.Series | None
             if baseline_idx is not None and sku in baseline_idx.index:
@@ -1211,6 +1246,7 @@ def save_step2_to_magento():
                             "attribute": attr_code,
                             "raw": repr(new_raw),
                             "hint_examples": f"normalize error: {exc}",
+                            "expected_codes": "",
                         }
                     )
                     continue
@@ -1231,17 +1267,32 @@ def save_step2_to_magento():
                                 examples.append(label)
                             if len(examples) >= 5:
                                 break
+                    expected_codes: list[str] = []
+                    values_to_labels = meta_info.get("values_to_labels")
+                    if isinstance(values_to_labels, dict):
+                        expected_codes = sorted(
+                            [
+                                str(value)
+                                for value in values_to_labels.values()
+                                if value not in (None, "")
+                            ]
+                        )[:10]
                     errors.append(
                         {
                             "sku": sku_value,
                             "attribute": attr_code,
-                            "raw": str(new_raw),
-                            "hint_examples": ", ".join(examples[:5]),
+                            "raw": repr(new_raw),
+                            "hint_examples": "\n".join(examples[:5]),
+                            "expected_codes": ", ".join(expected_codes),
                         }
                     )
                     continue
 
                 payload_by_sku.setdefault(sku_value, {})[attr_code] = normalized
+
+            entry = payload_by_sku.get(sku_value)
+            if entry and set(entry.keys()) == {"attribute_set_id"}:
+                payload_by_sku.pop(sku_value, None)
 
     if not payload_by_sku and not errors:
         st.info("Нет изменений для сохранения.")
@@ -1264,6 +1315,7 @@ def save_step2_to_magento():
                     "attribute": "*batch*",
                     "raw": repr(attrs),
                     "hint_examples": str(exc),
+                    "expected_codes": "",
                 }
             )
 
@@ -1276,7 +1328,16 @@ def save_step2_to_magento():
 
         st.warning("Some rows failed; review and fix:")
         st.dataframe(
-            _pd.DataFrame(errors, columns=["sku", "attribute", "raw", "hint_examples"]),
+            _pd.DataFrame(
+                errors,
+                columns=[
+                    "sku",
+                    "attribute",
+                    "raw",
+                    "hint_examples",
+                    "expected_codes",
+                ],
+            ),
             use_container_width=True,
         )
 
