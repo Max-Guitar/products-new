@@ -435,8 +435,24 @@ def _build_column_config_for_step1_like(step: str) -> tuple[dict, list[str]]:
 
 
 def _reset_step2_state():
-    st.session_state.pop("step2", None)
-    st.session_state.pop("show_attrs", None)
+    step2_state = st.session_state.get("step2")
+    if step2_state is None:
+        return
+    if not isinstance(step2_state, dict):
+        st.session_state["step2"] = {}
+        return
+
+    for key in (
+        "wide",
+        "wide_orig",
+        "wide_synced",
+        "dfs",
+        "original",
+        "staged",
+        "wide_meta",
+        "current_set_id",
+    ):
+        step2_state.pop(key, None)
 
 
 def _ensure_step2_state() -> dict:
@@ -2290,8 +2306,13 @@ if df_original_key in st.session_state:
                                     ):
                                         save_step2_to_magento()
 
-                                    if st.button("Reload", key="step2_reload"):
+                                    if st.button(
+                                        "Reload", key="btn_step2_reload"
+                                    ):
                                         _reset_step2_state()
-                                        st.experimental_rerun()
+                                        (
+                                            getattr(st, "rerun", None)
+                                            or getattr(st, "experimental_rerun")
+                                        )()
 else:
     st.info("Нажми **Load items** для загрузки и отображения товаров.")
