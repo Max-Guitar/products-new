@@ -17,6 +17,13 @@ import re
 import pandas as pd
 import streamlit as st
 
+st.set_page_config(
+    page_title="🤖 Peter v.1.0 (AI Content Manager)",
+    page_icon="🤖",
+    layout="wide",
+)
+st.title("🤖 Peter v.1.0 (AI Content Manager)")
+
 from connectors.magento.attributes import AttributeMetaCache
 from connectors.magento.categories import ensure_categories_meta
 from connectors.magento.client import get_default_products
@@ -1537,8 +1544,6 @@ def load_items(
     return out[["sku", "name", "attribute set", "created_at"]]
 
 
-st.set_page_config(page_title="Default Set In-Stock Browser", layout="wide")
-
 magento_base_url = st.secrets["MAGENTO_BASE_URL"].rstrip("/")
 magento_token = st.secrets["MAGENTO_ADMIN_TOKEN"]
 magento_session = get_session(auth_token=magento_token)
@@ -1558,15 +1563,14 @@ if not session or not base_url:
     st.error("Magento session не инициализирован")
     st.stop()
 
-st.markdown("### 🤖 AI Content Manager")
-st.info("Let’s find items that need attribute set assignment.")
+st.info("Let’s find items need to be updated.")
 
 if "step1_editor_mode" not in st.session_state:
     st.session_state["step1_editor_mode"] = "all"
 
 c1, c2 = st.columns(2)
-btn_all = c1.button("Load items", type="primary", key="btn_load_all")
-btn_50 = c2.button("Load 50 (fast)", key="btn_load_50_fast")
+btn_all = c1.button("📦 Load All", key="btn_load_all")
+btn_50 = c2.button("⚡ Load 50 (fast)", key="btn_load_50_fast")
 
 if btn_all:
     requested_run_mode: str | None = "all"
@@ -1592,10 +1596,12 @@ if requested_run_mode:
     df_edited_key = f"df_edited_{run_mode}"
     attribute_sets_key = f"attribute_sets_{run_mode}"
 
-    st.info(
-        f"Loading default products{f' (limit={limit})' if limit else ''}…"
-    )
+    status = st.status("Loading default products…", expanded=True)
+    pbar = st.progress(0)
+    data: list[dict] | None = None
     try:
+        pbar.progress(5)
+        status.update(label="Preparing request…")
         attr_set_id = get_attr_set_id(session, base_url, name=_DEF_ATTR_SET_NAME)
         data = get_default_products(
             session,
@@ -1607,15 +1613,16 @@ if requested_run_mode:
             enabled_only=enabled_only,
         )
         st.session_state[cache_key] = data
-        st.success(
-            f"Loaded {len(data or [])} products{f' (limit={limit})' if limit else ''}"
-        )
+        pbar.progress(60)
+        status.update(label="Parsing response…")
         df_items = load_items(
             session,
             base_url,
             attr_set_id=attr_set_id,
             products=data,
         )
+        pbar.progress(90)
+        status.update(label="Building table…")
         if df_items.empty:
             st.warning("No items match the Default set filter criteria.")
             st.session_state.pop(df_original_key, None)
@@ -1628,9 +1635,6 @@ if requested_run_mode:
                 df_ui["created_at"], errors="coerce"
             )
             df_ui = df_ui.sort_values("created_at", ascending=False).reset_index(drop=True)
-            st.success(
-                f"Found {len(df_ui)} products (Default; qty>0 OR backorders=2)"
-            )
             st.session_state[df_original_key] = df_ui.copy()
             try:
                 attribute_sets = list_attribute_sets(session, base_url)
@@ -1645,7 +1649,13 @@ if requested_run_mode:
             df_for_edit = df_for_edit[[col for col in cols_order if col in df_for_edit.columns]]
             st.session_state[df_edited_key] = df_for_edit.copy()
             _reset_step2_state()
+        pbar.progress(100)
+        status.update(
+            state="complete",
+            label=f"Loaded {len(data or [])} items",
+        )
     except Exception as exc:  # pragma: no cover - UI error handling
+        status.update(state="error", label="Failed to load products")
         st.error(f"Error: {exc}")
 
 current_run_mode = st.session_state.get("step1_editor_mode", "all")
@@ -1688,7 +1698,12 @@ if df_original_key in st.session_state:
         options = list(dict.fromkeys(options))
 
 
-        st.markdown("**Step 1. Assign the attribute sets**")
+        st.header("Step 1. Assign the product type (attribute set).")
+        st.caption(
+            "For each item, choose which product type (attribute set) it belongs to. "
+            "This lets us show the correct attributes later. "
+            "Edit the **Product Type (attribute set)** column: replace **default** with the right value from the dropdown."
+        )
 
         step2_active = st.session_state.get("show_attributes_trigger", False)
 
@@ -1697,7 +1712,7 @@ if df_original_key in st.session_state:
                 "sku": st.column_config.TextColumn("SKU", disabled=True),
                 "name": st.column_config.TextColumn("Name", disabled=True),
                 "attribute set": st.column_config.SelectboxColumn(
-                    label="🎯 Attribute Set",
+                    label="Product Type (attribute set)",
                     help="Change attribute set",
                     options=options,
                     required=True,
@@ -1712,6 +1727,23 @@ if df_original_key in st.session_state:
                 "created_at",
             ]
             col_cfg, disabled_cols = _build_column_config_for_step1_like(step="step1")
+            if "attribute set" in col_cfg:
+                cfg = col_cfg["attribute set"]
+                if hasattr(cfg, "label"):
+                    cfg.label = "Product Type (attribute set)"
+                elif hasattr(cfg, "_label"):
+                    cfg._label = "Product Type (attribute set)"
+            if "attribute_set" in col_cfg:
+                cfg = col_cfg["attribute_set"]
+                if hasattr(cfg, "label"):
+                    cfg.label = "Product Type (attribute set)"
+                elif hasattr(cfg, "_label"):
+                    cfg._label = "Product Type (attribute set)"
+            if "attribute_set_id" in df_base.columns:
+                col_cfg["attribute_set_id"] = st.column_config.NumberColumn(
+                    label="Product Type (attribute set)",
+                    disabled=False,
+                )
             edited_df = st.data_editor(
                 df_base,
                 column_config=col_cfg,
@@ -1727,7 +1759,7 @@ if df_original_key in st.session_state:
                 st.session_state["show_attributes_trigger"] = True
                 _reset_step2_state()
         else:
-            st.markdown("### Step 2. Items with updated attribute sets")
+            st.header("Step 2. Filling in attributes.")
 
             if df_edited_key not in st.session_state or df_original_key not in st.session_state:
                 st.warning("Нет изменённых товаров.")
@@ -1793,6 +1825,14 @@ if df_original_key in st.session_state:
                             if setup_failed or not api_base or not attr_sets_map:
                                 st.session_state["show_attributes_trigger"] = False
                             else:
+                                status2 = st.status(
+                                    "Building attribute editor…", expanded=True
+                                )
+                                p2 = st.progress(0)
+                                p2.progress(20)
+                                status2.update(
+                                    label="Fetching metadata from Magento…"
+                                )
                                 step2_state = _ensure_step2_state()
                                 step2_state.setdefault("staged", {})
 
@@ -1839,6 +1879,9 @@ if df_original_key in st.session_state:
                                     step2_state["categories_meta"] = categories_meta
                                 else:
                                     st.session_state["step2_categories_failed"] = False
+
+                                p2.progress(60)
+                                status2.update(label="Preparing columns…")
 
                                 if not step2_state["dfs"]:
                                     (
@@ -2130,9 +2173,17 @@ if df_original_key in st.session_state:
                                         step2_state["wide"]
                                     )
 
+                                completed = False
                                 if not step2_state["wide"]:
                                     st.warning("Нет атрибутов для отображения.")
+                                    p2.progress(100)
+                                    status2.update(
+                                        state="complete", label="Attributes ready"
+                                    )
+                                    completed = True
                                 elif st.session_state.get("show_attrs"):
+                                    p2.progress(90)
+                                    status2.update(label="Rendering tables…")
                                     wide_meta = step2_state.setdefault("wide_meta", {})
                                     categories_meta = step2_state.get("categories_meta", {})
                                     if not isinstance(categories_meta, dict):
@@ -2201,10 +2252,22 @@ if df_original_key in st.session_state:
                                             meta_map, sample_df=df_ref
                                         )
                                         column_config["attribute_set_id"] = (
-                                            st.column_config.NumberColumn(
-                                                "Attribute Set ID", disabled=True
-                                            )
+                                            st.column_config.Column(label="", disabled=True)
                                         )
+                                        if "sku" in df_ref.columns:
+                                            column_config["sku"] = st.column_config.Column(
+                                                label="SKU", disabled=True, width="small"
+                                            )
+                                        if "name" in df_ref.columns:
+                                            column_config["name"] = st.column_config.TextColumn(
+                                                label="Name",
+                                                disabled=False,
+                                                width="medium",
+                                            )
+                                        if "price" in df_ref.columns:
+                                            column_config["price"] = st.column_config.NumberColumn(
+                                                label="Price", disabled=True
+                                            )
                                         if "categories" in df_ref.columns:
                                             existing_cfg = column_config.get("categories")
                                             label = (
@@ -2220,17 +2283,21 @@ if df_original_key in st.session_state:
                                         step2_state["wide_colcfg"][set_id] = column_config
 
                                         column_order = [
-                                            "sku",
-                                            "name",
-                                            "attribute_set_id",
+                                            col
+                                            for col in df_ref.columns
+                                            if col != "attribute_set_id"
                                         ]
-                                        column_order.extend(
-                                            [
-                                                col
-                                                for col in df_ref.columns
-                                                if col not in column_order
-                                            ]
-                                        )
+                                        lead = [
+                                            col
+                                            for col in ("sku", "name", "price")
+                                            if col in column_order
+                                        ]
+                                        tail = [
+                                            col
+                                            for col in column_order
+                                            if col not in ("sku", "name", "price")
+                                        ]
+                                        column_order = lead + tail
 
                                         if DEBUG:
                                             st.write(
@@ -2241,11 +2308,18 @@ if df_original_key in st.session_state:
                                         for current_set_id, group in df_ref.groupby(
                                             "attribute_set_id"
                                         ):
-                                            set_title = step2_state["set_names"].get(
+                                            raw_title = step2_state["set_names"].get(
                                                 current_set_id, str(current_set_id)
                                             )
+                                            set_name = (
+                                                raw_title
+                                                if isinstance(raw_title, str)
+                                                and raw_title.strip()
+                                                else str(current_set_id)
+                                            )
+                                            icon = _attr_set_icon(set_name)
                                             st.subheader(
-                                                f"{_format_attr_set_title(set_title)} (ID {current_set_id})"
+                                                f"{icon} {set_name} ({len(group)} items)"
                                             )
 
                                             ordered_columns = [
@@ -2253,13 +2327,19 @@ if df_original_key in st.session_state:
                                                 for col in column_order
                                                 if col in group.columns
                                             ]
+                                            if "attribute_set_id" in ordered_columns:
+                                                ordered_columns = [
+                                                    col
+                                                    for col in ordered_columns
+                                                    if col != "attribute_set_id"
+                                                ]
                                             disabled_cols = [
                                                 col
-                                                for col in [
+                                                for col in (
                                                     "sku",
-                                                    "name",
+                                                    "price",
                                                     "attribute_set_id",
-                                                ]
+                                                )
                                                 if col in group.columns
                                             ]
                                             editor_df = st.data_editor(
@@ -2299,6 +2379,16 @@ if df_original_key in st.session_state:
                                                         current_set_id, None
                                                     )
 
+                                    p2.progress(100)
+                                    status2.update(
+                                        state="complete", label="Attributes ready"
+                                    )
+                                    completed = True
+                                if not completed:
+                                    p2.progress(100)
+                                    status2.update(
+                                        state="complete", label="Attributes ready"
+                                    )
                                     if st.button(
                                         "Save to Magento",
                                         type="primary",
@@ -2314,5 +2404,3 @@ if df_original_key in st.session_state:
                                             getattr(st, "rerun", None)
                                             or getattr(st, "experimental_rerun")
                                         )()
-else:
-    st.info("Нажми **Load items** для загрузки и отображения товаров.")
