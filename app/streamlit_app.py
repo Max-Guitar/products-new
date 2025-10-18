@@ -416,30 +416,32 @@ def _coerce_multiselect_cell(v, l2v: dict[str, str]) -> list[str]:
     return [l2v.get(s, s)]
 
 
-def make_value_formatter(v2l: dict[str, str]) -> JsCode:
+def make_value_formatter(v2l: dict) -> JsCode:
     return JsCode(
         f"""
     function(p) {{
-      var map = {json.dumps(v2l)};
+      var map = {json.dumps({})};
+      map = {json.dumps(v2l)};
       var v = p.value;
       if (Array.isArray(v)) return v.map(x => map[String(x)] || String(x)).join(", ");
       if (v === null || v === undefined) return "";
       return map[String(v)] || String(v);
-    }}"""
+    }}
+    """
     )
 
 
-def make_value_setter(l2v: dict[str, str], is_multi: bool) -> JsCode:
+def make_value_setter(l2v: dict, is_multi: bool) -> JsCode:
     return JsCode(
         f"""
     function(p) {{
       var map = {json.dumps(l2v)};
-      var nv = p.newValue;
       function toId(x) {{
         if (x == null) return null;
         var s = String(x).trim();
         return map.hasOwnProperty(s) ? map[s] : s;
       }}
+      var nv = p.newValue;
       if ({str(is_multi).lower()}) {{
         if (nv == null) {{ p.data[p.colDef.field] = []; return true; }}
         if (Array.isArray(nv)) {{
@@ -453,8 +455,60 @@ def make_value_setter(l2v: dict[str, str], is_multi: bool) -> JsCode:
         p.data[p.colDef.field] = toId(nv);
         return true;
       }}
-    }}"""
+    }}
+    """
     )
+
+
+# КАСТОМНЫЙ MULTISELECT EDITOR (Community)
+MultiSelectEditor = JsCode(
+    """
+class MultiSelectEditor {
+  init(params) {
+    this.params = params;
+    this.values = (params && params.values) ? params.values : [];
+    this.container = document.createElement('div');
+    this.container.style.padding = '4px';
+    this.select = document.createElement('select');
+    this.select.setAttribute('multiple', 'multiple');
+    this.select.style.width = '100%';
+    this.select.style.minWidth = '200px';
+    this.select.style.minHeight = '120px';
+
+    // значения колонке сейчас: массив ID или массив строк/лейблов
+    const current = Array.isArray(params.value) ? params.value.map(v => String(v)) : [];
+
+    // заполняем опции (labels)
+    this.values.forEach(label => {
+      const opt = document.createElement('option');
+      opt.value = String(label);
+      opt.textContent = String(label);
+      this.select.appendChild(opt);
+      // если текущее значение содержит label — помечаем выбранным (форматтер/сеттер конвертнёт в ID)
+      if (current.includes(String(label))) {
+        opt.selected = true;
+      }
+    });
+
+    this.container.appendChild(this.select);
+  }
+
+  getGui() { return this.container; }
+
+  afterGuiAttached() {
+    if (this.select) this.select.focus();
+  }
+
+  getValue() {
+    const selected = Array.from(this.select.selectedOptions || []).map(o => o.value);
+    return selected; // valueSetter конвертирует labels -> ids
+  }
+
+  destroy() {}
+  isPopup() { return true; } // рендер в попапе
+}
+"""
+)
 
 
 def _attr_set_icon(name: str) -> str:
@@ -2926,15 +2980,11 @@ if df_original_key in st.session_state:
                                             for col in ordered_columns:
                                                 if col not in df_view.columns:
                                                     continue
-                                                if col in {"sku", "name", "price"}:
+                                                if col in ("sku", "name", "price"):
                                                     continue
 
                                                 cfg = wcfg.get(col)
                                                 header_name = header_overrides.get(col)
-                                                column_kwargs: dict[str, Any] = {
-                                                    "editable": True
-                                                }
-
                                                 if isinstance(cfg, dict):
                                                     header_name = (
                                                         header_name
@@ -2951,47 +3001,77 @@ if df_original_key in st.session_state:
                                                 if not header_name:
                                                     header_name = col.replace("_", " ").title()
 
+                                                column_kwargs: dict[str, Any] = {}
                                                 if header_name:
                                                     column_kwargs["headerName"] = header_name
 
-                                                meta = meta_map_current.get(col, {})
-                                                if not isinstance(meta, dict):
-                                                    meta = {}
-                                                ctype = str(
+                                                meta = (meta_map_current or {}).get(col, {}) or {}
+                                                ftype = (
                                                     meta.get("frontend_input") or ""
                                                 ).lower()
+                                                labels = [
+                                                    str(o.get("label", "")).strip()
+                                                    for o in (meta.get("options") or [])
+                                                    if isinstance(o, dict)
+                                                    and str(o.get("label", "")).strip()
+                                                ]
+                                                v2l = {
+                                                    str(k): str(v)
+                                                    for k, v in (
+                                                        meta.get("values_to_labels")
+                                                        or {}
+                                                    ).items()
+                                                }
+                                                l2v = {
+                                                    str(k): str(v)
+                                                    for k, v in (
+                                                        meta.get("options_map") or {}
+                                                    ).items()
+                                                }
 
-                                                if ctype == "boolean":
+                                                if ftype == "boolean":
                                                     gb.configure_column(
                                                         col,
+                                                        editable=True,
                                                         cellEditor="agCheckboxCellEditor",
                                                         cellRenderer="agCheckboxCellRenderer",
                                                         **column_kwargs,
                                                     )
-                                                elif ctype in {"select", "multiselect"}:
-                                                    labels = _meta_options_list(meta)
-                                                    v2l = _v2l(meta)
-                                                    l2v = _l2v(meta)
-                                                    is_multi = (
-                                                        ctype == "multiselect"
-                                                    )
+                                                    continue
+
+                                                if ftype == "select":
                                                     gb.configure_column(
                                                         col,
-                                                        cellEditor="agRichSelectCellEditor",
-                                                        cellEditorParams={
-                                                            "values": labels,
-                                                            "allowTyping": True,
-                                                            "filterList": True,
-                                                            "multiple": is_multi,
-                                                        },
+                                                        editable=True,
+                                                        cellEditor="agSelectCellEditor",
+                                                        cellEditorParams={"values": labels},
                                                         valueFormatter=make_value_formatter(v2l),
                                                         valueSetter=make_value_setter(
-                                                            l2v, is_multi
+                                                            l2v, False
                                                         ),
                                                         **column_kwargs,
                                                     )
-                                                else:
-                                                    gb.configure_column(col, **column_kwargs)
+                                                    continue
+
+                                                if ftype == "multiselect":
+                                                    gb.configure_column(
+                                                        col,
+                                                        editable=True,
+                                                        cellEditor=MultiSelectEditor,
+                                                        cellEditorParams={"values": labels},
+                                                        valueFormatter=make_value_formatter(v2l),
+                                                        valueSetter=make_value_setter(
+                                                            l2v, True
+                                                        ),
+                                                        **column_kwargs,
+                                                    )
+                                                    continue
+
+                                                gb.configure_column(
+                                                    col,
+                                                    editable=True,
+                                                    **column_kwargs,
+                                                )
 
                                             gb.configure_grid_options(
                                                 suppressColumnMove=True,
@@ -3082,7 +3162,7 @@ if df_original_key in st.session_state:
                                                 ),
                                                 fit_columns_on_grid_load=False,
                                                 theme="balham",
-                                                key=f"aggrid_set_{current_set_id}_{render_counter}",
+                                                key=f"aggrid_set_{current_set_id}",
                                             )
 
                                             grid_data = grid.get("data", None)
