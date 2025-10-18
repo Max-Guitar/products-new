@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import sys
 from pathlib import Path
@@ -18,6 +19,7 @@ import re
 import pandas as pd
 import streamlit as st
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
+from st_aggrid.shared import JsCode
 
 st.set_page_config(
     page_title="🤖 Peter v.1.0 (AI Content Manager)",
@@ -359,13 +361,45 @@ def _meta_options(meta: dict) -> list:
     return unique
 
 
-def _options_for_aggrid(
-    col: str, meta_map: dict[str, dict], categories_labels_all: list[str]
-) -> list[str]:
-    if col == "categories":
-        return categories_labels_all
-    meta = meta_map.get(col, {}) if isinstance(meta_map, dict) else {}
-    return _meta_options(meta)
+def make_value_formatter(v2l: dict[str, str]) -> JsCode:
+    js = f"""
+    function(p) {{
+      var map = {json.dumps(v2l)};
+      var v = p.value;
+      if (Array.isArray(v)) return v.map(x => map[String(x)] || String(x)).join(", ");
+      if (v === null || v === undefined) return "";
+      return map[String(v)] || String(v);
+    }}
+    """
+    return JsCode(js)
+
+
+def make_value_setter(l2v: dict[str, str], is_multi: bool) -> JsCode:
+    js = f"""
+    function(p) {{
+      var map = {json.dumps(l2v)};
+      var nv = p.newValue;
+      function toId(x) {{
+        if (x === null || x === undefined) return null;
+        var s = String(x).trim();
+        return map.hasOwnProperty(s) ? map[s] : s;
+      }}
+      if ({str(is_multi).lower()}) {{
+        if (nv == null) {{ p.data[p.colDef.field] = []; return true; }}
+        if (Array.isArray(nv)) {{
+          p.data[p.colDef.field] = nv.map(toId).filter(x => x !== null);
+          return true;
+        }}
+        var parts = String(nv).split(",").map(s => s.trim()).filter(s => s.length);
+        p.data[p.colDef.field] = parts.map(toId);
+        return true;
+      }} else {{
+        p.data[p.colDef.field] = toId(nv);
+        return true;
+      }}
+    }}
+    """
+    return JsCode(js)
 
 
 def _attr_set_icon(name: str) -> str:
@@ -2554,6 +2588,9 @@ if df_original_key in st.session_state:
                                         for opt in (categories_meta.get("options") or [])
                                         if isinstance(opt, dict) and opt.get("label")
                                     ]
+                                    step2_state[
+                                        "categories_all_labels"
+                                    ] = labels_all.copy()
                                     total_rows = sum(
                                         len(df)
                                         for df in step2_state["wide"].values()
@@ -2723,6 +2760,8 @@ if df_original_key in st.session_state:
                                                 step2_state.get("wide_colcfg", {})
                                                 .get(current_set_id, {})
                                             )
+                                            if not isinstance(wcfg, dict):
+                                                wcfg = {}
 
                                             gb = GridOptionsBuilder.from_dataframe(df_view)
                                             gb.configure_default_column(editable=True)
@@ -2761,35 +2800,51 @@ if df_original_key in st.session_state:
                                                 "cases_covers": "Cases & Covers",
                                             }
 
-                                            meta_map_current = (
-                                                wide_meta.get(current_set_id, {})
-                                                if isinstance(wide_meta, dict)
-                                                else {}
+                                            wide_meta_map = step2_state.get("wide_meta", {})
+                                            if not isinstance(wide_meta_map, dict):
+                                                wide_meta_map = {}
+                                            meta_map_current = wide_meta_map.get(
+                                                current_set_id, {}
                                             )
-                                            if not isinstance(meta_map_current, dict) or not meta_map_current:
+                                            if not isinstance(meta_map_current, dict):
+                                                meta_map_current = {}
+                                            if not meta_map_current:
                                                 meta_map_current = (
                                                     meta_map
                                                     if isinstance(meta_map, dict)
                                                     else {}
                                                 )
 
-                                            def _detect_type(
-                                                cfg_obj: Any,
-                                            ) -> str | None:
-                                                if isinstance(
-                                                    cfg_obj, st.column_config.CheckboxColumn
-                                                ):
-                                                    return "boolean"
-                                                if isinstance(
-                                                    cfg_obj, st.column_config.SelectboxColumn
-                                                ):
-                                                    return "select"
-                                                if isinstance(
-                                                    cfg_obj,
-                                                    st.column_config.MultiselectColumn,
-                                                ):
-                                                    return "multiselect"
-                                                return None
+                                            def meta_options(col: str) -> list[str]:
+                                                if col == "categories":
+                                                    labels = step2_state.get(
+                                                        "categories_all_labels", []
+                                                    )
+                                                    return list(dict.fromkeys(labels))
+                                                meta = (meta_map_current or {}).get(col, {}) or {}
+                                                opts = meta.get("options") or []
+                                                labels = [
+                                                    str(opt.get("label", "")).strip()
+                                                    for opt in opts
+                                                    if isinstance(opt, dict)
+                                                ]
+                                                return [label for label in labels if label]
+
+                                            def values_to_labels_map(col: str) -> dict[str, str]:
+                                                meta = (meta_map_current or {}).get(col, {}) or {}
+                                                v2l = meta.get("values_to_labels") or {}
+                                                return {
+                                                    str(key): str(value)
+                                                    for key, value in v2l.items()
+                                                }
+
+                                            def labels_to_values_map(col: str) -> dict[str, str]:
+                                                meta = (meta_map_current or {}).get(col, {}) or {}
+                                                l2v = meta.get("options_map") or {}
+                                                return {
+                                                    str(key): str(value)
+                                                    for key, value in l2v.items()
+                                                }
 
                                             for col in ordered_columns:
                                                 if col not in df_view.columns:
@@ -2797,11 +2852,7 @@ if df_original_key in st.session_state:
                                                 if col in {"sku", "name", "price"}:
                                                     continue
 
-                                                cfg = (
-                                                    wcfg.get(col, {})
-                                                    if isinstance(wcfg, dict)
-                                                    else {}
-                                                )
+                                                cfg = wcfg.get(col)
                                                 header_name = header_overrides.get(col)
                                                 column_kwargs: dict[str, Any] = {
                                                     "editable": True
@@ -2813,42 +2864,26 @@ if df_original_key in st.session_state:
                                                         or cfg.get("label")
                                                         or cfg.get("header")
                                                     )
-                                                else:
+                                                elif cfg is not None:
                                                     header_name = (
                                                         header_name
                                                         or getattr(cfg, "label", None)
                                                         or getattr(cfg, "_label", None)
                                                     )
 
-                                                meta = (
-                                                    meta_map_current.get(col, {})
-                                                    if isinstance(meta_map_current, dict)
-                                                    else {}
-                                                )
-                                                ctype_value = (
-                                                    meta.get("frontend_input")
-                                                    or meta.get("backend_type")
-                                                    or ""
-                                                )
-                                                ctype = (
-                                                    ctype_value.lower()
-                                                    if isinstance(ctype_value, str)
-                                                    else ""
-                                                )
-
-                                                if not ctype:
-                                                    if isinstance(cfg, dict):
-                                                        ctype = (cfg.get("type") or "").lower()
-                                                    else:
-                                                        detected_type = _detect_type(cfg)
-                                                        ctype = (detected_type or "").lower()
-
-                                                labels = _options_for_aggrid(
-                                                    col, meta_map_current, labels_all
-                                                )
+                                                if not header_name:
+                                                    header_name = col.replace("_", " ").title()
 
                                                 if header_name:
                                                     column_kwargs["headerName"] = header_name
+
+                                                meta = (meta_map_current or {}).get(col, {}) or {}
+                                                ctype = str(
+                                                    meta.get("frontend_input") or ""
+                                                ).lower()
+
+                                                if col == "categories":
+                                                    ctype = "multiselect"
 
                                                 if ctype == "boolean":
                                                     gb.configure_column(
@@ -2857,19 +2892,13 @@ if df_original_key in st.session_state:
                                                         cellRenderer="agCheckboxCellRenderer",
                                                         **column_kwargs,
                                                     )
-                                                elif ctype == "select":
-                                                    gb.configure_column(
-                                                        col,
-                                                        cellEditor="agRichSelectCellEditor",
-                                                        cellEditorParams={
-                                                            "values": labels,
-                                                            "allowTyping": True,
-                                                            "filterList": True,
-                                                            "multiple": False,
-                                                        },
-                                                        **column_kwargs,
+                                                elif ctype in {"select", "multiselect"}:
+                                                    labels = meta_options(col)
+                                                    v2l = values_to_labels_map(col)
+                                                    l2v = labels_to_values_map(col)
+                                                    is_multi = (
+                                                        ctype == "multiselect"
                                                     )
-                                                elif ctype == "multiselect":
                                                     gb.configure_column(
                                                         col,
                                                         cellEditor="agRichSelectCellEditor",
@@ -2877,8 +2906,12 @@ if df_original_key in st.session_state:
                                                             "values": labels,
                                                             "allowTyping": True,
                                                             "filterList": True,
-                                                            "multiple": True,
+                                                            "multiple": is_multi,
                                                         },
+                                                        valueFormatter=make_value_formatter(v2l),
+                                                        valueSetter=make_value_setter(
+                                                            l2v, is_multi
+                                                        ),
                                                         **column_kwargs,
                                                     )
                                                 else:
@@ -2890,6 +2923,37 @@ if df_original_key in st.session_state:
                                                 stopEditingWhenCellsLoseFocus=True,
                                                 rowSelection="none",
                                             )
+
+                                            if st.checkbox(
+                                                f"DEBUG options {current_set_id}",
+                                                key=f"dbg_{current_set_id}",
+                                            ):
+                                                st.write(
+                                                    "meta_map keys:",
+                                                    list((meta_map_current or {}).keys())[:10],
+                                                )
+                                                for probe in (
+                                                    "brand",
+                                                    "condition",
+                                                    "categories",
+                                                ):
+                                                    if probe in (meta_map_current or {}):
+                                                        st.write(
+                                                            probe,
+                                                            {
+                                                                "type": (
+                                                                    meta_map_current[probe].get(
+                                                                        "frontend_input"
+                                                                    )
+                                                                ),
+                                                                "opts": len(
+                                                                    meta_options(probe)
+                                                                ),
+                                                                "v2l": list(
+                                                                    values_to_labels_map(probe).items()
+                                                                )[:5],
+                                                            },
+                                                        )
 
                                             grid = AgGrid(
                                                 df_view,
@@ -2924,36 +2988,36 @@ if df_original_key in st.session_state:
                                             editor_df = editor_df.reindex(columns=df_view.columns)
 
                                             def _to_list(value: Any) -> list[Any]:
-                                                if value is None or value == "":
+                                                if value is None or value == "" or value == []:
                                                     return []
                                                 if isinstance(value, list):
                                                     return value
-                                                if isinstance(value, str):
-                                                    return [
-                                                        item.strip()
-                                                        for item in value.split(",")
-                                                        if item.strip()
-                                                    ]
                                                 return [value]
 
-                                            if isinstance(wcfg, dict):
-                                                for col_name, cfg in wcfg.items():
-                                                    if col_name not in editor_df.columns:
-                                                        continue
-                                                    if isinstance(cfg, dict):
-                                                        cfg_type = (cfg.get("type") or "").lower()
-                                                    else:
-                                                        cfg_type, _ = _detect_type(cfg)
-                                                        cfg_type = cfg_type or ""
-                                                    if cfg_type == "multiselect":
-                                                        editor_df[col_name] = editor_df[
-                                                            col_name
-                                                        ].apply(_to_list)
+                                            multi_columns = {
+                                                col_name
+                                                for col_name, meta in (meta_map_current or {}).items()
+                                                if isinstance(meta, dict)
+                                                and str(
+                                                    meta.get("frontend_input") or ""
+                                                ).lower()
+                                                == "multiselect"
+                                            }
 
                                             for column in editor_df.columns:
-                                                editor_df[column] = editor_df[
-                                                    column
-                                                ].astype(object)
+                                                if (
+                                                    column == "categories"
+                                                    or column in multi_columns
+                                                ):
+                                                    editor_df[column] = (
+                                                        editor_df[column]
+                                                        .apply(_to_list)
+                                                        .astype(object)
+                                                    )
+                                                else:
+                                                    editor_df[column] = editor_df[
+                                                        column
+                                                    ].astype(object)
 
                                             base_synced = (
                                                 step2_state.get("wide_synced", {})
