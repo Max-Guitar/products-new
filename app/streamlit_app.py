@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 import sys
 from pathlib import Path
-from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -18,8 +16,6 @@ import re
 
 import pandas as pd
 import streamlit as st
-from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
-from st_aggrid.shared import JsCode
 
 st.set_page_config(
     page_title="🤖 Peter v.1.0 (AI Content Manager)",
@@ -28,34 +24,8 @@ st.set_page_config(
 )
 st.title("🤖 Peter v.1.0 (AI Content Manager)")
 
-st.markdown(
-    """
-<style>
-.ag-theme-balham .ag-cell,
-.ag-theme-balham .ag-header-cell {
-  border-right: 1px solid #eee !important;
-}
-.ag-theme-balham .ag-header {
-  border-bottom: 1px solid #e6e6e6 !important;
-}
-.ag-theme-balham .ag-root-wrapper,
-.ag-theme-balham .ag-root-wrapper-body,
-.ag-theme-balham .ag-center-cols-viewport {
-  overflow: visible !important;
-}
-.ag-popup, .ag-popup-editor, .ag-menu, .ag-select-list {
-  z-index: 9999 !important;
-}
-.block-container, .stApp {
-  overflow: visible !important;
-}
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
 from connectors.magento.attributes import AttributeMetaCache
-from connectors.magento.categories import ensure_categories_meta, get_categories_tree
+from connectors.magento.categories import ensure_categories_meta
 from connectors.magento.client import get_default_products
 from services.ai_fill import (
     ALWAYS_ATTRS,
@@ -95,357 +65,6 @@ _ATTRIBUTE_SET_ICONS = {
 _DEFAULT_ATTRIBUTE_ICON = "🧩"
 
 
-EMPTY_ID = ""
-EMPTY_LABEL = "(none)"
-
-
-TagCellRenderer = JsCode(
-    """
-class TagCellRenderer {
-  init(params) {
-    const v2l = (params.colDef.cellRendererParams && params.colDef.cellRendererParams.v2l) || {};
-    const toLabel = (x) => v2l[String(x)] || String(x || "");
-
-    this.eGui = document.createElement('div');
-    this.eGui.style.display = 'flex';
-    this.eGui.style.flexWrap = 'nowrap';
-    this.eGui.style.alignItems = 'center';
-    this.eGui.style.gap = '6px';
-    this.eGui.style.overflow = 'hidden';
-    this.eGui.style.whiteSpace = 'nowrap';
-    this.eGui.style.textOverflow = 'ellipsis';
-
-    const values = Array.isArray(params.value) ? params.value : (params.value ? [params.value] : []);
-    const labels = values.map(toLabel);
-
-    labels.forEach(lbl => {
-      const pill = document.createElement('span');
-      pill.textContent = lbl;
-      pill.style.display = 'inline-flex';
-      pill.style.alignItems = 'center';
-      pill.style.padding = '2px 8px';
-      pill.style.border = '1px solid #DDD';
-      pill.style.borderRadius = '999px';
-      pill.style.background = '#f7f7f9';
-      pill.style.fontSize = '12px';
-      pill.style.whiteSpace = 'nowrap';
-      this.eGui.appendChild(pill);
-    });
-  }
-  getGui(){ return this.eGui; }
-  refresh(){ return false; }
-}
-"""
-)
-
-
-TagMultiEditor = JsCode(
-    """
-class TagMultiEditor {
-  init(params) {
-    this.params = params;
-    const labels = (params && params.values) || [];
-    this.v2l = (params && params.v2l) || {};
-    this.l2v = (params && params.l2v) || {};
-    const toId  = (s) => this.l2v.hasOwnProperty(String(s)) ? this.l2v[String(s)] : String(s);
-    const toLbl = (id) => this.v2l.hasOwnProperty(String(id)) ? this.v2l[String(id)] : String(id);
-
-    this.selected = Array.isArray(params.value) ? params.value.map(v => String(v)) :
-                    (params.value ? [String(params.value)] : []);
-
-    this.root = document.createElement('div');
-    this.root.style.padding = '8px';
-    this.root.style.minWidth = '360px';
-    this.root.style.maxWidth = '560px';
-
-    this.tags = document.createElement('div');
-    this.tags.style.display = 'flex';
-    this.tags.style.flexWrap = 'nowrap';
-    this.tags.style.gap = '6px';
-    this.tags.style.whiteSpace = 'nowrap';
-    this.tags.style.overflow = 'hidden';
-    this.tags.style.textOverflow = 'ellipsis';
-    this.tags.style.marginBottom = '8px';
-    this.root.appendChild(this.tags);
-
-    const row = document.createElement('div');
-    row.style.display = 'flex';
-    row.style.gap = '8px';
-
-    this.input = document.createElement('input');
-    this.input.type = 'text';
-    this.input.placeholder = 'Type to search…';
-    this.input.style.flex = '1';
-    this.input.style.padding = '6px 8px';
-    this.input.style.border = '1px solid #DDD';
-    this.input.style.borderRadius = '6px';
-
-    this.addBtn = document.createElement('button');
-    this.addBtn.textContent = 'Add';
-    this.addBtn.style.padding = '6px 10px';
-
-    row.appendChild(this.input);
-    row.appendChild(this.addBtn);
-    this.root.appendChild(row);
-
-    this.sugg = document.createElement('div');
-    this.sugg.style.border = '1px solid #EEE';
-    this.sugg.style.marginTop = '6px';
-    this.sugg.style.maxHeight = '0px';
-    this.root.appendChild(this.sugg);
-
-    const renderTags = () => {
-      this.tags.innerHTML = '';
-      this.selected.forEach(id => {
-        const pill = document.createElement('span');
-        pill.textContent = toLbl(id);
-        pill.style.padding = '2px 8px';
-        pill.style.border = '1px solid #DDD';
-        pill.style.borderRadius = '999px';
-        pill.style.background = '#f7f7f9';
-        pill.style.fontSize = '12px';
-        pill.style.display = 'inline-flex';
-        pill.style.alignItems = 'center';
-        pill.style.gap = '6px';
-        pill.style.whiteSpace = 'nowrap';
-
-        const x = document.createElement('span');
-        x.textContent = '×';
-        x.style.cursor = 'pointer';
-        x.onclick = () => { this.selected = this.selected.filter(v => v !== id); renderTags(); };
-        pill.appendChild(x);
-        this.tags.appendChild(pill);
-      });
-    };
-
-    const addLabel = (lbl) => {
-      const s = String(lbl || '').trim();
-      if (!s) return;
-      const id = toId(s);
-      if (!this.selected.includes(String(id))) {
-        this.selected.push(String(id));
-        renderTags();
-      }
-    };
-
-    this.input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { addLabel(this.input.value); this.input.value=''; }
-      if (e.key === 'Backspace' && !this.input.value) { this.selected.pop(); renderTags(); }
-    });
-    this.addBtn.onclick = () => { addLabel(this.input.value); this.input.value=''; };
-
-    renderTags();
-  }
-  getGui(){ return this.root; }
-  afterGuiAttached(){ if (this.input) this.input.focus(); }
-  getValue(){ return this.selected.slice(); }
-  destroy(){}
-  isPopup(){ return true; }
-}
-"""
-)
-
-
-TagOneLineRenderer = JsCode(
-    """
-class TagOneLineRenderer {
-  init(p){
-    const map = (p.colDef.cellRendererParams && p.colDef.cellRendererParams.v2l) || {};
-    this.eGui = document.createElement('div');
-    this.eGui.style.display='flex';
-    this.eGui.style.flexWrap='nowrap';
-    this.eGui.style.alignItems='center';
-    this.eGui.style.gap='6px';
-    this.eGui.style.overflow='hidden';
-    this.eGui.style.whiteSpace='nowrap';
-    this.eGui.style.textOverflow='ellipsis';
-    const values = Array.isArray(p.value) ? p.value : (p.value ? [p.value] : []);
-    values.map(v=>map[String(v)]||String(v||"")).forEach(lbl=>{
-      const pill=document.createElement('span');
-      pill.textContent=lbl;
-      pill.style.padding='2px 8px';
-      pill.style.border='1px solid #DDD';
-      pill.style.borderRadius='999px';
-      pill.style.background='#f7f7f9';
-      pill.style.fontSize='12px';
-      pill.style.whiteSpace='nowrap';
-      this.eGui.appendChild(pill);
-    });
-  }
-  getGui(){return this.eGui}
-  refresh(){return false}
-}
-"""
-)
-
-
-TreeMultiEditor = JsCode(
-    """
-class TreeMultiEditor {
-  init(p){
-    this.p=p;
-    const tree = (p && p.tree) || [];
-    const v2l  = (p && p.v2l)  || {};
-    const sel = Array.isArray(p.value) ? p.value.map(String) : (p.value?[String(p.value)]:[]);
-    this.selected = new Set(sel);
-
-    this.root = document.createElement('div');
-    this.root.style.minWidth='540px';
-    this.root.style.maxWidth='740px';
-    this.root.style.maxHeight='70vh';
-    this.root.style.overflow='auto';
-    this.root.style.padding='8px';
-
-    const sWrap=document.createElement('div');
-    sWrap.style.display='flex';
-    sWrap.style.marginBottom='8px';
-    const input=document.createElement('input');
-    input.type='text'; input.placeholder='Search categories...';
-    input.style.flex='1'; input.style.padding='6px 8px';
-    input.style.border='1px solid #DDD'; input.style.borderRadius='6px';
-    sWrap.appendChild(input); this.root.appendChild(sWrap);
-
-    this.treeBox=document.createElement('div'); this.root.appendChild(this.treeBox);
-
-    const renderNode=(node, level=0)=>{
-      const row=document.createElement('div');
-      row.style.display='flex'; row.style.alignItems='center';
-      row.style.gap='8px'; row.style.padding='4px 4px 4px '+(12*level)+'px';
-      const cb=document.createElement('input'); cb.type='checkbox';
-      const id=String(node.id||""); const name=String(node.name||"");
-      cb.checked=this.selected.has(id);
-      cb.onchange=()=>{ if(cb.checked) this.selected.add(id); else this.selected.delete(id); };
-      const lbl=document.createElement('span'); lbl.textContent=name;
-      row.appendChild(cb); row.appendChild(lbl);
-      return {row, cb};
-    };
-
-    const renderTree=(nodes, box, level=0)=>{
-      (nodes||[]).forEach(nd=>{
-        const {row}=renderNode(nd, level);
-        box.appendChild(row);
-        const ch=nd.children_data||[];
-        if(ch.length){
-          renderTree(ch, box, level+1);
-        }
-      });
-    };
-
-    const fullTree = (this.p.treeData || []).length ? this.p.treeData : tree;
-    const build = (filter='')=>{
-      this.treeBox.innerHTML='';
-      if(!filter){
-        renderTree(fullTree, this.treeBox, 0);
-      }else{
-        const q=filter.toLowerCase();
-        Object.keys(v2l).forEach(id=>{
-          const path=v2l[id].toLowerCase();
-          if(path.includes(q)){
-            const row=document.createElement('div');
-            row.style.display='flex'; row.style.alignItems='center';
-            row.style.gap='8px'; row.style.padding='4px';
-            const cb=document.createElement('input'); cb.type='checkbox';
-            cb.checked=this.selected.has(id);
-            cb.onchange=()=>{ if(cb.checked) this.selected.add(id); else this.selected.delete(id); };
-            const lbl=document.createElement('span'); lbl.textContent=v2l[id];
-            row.appendChild(cb); row.appendChild(lbl);
-            this.treeBox.appendChild(row);
-          }
-        });
-      }
-    };
-
-    input.addEventListener('input', ()=>build(input.value));
-    build('');
-  }
-  getGui(){ return this.root }
-  afterGuiAttached(){}
-  getValue(){ return Array.from(this.selected) }
-  isPopup(){ return true }
-  destroy(){}
-}
-"""
-)
-
-
-SearchableSelectEditor = JsCode(
-    """
-class SearchableSelectEditor {
-  init(p){
-    this.p=p;
-    const labels=(p && p.values)||[];
-    this.l2v=p.l2v||{};
-    const toId=(s)=>this.l2v.hasOwnProperty(String(s))?this.l2v[String(s)]:String(s);
-    const cur=p.value!=null?String(p.value):"";
-
-    this.root=document.createElement('div');
-    this.root.style.minWidth='280px'; this.root.style.maxHeight='50vh';
-    this.root.style.overflow='auto'; this.root.style.padding='8px';
-
-    const input=document.createElement('input');
-    input.type='text'; input.placeholder='Search...';
-    input.style.width='100%'; input.style.padding='6px 8px';
-    input.style.border='1px solid #DDD'; input.style.borderRadius='6px';
-    this.root.appendChild(input);
-
-    const box=document.createElement('div');
-    box.style.marginTop='6px'; this.root.appendChild(box);
-
-    const render=(q='')=>{
-      box.innerHTML='';
-      const pool=labels.filter(l=>l.toLowerCase().includes(q.toLowerCase()));
-      pool.forEach(lbl=>{
-        const row=document.createElement('div');
-        row.textContent=lbl; row.style.padding='6px 8px'; row.style.cursor='pointer';
-        row.onmouseenter=()=>row.style.background='#f0f4ff';
-        row.onmouseleave=()=>row.style.background='white';
-        row.onclick=()=>{ this.value=toId(lbl); };
-        box.appendChild(row);
-      });
-    };
-    input.addEventListener('input', ()=>render(input.value));
-    render('');
-    this.value=cur;
-  }
-  getGui(){return this.root}
-  afterGuiAttached(){}
-  getValue(){return this.value}
-  isPopup(){return true}
-  destroy(){}
-}
-"""
-)
-
-
-HtmlEditor = JsCode(
-    """
-class HtmlEditor {
-  init(p){
-    this.p=p;
-    const val = (p.value==null) ? "" : String(p.value);
-    this.root=document.createElement('div');
-    this.root.style.minWidth='500px'; this.root.style.maxWidth='800px';
-    this.root.style.maxHeight='70vh'; this.root.style.overflow='auto';
-    const box=document.createElement('div');
-    box.contentEditable='true';
-    box.style.minHeight='140px';
-    box.style.padding='8px';
-    box.style.border='1px solid #DDD';
-    box.style.borderRadius='6px';
-    box.innerHTML=val;
-    this.root.appendChild(box);
-    this.box=box;
-  }
-  getGui(){return this.root}
-  afterGuiAttached(){ this.box.focus(); }
-  getValue(){ return this.box.innerHTML; }
-  isPopup(){ return true }
-  destroy(){}
-}
-"""
-)
-
-
 BASE_ORDER = [
     "sku",
     "name",
@@ -455,240 +74,113 @@ BASE_ORDER = [
     "brand",
 ]
 
-ALIASES = {
-    "product type (attribute set)": "attribute_set_id",
-    "attribute set": "attribute_set_id",
-    "cases covers": "cases_covers",
-    "short description": "short_description",
-    "guitar style": "guitarstylemultiplechoice",
-    "series": "series",
-    "model": "model",
-    "amp type": "amp_type",
-    "effect type": "effect_type",
-    "accessory type": "accessory_type",
-    "power (watt)": "power_watt",
-    "built in fx": "built_in_fx",
-    "footswitch included": "footswitch_included",
-    "cover included": "cover_included",
-    "power polarity": "power_polarity",
-}
-
-
-def norm_name(s: str) -> str:
-    k = (s or "").strip().lower()
-    return ALIASES.get(k, k).replace(" ", "_")
-
-
-ORDER_BY_SET_NAME = {
-    "acoustic guitar": [
-        "series",
-        "acoustic_guitar_style",
-        "acoustic_body_shape",
-        "body_material",
-        "top_material",
-        "finish",
-        "bridge",
-        "controls",
-        "acoustic_pickup",
-        "neck_profile",
-        "neck_material",
-        "neck_radius",
-        "neck_nutwidth",
-        "fretboard_material",
-        "tuning_machines",
-        "scale_mensur",
-        "amount_of_frets",
-        "no_strings",
-        "orientation",
-        "acoustic_cutaway",
-        "electro_acoustic",
-        "kids_size",
-        "vintage",
-        "cases_covers",
-        "categories",
-        "short_description",
-    ],
-    "electric guitar": [
-        "series",
-        "model",
-        "guitarstylemultiplechoice",
-        "body_material",
-        "top_material",
-        "finish",
-        "bridge_type",
-        "bridge",
-        "pickup_config",
-        "bridge_pickup",
-        "middle_pickup",
-        "neck_pickup",
-        "controls",
-        "neck_profile",
-        "neck_material",
-        "neck_radius",
-        "neck_nutwidth",
-        "fretboard_material",
-        "tuning_machines",
-        "scale_mensur",
-        "amount_of_frets",
-        "no_strings",
-        "orientation",
-        "semi_hollow_body",
-        "kids_size",
-        "vintage",
-        "cases_covers",
-        "categories",
-        "short_description",
-    ],
-    "electric guitars": [
-        "series",
-        "model",
-        "guitarstylemultiplechoice",
-        "body_material",
-        "top_material",
-        "finish",
-        "bridge_type",
-        "bridge",
-        "pickup_config",
-        "bridge_pickup",
-        "middle_pickup",
-        "neck_pickup",
-        "controls",
-        "neck_profile",
-        "neck_material",
-        "neck_radius",
-        "neck_nutwidth",
-        "fretboard_material",
-        "tuning_machines",
-        "scale_mensur",
-        "amount_of_frets",
-        "no_strings",
-        "orientation",
-        "semi_hollow_body",
-        "kids_size",
-        "vintage",
-        "cases_covers",
-        "categories",
-        "short_description",
-    ],
-    "bass guitar": [
-        "series",
-        "model",
-        "body_material",
-        "top_material",
-        "finish",
-        "bridge",
-        "pickup_config",
-        "bridge_pickup",
-        "middle_pickup",
-        "neck_pickup",
-        "controls",
-        "neck_profile",
-        "neck_material",
-        "neck_radius",
-        "neck_nutwidth",
-        "fretboard_material",
-        "tuning_machines",
-        "scale_mensur",
-        "amount_of_frets",
-        "no_strings",
-        "orientation",
-        "acoustic_bass",
-        "kids_size",
-        "vintage",
-        "cases_covers",
-        "categories",
-        "short_description",
-    ],
-    "amps": [
-        "series",
-        "model",
-        "amp_type",
-        "built_in_fx",
-        "cover_included",
-        "footswitch_included",
-        "battery",
-        "power",
-        "power_watt",
-        "power_polarity",
-        "controls",
-        "categories",
-        "short_description",
-    ],
-    "effects": [
-        "series",
-        "model",
-        "brand",
-        "effect_type",
-        "controls",
-        "battery",
-        "power",
-        "power_polarity",
-        "vintage",
-        "categories",
-        "short_description",
-    ],
-    "accessories": [
-        "accessory_type",
-        "type",
-        "cables",
-        "strings",
-        "cases_covers",
-        "merchandise",
-        "parts",
-        "categories",
-        "short_description",
-    ],
-}
-
-ORDER_BY_SET_NAME["acoustic guitars"] = ORDER_BY_SET_NAME["acoustic guitar"]
-ORDER_BY_SET_NAME["bass guitars"] = ORDER_BY_SET_NAME["bass guitar"]
-ORDER_BY_SET_NAME["amplifiers"] = ORDER_BY_SET_NAME["amps"]
-
 
 def build_column_order_for_set(
-    df_cols: list[str], set_name: str | None
+    df_cols: list[str], set_id: int, set_name: str | None = None
 ) -> list[str]:
-    normalized_to_actual: dict[str, str] = {}
-    ordered_actual: list[str] = []
-    for col in df_cols:
-        if col == "attribute_set_id":
-            continue
-        normalized = norm_name(col)
-        if normalized not in normalized_to_actual:
-            normalized_to_actual[normalized] = col
-            ordered_actual.append(col)
+    alias = {
+        "cases covers": "cases_covers",
+        "guitarstylemultiplechoice": "guitarstylemultiplechoice",
+        "short description": "short_description",
+        "attribute set": "attribute_set_id",
+        "product type (attribute set)": "attribute_set_id",
+    }
 
-    name = (set_name or "").strip().lower()
+    def norm(cols: Iterable[str | None]) -> list[str]:
+        out: list[str] = []
+        for c in cols:
+            k = (c or "").strip()
+            lowered = k.lower()
+            mapped = alias.get(lowered, k)
+            out.append(mapped)
+        return out
 
-    base_candidates = [norm_name(c) for c in BASE_ORDER]
-    base = [
-        normalized_to_actual[norm]
-        for norm in base_candidates
-        if norm in normalized_to_actual
-    ]
+    order = norm(BASE_ORDER)
 
-    specific_list = ORDER_BY_SET_NAME.get(name, [])
-    specific_candidates = [norm_name(c) for c in specific_list]
-    specific = [
-        normalized_to_actual[norm]
-        for norm in specific_candidates
-        if norm in normalized_to_actual
-    ]
+    per_set: list[str]
+    name_lc = (set_name or "").strip().lower()
+    if name_lc == "acoustic guitar":
+        per_set = norm(
+            [
+                "series",
+                "acoustic_guitar_style",
+                "acoustic_body_shape",
+                "body_material",
+                "top_material",
+                "finish",
+                "bridge",
+                "controls",
+                "acoustic_pickup",
+                "neck_profile",
+                "neck_material",
+                "neck_radius",
+                "neck_nutwidth",
+                "fretboard_material",
+                "tuning_machines",
+                "scale_mensur",
+                "amount_of_frets",
+                "no_strings",
+                "orientation",
+                "acoustic_cutaway",
+                "electro_acoustic",
+                "kids_size",
+                "vintage",
+                "cases_covers",
+                "categories",
+                "short_description",
+            ]
+        )
+    elif name_lc == "electric guitars":
+        per_set = norm(
+            [
+                "series",
+                "model",
+                "guitarstylemultiplechoice",
+                "body_material",
+                "top_material",
+                "finish",
+                "bridge_type",
+                "bridge",
+                "pickup_config",
+                "bridge_pickup",
+                "middle_pickup",
+                "neck_pickup",
+                "controls",
+                "neck_profile",
+                "neck_material",
+                "neck_radius",
+                "neck_nutwidth",
+                "fretboard_material",
+                "tuning_machines",
+                "scale_mensur",
+                "amount_of_frets",
+                "no_strings",
+                "orientation",
+                "semi_hollow_body",
+                "kids_size",
+                "vintage",
+                "cases_covers",
+                "categories",
+                "short_description",
+            ]
+        )
+    else:
+        per_set = []
 
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for seq in (base, specific):
-        for actual in seq:
-            if actual not in seen:
-                seen.add(actual)
-                ordered.append(actual)
+    seen: dict[str, None] = {}
 
-    for actual in ordered_actual:
-        if actual not in seen:
-            seen.add(actual)
-            ordered.append(actual)
+    def add_seq(seq: Iterable[str]) -> None:
+        for c in seq:
+            if c in df_cols and c not in seen:
+                seen[c] = None
 
-    return ordered
+    add_seq(order)
+    add_seq(per_set)
+    for c in df_cols:
+        if c not in seen:
+            seen[c] = None
+
+    return list(seen.keys())
 
 
 ID_RX = re.compile(r"#(\d+)\)?$")
@@ -736,74 +228,6 @@ def _meta_options(meta: dict) -> list:
             seen.add(item)
             unique.append(item)
     return unique
-
-
-def _meta_options_list(meta: dict) -> list[str]:
-    return [
-        str(opt.get("label", "")).strip()
-        for opt in (meta.get("options") or [])
-        if isinstance(opt, dict)
-        and str(opt.get("label", "")).strip()
-    ]
-
-
-def _v2l(meta: dict) -> dict[str, str]:
-    return {
-        str(key): str(value)
-        for key, value in (meta.get("values_to_labels") or {}).items()
-    }
-
-
-def _l2v(meta: dict) -> dict[str, str]:
-    return {
-        str(key): str(value)
-        for key, value in (meta.get("options_map") or {}).items()
-    }
-
-
-def _inject_empty_option(meta: dict):
-    opts = meta.setdefault("options", [])
-    has_empty = any(
-        str(o.get("value", "")) == "" for o in opts if isinstance(o, dict)
-    )
-    if not has_empty:
-        opts.insert(0, {"label": EMPTY_LABEL, "value": EMPTY_ID})
-    v2l = meta.setdefault("values_to_labels", {})
-    l2v = meta.setdefault("options_map", {})
-    v2l[str(EMPTY_ID)] = EMPTY_LABEL
-    l2v[str(EMPTY_LABEL)] = str(EMPTY_ID)
-
-
-def _coerce_multiselect_cell(v, l2v: dict[str, str]) -> list[str]:
-    if v is None or v == "" or v == []:
-        return []
-    if isinstance(v, list):
-        out: list[str] = []
-        for el in v:
-            if isinstance(el, dict):
-                val = (
-                    el.get("value")
-                    or el.get("id")
-                    or el.get("category_id")
-                )
-                if val is None:
-                    lbl = str(el.get("label", "")).strip()
-                    if lbl:
-                        val = l2v.get(lbl) or lbl
-                if val is not None:
-                    out.append(str(val))
-            else:
-                s = str(el).strip()
-                out.append(l2v.get(s, s))
-        return out
-    s = str(v).strip()
-    if "," in s:
-        return [
-            l2v.get(x.strip(), x.strip())
-            for x in s.split(",")
-            if x.strip()
-        ]
-    return [l2v.get(s, s)]
 
 
 def _attr_set_icon(name: str) -> str:
@@ -1487,13 +911,9 @@ def _apply_categories_fallback(meta_map: dict[str, dict]) -> None:
     if not st.session_state.get("step2_categories_failed"):
         return
     meta = meta_map.get("categories")
-    if isinstance(meta, dict) and meta.get("options"):
-        return
-    fallback = meta_map.setdefault("categories", {})
-    fallback["frontend_input"] = "text"
-    fallback.pop("options", None)
-    fallback.pop("options_map", None)
-    fallback.pop("values_to_labels", None)
+    if isinstance(meta, dict):
+        meta["frontend_input"] = "text"
+        meta.pop("options", None)
 
 
 def colcfg_from_meta(
@@ -2937,56 +2357,6 @@ if df_original_key in st.session_state:
 
                                 _pupdate(40, "Fetching metadata from Magento…")
 
-                                if (
-                                    "categories_tree" not in step2_state
-                                    or "categories_v2l" not in step2_state
-                                ):
-                                    try:
-                                        categories_tree = get_categories_tree(
-                                            session, api_base
-                                        )
-                                    except Exception:
-                                        categories_tree = {}
-                                    if not isinstance(categories_tree, dict):
-                                        categories_tree = {}
-
-                                    def _flatten_tree(node: Any, prefix: str = "") -> list[dict[str, str]]:
-                                        out: list[dict[str, str]] = []
-                                        if not isinstance(node, dict):
-                                            return out
-                                        label = str(node.get("name") or "").strip()
-                                        cat_id = str(node.get("id") or "").strip()
-                                        path = f"{prefix} / {label}".strip(" /")
-                                        if cat_id and label:
-                                            out.append({
-                                                "id": cat_id,
-                                                "label": label,
-                                                "path": path,
-                                            })
-                                        children = node.get("children_data") or []
-                                        for child in children:
-                                            out.extend(_flatten_tree(child, path))
-                                        return out
-
-                                    flat: list[dict[str, str]] = []
-                                    if categories_tree:
-                                        flat = _flatten_tree(categories_tree)
-
-                                    step2_state["categories_tree"] = categories_tree
-                                    step2_state["categories_flat"] = flat
-                                    v2l = {
-                                        item["id"]: item["path"]
-                                        for item in flat
-                                        if item.get("id") and item.get("path")
-                                    }
-                                    l2v = {
-                                        item["path"]: item["id"]
-                                        for item in flat
-                                        if item.get("id") and item.get("path")
-                                    }
-                                    step2_state["categories_v2l"] = v2l
-                                    step2_state["categories_l2v"] = l2v
-
                                 categories_meta = step2_state.get("categories_meta")
                                 if not isinstance(categories_meta, dict) or not categories_meta.get(
                                     "options"
@@ -3015,40 +2385,12 @@ if df_original_key in st.session_state:
                                         categories_meta = (
                                             meta_cache.get("categories")
                                             if isinstance(meta_cache, AttributeMetaCache)
-                                        else {}
-                                    )
-                                    st.session_state["step2_categories_failed"] = True
+                                            else {}
+                                        )
+                                        st.session_state["step2_categories_failed"] = True
+                                    step2_state["categories_meta"] = categories_meta
                                 else:
                                     st.session_state["step2_categories_failed"] = False
-
-                                if not isinstance(categories_meta, dict):
-                                    categories_meta = {}
-                                step2_state["categories_meta"] = categories_meta
-
-                                step2_state["categories_all_labels"] = [
-                                    o.get("label", "")
-                                    for o in (categories_meta.get("options") or [])
-                                    if isinstance(o, dict)
-                                ]
-
-                                wide_meta_all = step2_state.get("wide_meta")
-                                if isinstance(wide_meta_all, dict):
-                                    for sid, meta_map_all in wide_meta_all.items():
-                                        if not isinstance(meta_map_all, dict):
-                                            continue
-                                        categories_slot = meta_map_all.setdefault(
-                                            "categories", {}
-                                        )
-                                        categories_slot["frontend_input"] = "multiselect"
-                                        categories_slot["options"] = (
-                                            categories_meta.get("options", []) or []
-                                        )
-                                        categories_slot["options_map"] = (
-                                            categories_meta.get("options_map", {}) or {}
-                                        )
-                                        categories_slot["values_to_labels"] = (
-                                            categories_meta.get("values_to_labels", {}) or {}
-                                        )
 
                                 _pupdate(45, "Preparing categories (full tree)…")
 
@@ -3074,9 +2416,6 @@ if df_original_key in st.session_state:
                                         for opt in (categories_meta.get("options") or [])
                                         if isinstance(opt, dict) and opt.get("label")
                                     ]
-                                    step2_state[
-                                        "categories_all_labels"
-                                    ] = labels_all.copy()
                                     total_rows = sum(
                                         len(df)
                                         for df in step2_state["wide"].values()
@@ -3234,420 +2573,94 @@ if df_original_key in st.session_state:
                                                     columns=["attribute_set_id"]
                                                 )
 
-                                            set_name = attribute_set_names.get(
-                                                current_set_id, ""
-                                            )
                                             ordered_columns = build_column_order_for_set(
-                                                list(group.columns), set_name
+                                                df_cols=list(group.columns),
+                                                set_id=current_set_id,
+                                                set_name=attribute_set_names.get(
+                                                    current_set_id, ""
+                                                ),
+                                            )
+                                            ordered_columns = _pin_sku_name(
+                                                ordered_columns, list(group.columns)
                                             )
 
-                                            wide_meta_map = step2_state.get(
-                                                "wide_meta", {}
-                                            )
-                                            if not isinstance(wide_meta_map, dict):
-                                                wide_meta_map = {}
-                                            meta_map_current = wide_meta_map.get(
-                                                current_set_id, {}
-                                            )
-                                            if not isinstance(meta_map_current, dict):
-                                                meta_map_current = {}
-
-                                            for col in list(group.columns):
-                                                meta = (meta_map_current or {}).get(
-                                                    col, {}
-                                                ) or {}
-                                                ftype = (
-                                                    meta.get("frontend_input") or ""
-                                                ).lower()
-                                                if ftype in ("select", "multiselect"):
-                                                    _inject_empty_option(meta)
-                                                if ftype == "multiselect":
-                                                    l2v = {
-                                                        str(k): str(v)
-                                                        for k, v in (
-                                                            meta.get("options_map")
-                                                            or {}
-                                                        ).items()
-                                                    }
-                                                    group[col] = (
-                                                        group[col]
-                                                        .apply(
-                                                            lambda x: _coerce_multiselect_cell(
-                                                                x, l2v
-                                                            )
-                                                        )
-                                                        .astype(object)
-                                                    )
-
-                                            df_view = group[ordered_columns].copy()
-                                            wcfg = (
-                                                step2_state.get("wide_colcfg", {})
-                                                .get(current_set_id, {})
-                                            )
-                                            if not isinstance(wcfg, dict):
-                                                wcfg = {}
-
-                                            gb = GridOptionsBuilder.from_dataframe(df_view)
-                                            gb.configure_default_column(
-                                                editable=True,
-                                                wrapText=False,
-                                                autoHeight=False,
-                                            )
-
-                                            if "sku" in df_view.columns:
-                                                gb.configure_column(
-                                                    "sku",
-                                                    pinned="left",
-                                                    editable=False,
-                                                    width=120,
-                                                    headerName="SKU",
+                                            column_config_final = dict(column_config or {})
+                                            if "sku" in group.columns:
+                                                column_config_final[
+                                                    "sku"
+                                                ] = st.column_config.Column(
+                                                    label="SKU",
+                                                    disabled=True,
+                                                    width="small",
                                                 )
-
-                                            if "name" in df_view.columns:
-                                                gb.configure_column(
-                                                    "name",
-                                                    pinned="left",
-                                                    editable=True,
-                                                    width=280,
-                                                    headerName="Name",
+                                            if "name" in group.columns:
+                                                column_config_final[
+                                                    "name"
+                                                ] = st.column_config.TextColumn(
+                                                    label="Name",
+                                                    disabled=False,
+                                                    width="medium",
                                                 )
-
-                                            if "price" in df_view.columns:
-                                                gb.configure_column(
-                                                    "price",
-                                                    editable=False,
-                                                    headerName="Price",
+                                            if "price" in group.columns:
+                                                column_config_final[
+                                                    "price"
+                                                ] = st.column_config.NumberColumn(
+                                                    label="Price", disabled=True
                                                 )
-
-                                            header_overrides = {
-                                                "guitarstylemultiplechoice": "Guitar style",
-                                                "amp_type": "Amp type",
-                                                "effect_type": "Effect type",
-                                                "accessory_type": "Accessory type",
-                                                "short_description": "Short Description",
-                                                "cases_covers": "Cases & Covers",
-                                            }
-
-                                            cats_v2l_state = (
-                                                step2_state.get("categories_v2l") or {}
-                                            )
-                                            cats_v2l = {
-                                                str(k): str(v)
-                                                for k, v in cats_v2l_state.items()
-                                            }
-                                            cats_tree_state = step2_state.get("categories_tree")
-                                            if isinstance(cats_tree_state, dict):
-                                                cats_tree_children = (
-                                                    cats_tree_state.get("children_data", []) or []
-                                                )
-                                            elif isinstance(cats_tree_state, list):
-                                                cats_tree_children = cats_tree_state
-                                            else:
-                                                cats_tree_children = []
-
-                                            for col in ordered_columns:
-                                                if col not in df_view.columns:
-                                                    continue
-                                                if col in ("sku", "name", "price"):
-                                                    continue
-
-                                                cfg = wcfg.get(col)
-                                                header_name = header_overrides.get(col)
-                                                if isinstance(cfg, dict):
-                                                    header_name = (
-                                                        header_name
-                                                        or cfg.get("label")
-                                                        or cfg.get("header")
-                                                    )
-                                                elif cfg is not None:
-                                                    header_name = (
-                                                        header_name
-                                                        or getattr(cfg, "label", None)
-                                                        or getattr(cfg, "_label", None)
-                                                    )
-
-                                                if not header_name:
-                                                    header_name = col.replace("_", " ").title()
-
-                                                column_kwargs: dict[str, Any] = {}
-                                                if header_name:
-                                                    column_kwargs["headerName"] = header_name
-
-                                                meta = (meta_map_current or {}).get(col, {}) or {}
-                                                ftype = (
-                                                    meta.get("frontend_input") or ""
-                                                ).lower()
-                                                if ftype in ("select", "multiselect"):
-                                                    _inject_empty_option(meta)
-                                                labels = [
-                                                    str(o.get("label", "")).strip()
-                                                    for o in (meta.get("options") or [])
-                                                    if isinstance(o, dict)
-                                                    and str(o.get("label", "")).strip()
+                                            if "guitarstylemultiplechoice" in column_config_final:
+                                                cfg = column_config_final[
+                                                    "guitarstylemultiplechoice"
                                                 ]
-                                                v2l = {
-                                                    str(k): str(v)
-                                                    for k, v in (
-                                                        meta.get("values_to_labels")
-                                                        or {}
-                                                    ).items()
-                                                }
-                                                l2v = {
-                                                    str(k): str(v)
-                                                    for k, v in (
-                                                        meta.get("options_map") or {}
-                                                    ).items()
-                                                }
+                                                if hasattr(cfg, "label"):
+                                                    cfg.label = "Guitar style"
+                                                elif hasattr(cfg, "_label"):
+                                                    cfg._label = "Guitar style"
 
-                                            if col == "short_description":
-                                                gb.configure_column(
-                                                    col,
-                                                    editable=True,
-                                                    cellEditor=HtmlEditor,
-                                                    cellEditorPopup=True,
-                                                    cellEditorPopupPosition="over",
-                                                    valueFormatter=JsCode(
-                                                        """
-                        function(p){
-                          var s = String(p.value||"");
-                          var div=document.createElement('div'); div.innerHTML=s;
-                          return (div.textContent||div.innerText||"").replace(/\s+/g,' ').trim();
-                        }
-                        """
-                                                        ),
-                                                        **column_kwargs,
-                                                    )
-                                                    continue
-
-                                                if col == "categories":
-                                                    cats_formatter = JsCode(
-                                                        f"""
-                        function(p){{
-                          var m={json.dumps(cats_v2l)};
-                          var v=p.value;
-                          if(Array.isArray(v)) return v.map(x=>m[String(x)]||String(x)).join(\", \");
-                          return v==null?\"\":(m[String(v)]||String(v));
-                        }}
-                        """
-                                                    )
-                                                    gb.configure_column(
-                                                        col,
-                                                        editable=True,
-                                                        cellRenderer=TagOneLineRenderer,
-                                                        cellRendererParams={"v2l": cats_v2l},
-                                                        cellEditor=TreeMultiEditor,
-                                                        cellEditorParams={
-                                                            "tree": cats_tree_children,
-                                                            "v2l": cats_v2l,
-                                                        },
-                                                        cellEditorPopup=True,
-                                                        cellEditorPopupPosition="over",
-                                                        valueFormatter=cats_formatter,
-                                                        **column_kwargs,
-                                                    )
-                                                    continue
-
-                                                if ftype == "boolean":
-                                                    gb.configure_column(
-                                                        col,
-                                                        editable=True,
-                                                        cellEditor="agCheckboxCellEditor",
-                                                        cellRenderer="agCheckboxCellRenderer",
-                                                        **column_kwargs,
-                                                    )
-                                                    continue
-
-                                                if ftype == "select":
-                                                    gb.configure_column(
-                                                        col,
-                                                        editable=True,
-                                                        cellEditor=SearchableSelectEditor,
-                                                        cellEditorParams={
-                                                            "values": labels,
-                                                            "l2v": l2v,
-                                                        },
-                                                        cellEditorPopup=True,
-                                                        cellEditorPopupPosition="over",
-                                                        valueFormatter=JsCode(
-                                                            f"function(p){{var m={json.dumps(v2l)};var v=p.value;return m[String(v)]||String(v||'');}}"
-                                                        ),
-                                                        **column_kwargs,
-                                                    )
-                                                continue
-
-                                                if ftype == "multiselect":
-                                                    gb.configure_column(
-                                                        col,
-                                                        editable=True,
-                                                        cellRenderer=TagCellRenderer,
-                                                        cellRendererParams={"v2l": v2l},
-                                                        cellEditor=TagMultiEditor,
-                                                        cellEditorParams={
-                                                            "values": labels,
-                                                            "v2l": v2l,
-                                                            "l2v": l2v,
-                                                        },
-                                                        cellEditorPopup=True,
-                                                        cellEditorPopupPosition="over",
-                                                        valueFormatter=JsCode(
-                                                            f"""
-                      function(p){{
-                        var m={json.dumps(v2l)};
-                        var v=p.value;
-                        if(Array.isArray(v)) return v.map(x=>m[String(x)]||String(x)).join(\", \");
-                        return v==null?\"\":(m[String(v)]||String(v));
-                      }}
-                    """
-                                                        ),
-                                                        **column_kwargs,
-                                                    )
-                                                    continue
-
-                                                gb.configure_column(
-                                                    col,
-                                                    editable=True,
-                                                    **column_kwargs,
-                                                )
-
-                                            gb.configure_grid_options(
-                                                domLayout="autoHeight",
-                                                rowHeight=34,
-                                                popupParent=JsCode("document.body"),
-                                                suppressColumnMove=True,
-                                                singleClickEdit=True,
-                                                stopEditingWhenCellsLoseFocus=True,
-                                                rowSelection="none",
+                                            editor_df = st.data_editor(
+                                                group,
+                                                key=f"editor_set_{current_set_id}",
+                                                column_config={
+                                                    key: value
+                                                    for key, value in column_config_final.items()
+                                                    if key in group.columns
+                                                },
+                                                column_order=ordered_columns,
+                                                use_container_width=True,
+                                                hide_index=True,
+                                                num_rows="fixed",
                                             )
 
-                                            if st.checkbox(
-                                                f"DEBUG options {current_set_id}",
-                                                key=f"dbg_{current_set_id}",
-                                            ):
-                                                st.write(
-                                                    "meta_map keys:",
-                                                    list((meta_map_current or {}).keys())[:10],
-                                                )
-                                                for probe in (
-                                                    "brand",
-                                                    "condition",
-                                                    "categories",
-                                                ):
-                                                    if probe in (meta_map_current or {}):
-                                                        st.write(
-                                                            probe,
-                                                            {
-                                                                "type": (
-                                                                    meta_map_current[probe].get(
-                                                                        "frontend_input"
-                                                                    )
-                                                                ),
-                                                                "opts": len(
-                                                                    _meta_options_list(
-                                                                        meta_map_current.get(
-                                                                            probe, {}
-                                                                        )
-                                                                    )
-                                                                ),
-                                                                "v2l": list(
-                                                                    _v2l(
-                                                                        meta_map_current.get(
-                                                                            probe, {}
-                                                                        )
-                                                                    ).items()
-                                                                )[:5],
-                                                            },
-                                                        )
-
-                                            grid = AgGrid(
-                                                df_view,
-                                                gridOptions=gb.build(),
-                                                update_mode=GridUpdateMode.VALUE_CHANGED,
-                                                allow_unsafe_jscode=True,
-                                                fit_columns_on_grid_load=False,
-                                                theme="balham",
-                                                key=f"aggrid_set_{current_set_id}",
-                                            )
-
-                                            grid_data = grid.get("data", None)
-
-                                            if grid_data is None:
-                                                editor_df = df_view.copy()
-                                            elif isinstance(grid_data, pd.DataFrame):
-                                                editor_df = grid_data.copy()
-                                            elif isinstance(grid_data, list):
-                                                editor_df = pd.DataFrame(grid_data)
-                                            elif isinstance(grid_data, dict):
-                                                editor_df = (
-                                                    pd.DataFrame([grid_data])
-                                                    if grid_data
-                                                    else df_view.copy()
-                                                )
-                                            else:
-                                                editor_df = df_view.copy()
-
-                                            editor_df = editor_df.reindex(columns=df_view.columns)
-
-                                            for column in editor_df.columns:
-                                                meta_for_column = (
-                                                    meta_map_current.get(column, {})
-                                                    if isinstance(meta_map_current, dict)
-                                                    else {}
-                                                )
-                                                if not isinstance(meta_for_column, dict):
-                                                    meta_for_column = {}
-                                                ctype = str(
-                                                    meta_for_column.get(
-                                                        "frontend_input"
-                                                    )
-                                                    or ""
-                                                ).lower()
-                                                if ctype == "multiselect":
-                                                    editor_df[column] = (
-                                                        editor_df[column]
-                                                        .apply(
-                                                            lambda v: (
-                                                                v
-                                                                if isinstance(v, list)
-                                                                else (
-                                                                    []
-                                                                    if v
-                                                                    in (
-                                                                        None,
-                                                                        "",
-                                                                    )
-                                                                    else [
-                                                                        str(v)
-                                                                    ]
-                                                                )
-                                                            )
-                                                        )
-                                                        .astype(object)
-                                                    )
-                                                else:
+                                            if isinstance(editor_df, pd.DataFrame):
+                                                for column in editor_df.columns:
                                                     editor_df[column] = editor_df[
                                                         column
                                                     ].astype(object)
-
-                                            base_synced = (
-                                                step2_state.get("wide_synced", {})
-                                                .get(current_set_id)
-                                            )
-                                            if (
-                                                isinstance(base_synced, pd.DataFrame)
-                                                and "attribute_set_id"
-                                                in base_synced.columns
-                                            ):
-                                                base_synced = base_synced.drop(
-                                                    columns=["attribute_set_id"]
+                                                base_synced = (
+                                                    step2_state.get("wide_synced", {})
+                                                    .get(current_set_id)
                                                 )
-                                            if _df_differs(editor_df, base_synced):
-                                                step2_state["staged"][
-                                                    current_set_id
-                                                ] = editor_df.copy(deep=True)
-                                            else:
-                                                step2_state["staged"].pop(
-                                                    current_set_id, None
-                                                )
+                                                if (
+                                                    isinstance(
+                                                        base_synced, pd.DataFrame
+                                                    )
+                                                    and "attribute_set_id"
+                                                    in base_synced.columns
+                                                ):
+                                                    base_synced = base_synced.drop(
+                                                        columns=["attribute_set_id"]
+                                                    )
+                                                if _df_differs(
+                                                    editor_df, base_synced
+                                                ):
+                                                    step2_state["staged"][
+                                                        current_set_id
+                                                    ] = editor_df.copy(
+                                                        deep=True
+                                                    )
+                                                else:
+                                                    step2_state["staged"].pop(
+                                                        current_set_id, None
+                                                    )
 
                                     _pupdate(100, "Attributes ready")
                                     status2.update(

@@ -8,33 +8,6 @@ import requests
 from connectors.magento.client import magento_get
 
 
-def get_categories_tree(
-    session: requests.Session,
-    base_url: str,
-    root_id: int = 2,
-) -> Dict[str, object]:
-    """Return the Magento categories tree structure.
-
-    The Magento ``/V1/categories`` endpoint already returns the full tree for the
-    configured store view, so we simply fetch it once and reuse the cached
-    response across the application lifecycle.
-
-    Parameters
-    ----------
-    session:
-        Authenticated :class:`requests.Session` instance.
-    base_url:
-        Base Magento REST URL (without ``/rest`` suffix).
-    root_id:
-        Unused placeholder for compatibility with callers that may eventually
-        scope the tree to a specific root category. It defaults to ``2`` which
-        is the usual "Default Category" id in Magento installations.
-    """
-
-    _ = root_id  # reserved for potential future use
-    return magento_get(session, base_url, "/categories") or {}
-
-
 def _flatten_magento_categories(node, acc: List[Dict[str, object]]) -> None:
     """Recursively flatten Magento category tree structures."""
 
