@@ -1432,6 +1432,7 @@ btn_all = c1.button("Load items", type="primary", key="btn_load_all")
 btn_50 = c2.button("Load 50 (fast)", key="btn_load_50_fast")
 
 limit = 50 if btn_50 else None
+enabled_only = True if btn_50 else None
 
 if btn_all or btn_50:
     st.session_state["step1_editor_mode"] = "50" if limit == 50 else "all"
@@ -1447,6 +1448,7 @@ if btn_all or btn_50:
             qty_min=0,
             limit=limit,
             minimal_fields=True,
+            enabled_only=enabled_only,
         )
         st.success(
             f"Loaded {len(data or [])} products{f' (limit={limit})' if limit else ''}"
