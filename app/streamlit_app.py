@@ -65,6 +65,124 @@ _ATTRIBUTE_SET_ICONS = {
 _DEFAULT_ATTRIBUTE_ICON = "🧩"
 
 
+BASE_ORDER = [
+    "sku",
+    "name",
+    "price",
+    "condition",
+    "country_of_manufacture",
+    "brand",
+]
+
+
+def build_column_order_for_set(
+    df_cols: list[str], set_id: int, set_name: str | None = None
+) -> list[str]:
+    alias = {
+        "cases covers": "cases_covers",
+        "guitarstylemultiplechoice": "guitarstylemultiplechoice",
+        "short description": "short_description",
+        "attribute set": "attribute_set_id",
+        "product type (attribute set)": "attribute_set_id",
+    }
+
+    def norm(cols: Iterable[str | None]) -> list[str]:
+        out: list[str] = []
+        for c in cols:
+            k = (c or "").strip()
+            lowered = k.lower()
+            mapped = alias.get(lowered, k)
+            out.append(mapped)
+        return out
+
+    order = norm(BASE_ORDER)
+
+    per_set: list[str]
+    name_lc = (set_name or "").strip().lower()
+    if name_lc == "acoustic guitar":
+        per_set = norm(
+            [
+                "series",
+                "acoustic_guitar_style",
+                "acoustic_body_shape",
+                "body_material",
+                "top_material",
+                "finish",
+                "bridge",
+                "controls",
+                "acoustic_pickup",
+                "neck_profile",
+                "neck_material",
+                "neck_radius",
+                "neck_nutwidth",
+                "fretboard_material",
+                "tuning_machines",
+                "scale_mensur",
+                "amount_of_frets",
+                "no_strings",
+                "orientation",
+                "acoustic_cutaway",
+                "electro_acoustic",
+                "kids_size",
+                "vintage",
+                "cases_covers",
+                "categories",
+                "short_description",
+            ]
+        )
+    elif name_lc == "electric guitars":
+        per_set = norm(
+            [
+                "series",
+                "model",
+                "guitarstylemultiplechoice",
+                "body_material",
+                "top_material",
+                "finish",
+                "bridge_type",
+                "bridge",
+                "pickup_config",
+                "bridge_pickup",
+                "middle_pickup",
+                "neck_pickup",
+                "controls",
+                "neck_profile",
+                "neck_material",
+                "neck_radius",
+                "neck_nutwidth",
+                "fretboard_material",
+                "tuning_machines",
+                "scale_mensur",
+                "amount_of_frets",
+                "no_strings",
+                "orientation",
+                "semi_hollow_body",
+                "kids_size",
+                "vintage",
+                "cases_covers",
+                "categories",
+                "short_description",
+            ]
+        )
+    else:
+        per_set = []
+
+    seen: dict[str, None] = {}
+
+    def add_seq(seq: Iterable[str]) -> None:
+        for c in seq:
+            if c in df_cols and c not in seen:
+                seen[c] = None
+
+    add_seq(order)
+    add_seq(per_set)
+    for c in df_cols:
+        if c not in seen:
+            seen[c] = None
+
+    return list(seen.keys())
+
+
 ID_RX = re.compile(r"#(\d+)\)?$")
 
 
@@ -146,17 +264,21 @@ def _format_multiselect_display_value(values) -> str:
     return ", ".join(parts)
 
 
-def _pin_sku_name(column_order: list[str] | None) -> list[str]:
-    if not isinstance(column_order, list):
-        if column_order is None:
-            return []
+def _pin_sku_name(order: Iterable[str], df_cols: Iterable[str]) -> list[str]:
+    if not isinstance(order, list):
         try:
-            column_order = list(column_order)  # type: ignore[arg-type]
+            order = list(order or [])  # type: ignore[arg-type]
         except TypeError:
-            return []
-    lead = [c for c in ("sku", "name") if c in column_order]
-    tail = [c for c in column_order if c not in ("sku", "name")]
-    return lead + tail
+            order = []
+    if not isinstance(df_cols, list):
+        try:
+            df_cols = list(df_cols or [])  # type: ignore[arg-type]
+        except TypeError:
+            df_cols = []
+    lead = [c for c in ("sku", "name") if c in df_cols]
+    rest = [c for c in order if c not in lead and c in df_cols]
+    missing = [c for c in df_cols if c not in lead and c not in rest]
+    return lead + rest + missing
 
 
 def _parse_category_token(token: object) -> int | None:
@@ -823,12 +945,19 @@ def build_wide_colcfg(
 ):
     cfg = {
         "sku": st.column_config.TextColumn("SKU", disabled=True),
-        "name": st.column_config.TextColumn("Name", disabled=True),
+        "name": st.column_config.TextColumn("Name", disabled=False),
     }
 
     for code, original_meta in list(wide_meta.items()):
         meta = original_meta or {}
         cfg[code] = colcfg_from_meta(code, meta)
+
+    if "guitarstylemultiplechoice" in cfg:
+        guitar_cfg = cfg["guitarstylemultiplechoice"]
+        if hasattr(guitar_cfg, "label"):
+            guitar_cfg.label = "Guitar style"
+        elif hasattr(guitar_cfg, "_label"):
+            guitar_cfg._label = "Guitar style"
 
     return cfg
 
@@ -875,10 +1004,10 @@ def build_attributes_df(
         name_value = row.get("name")
         attr_set_value = row.get("attribute set")
         try:
-            with st.spinner(f"🔄 {sku_value}: загрузка атрибутов…"):
+            with st.spinner(f"🔄 {sku_value}: loading attributes…"):
                 product = get_product_by_sku(session, api_base, sku_value)
         except Exception as exc:  # pragma: no cover - UI interaction
-            st.warning(f"{sku_value}: не удалось получить атрибуты ({exc})")
+            st.warning(f"{sku_value}: failed to fetch attributes ({exc})")
             continue
 
         attr_set_id = None
@@ -1166,13 +1295,13 @@ def apply_product_update(session, api_base: str, sku: str, attributes: dict):
 def save_step2_to_magento():
     step2_state = st.session_state.get("step2")
     if not isinstance(step2_state, dict):
-        st.info("Нет изменений для сохранения.")
+        st.info("No changes to save.")
         return
 
     session = st.session_state.get("mg_session")
     base_url = st.session_state.get("mg_base_url")
     if not session or not base_url:
-        st.error("Magento session не инициализирован")
+        st.error("Magento session is not initialized")
         return
 
     staged_map = (step2_state.get("staged") or {}).copy()
@@ -1206,7 +1335,7 @@ def save_step2_to_magento():
         meta_cache.build_and_set_static_for(["country_of_manufacture"], store_id=0)
 
     if not wide_map:
-        st.info("Нет изменений для сохранения.")
+        st.info("No changes to save.")
         return
 
     payload_by_sku: dict[str, dict[str, object]] = {}
@@ -1331,12 +1460,12 @@ def save_step2_to_magento():
                 payload_by_sku.pop(sku_value, None)
 
     if not payload_by_sku and not errors:
-        st.info("Нет изменений для сохранения.")
+        st.info("No changes to save.")
         return
 
     api_base = st.session_state.get("ai_api_base")
     if not api_base:
-        st.warning("Magento API не инициализирован.")
+        st.warning("Magento API is not initialized.")
         return
 
     ok_skus: set[str] = set()
@@ -1573,7 +1702,7 @@ if not st.session_state.get("_mg_auth_logged"):
 session = st.session_state.get("mg_session")
 base_url = st.session_state.get("mg_base_url")
 if not session or not base_url:
-    st.error("Magento session не инициализирован")
+    st.error("Magento session is not initialized")
     st.stop()
 
 st.info("Let’s find items need to be updated.")
@@ -1783,7 +1912,7 @@ if df_original_key in st.session_state:
                     label="Product Type (attribute set)",
                     disabled=False,
                 )
-            column_order = _pin_sku_name(column_order)
+            column_order = _pin_sku_name(column_order, list(df_base.columns))
             edited_df = st.data_editor(
                 df_base,
                 column_config=col_cfg,
@@ -1811,7 +1940,7 @@ if df_original_key in st.session_state:
                 st.session_state["_go_step2_requested"] = False
 
             if df_edited_key not in st.session_state or df_original_key not in st.session_state:
-                st.warning("Нет изменённых товаров.")
+                st.warning("No updated products.")
                 st.session_state["show_attributes_trigger"] = False
             else:
                 df_new = st.session_state[df_edited_key].copy()
@@ -1822,14 +1951,14 @@ if df_original_key in st.session_state:
                     required_cols.issubset(df_new.columns)
                     and required_cols.issubset(df_old.columns)
                 ):
-                    st.warning("Нет изменённых товаров.")
+                    st.warning("No updated products.")
                     st.session_state["show_attributes_trigger"] = False
                 else:
                     df_new_idx = df_new.set_index("sku")
                     df_old_idx = df_old.set_index("sku")
                     common_skus = df_new_idx.index.intersection(df_old_idx.index)
                     if common_skus.empty:
-                        st.warning("Нет изменённых товаров.")
+                        st.warning("No updated products.")
                         st.session_state["show_attributes_trigger"] = False
                     else:
                         df_new_common = df_new_idx.loc[common_skus]
@@ -1839,7 +1968,7 @@ if df_original_key in st.session_state:
                         df_changed = df_new_common.loc[diff_mask].reset_index()
 
                         if df_changed.empty:
-                            st.warning("Нет изменённых товаров.")
+                            st.warning("No updated products.")
                             st.session_state["show_attributes_trigger"] = False
                         else:
                             api_base = st.session_state.get("ai_api_base")
@@ -1849,11 +1978,11 @@ if df_original_key in st.session_state:
                             html_error = False
                             try:
                                 if not api_base:
-                                    with st.spinner("🔌 Подключение к Magento…"):
+                                    with st.spinner("🔌 Connecting to Magento…"):
                                         api_base = probe_api_base(session, base_url)
                                     st.session_state["ai_api_base"] = api_base
                                 if not attr_sets_map and api_base:
-                                    with st.spinner("📚 Загрузка attribute sets…"):
+                                    with st.spinner("📚 Loading attribute sets…"):
                                         attr_sets_map = get_attribute_sets_map(
                                             session, api_base
                                         )
@@ -1863,7 +1992,7 @@ if df_original_key in st.session_state:
                                 html_error = True
                             except Exception as exc:  # pragma: no cover - UI interaction
                                 st.warning(
-                                    f"Не удалось подготовить подключение к Magento: {exc}"
+                                    f"Failed to prepare Magento connection: {exc}"
                                 )
                                 setup_failed = True
 
@@ -2233,7 +2362,7 @@ if df_original_key in st.session_state:
                                     "options"
                                 ):
                                     try:
-                                        with st.spinner("📂 Загрузка категорий…"):
+                                        with st.spinner("📂 Loading categories…"):
                                             categories_meta = ensure_categories_meta(
                                                 meta_cache,
                                                 session,
@@ -2251,7 +2380,7 @@ if df_original_key in st.session_state:
                                         st.session_state["step2_categories_failed"] = False
                                     except Exception as exc:  # pragma: no cover - UI interaction
                                         st.warning(
-                                            f"Не удалось загрузить категории: {exc}"
+                                            f"Failed to load categories: {exc}"
                                         )
                                         categories_meta = (
                                             meta_cache.get("categories")
@@ -2271,7 +2400,7 @@ if df_original_key in st.session_state:
 
                                 completed = False
                                 if not step2_state["wide"]:
-                                    st.warning("Нет атрибутов для отображения.")
+                                    st.warning("No attributes to display.")
                                     _pupdate(100, "Attributes ready")
                                     status2.update(
                                         state="complete", label="Attributes ready"
@@ -2385,32 +2514,6 @@ if df_original_key in st.session_state:
                                         column_config = build_wide_colcfg(
                                             meta_map, sample_df=df_ref
                                         )
-                                        column_config["attribute_set_id"] = (
-                                            st.column_config.Column(label="", disabled=True)
-                                        )
-                                        if (
-                                            isinstance(df_ref, pd.DataFrame)
-                                            and "sku" in df_ref.columns
-                                        ):
-                                            column_config["sku"] = st.column_config.Column(
-                                                label="SKU", disabled=True, width="small"
-                                            )
-                                        if (
-                                            isinstance(df_ref, pd.DataFrame)
-                                            and "name" in df_ref.columns
-                                        ):
-                                            column_config["name"] = st.column_config.TextColumn(
-                                                label="Name",
-                                                disabled=False,
-                                                width="medium",
-                                            )
-                                        if (
-                                            isinstance(df_ref, pd.DataFrame)
-                                            and "price" in df_ref.columns
-                                        ):
-                                            column_config["price"] = st.column_config.NumberColumn(
-                                                label="Price", disabled=True
-                                            )
                                         if (
                                             isinstance(df_ref, pd.DataFrame)
                                             and "categories" in df_ref.columns
@@ -2428,21 +2531,12 @@ if df_original_key in st.session_state:
                                             )
                                         step2_state["wide_colcfg"][set_id] = column_config
 
-                                        column_order = [
-                                            col
-                                            for col in getattr(df_ref, "columns", [])
-                                            if col != "attribute_set_id"
-                                        ]
-                                        column_order = _pin_sku_name(column_order)
-
-                                        if DEBUG:
-                                            st.write(
-                                                "DEBUG column_order:",
-                                                column_order,
-                                            )
-
                                         if not isinstance(df_ref, pd.DataFrame):
                                             continue
+
+                                        attribute_set_names = step2_state.get(
+                                            "set_names", {}
+                                        )
 
                                         for current_set_id, group in df_ref.groupby(
                                             "attribute_set_id"
@@ -2473,37 +2567,64 @@ if df_original_key in st.session_state:
                                                 f"{icon} {set_name} ({len(group)} items)"
                                             )
 
-                                            ordered_columns = [
-                                                col
-                                                for col in column_order
-                                                if col in group.columns
-                                            ]
-                                            if "attribute_set_id" in ordered_columns:
-                                                ordered_columns = [
-                                                    col
-                                                    for col in ordered_columns
-                                                    if col != "attribute_set_id"
-                                                ]
-                                            ordered_columns = _pin_sku_name(ordered_columns)
-                                            disabled_cols = [
-                                                col
-                                                for col in (
-                                                    "sku",
-                                                    "price",
-                                                    "attribute_set_id",
+                                            group = group.reset_index(drop=True)
+                                            if "attribute_set_id" in group.columns:
+                                                group = group.drop(
+                                                    columns=["attribute_set_id"]
                                                 )
-                                                if col in group.columns
-                                            ]
+
+                                            ordered_columns = build_column_order_for_set(
+                                                df_cols=list(group.columns),
+                                                set_id=current_set_id,
+                                                set_name=attribute_set_names.get(
+                                                    current_set_id, ""
+                                                ),
+                                            )
+                                            ordered_columns = _pin_sku_name(
+                                                ordered_columns, list(group.columns)
+                                            )
+
+                                            column_config_final = dict(column_config or {})
+                                            if "sku" in group.columns:
+                                                column_config_final[
+                                                    "sku"
+                                                ] = st.column_config.Column(
+                                                    label="SKU",
+                                                    disabled=True,
+                                                    width="small",
+                                                )
+                                            if "name" in group.columns:
+                                                column_config_final[
+                                                    "name"
+                                                ] = st.column_config.TextColumn(
+                                                    label="Name",
+                                                    disabled=False,
+                                                    width="medium",
+                                                )
+                                            if "price" in group.columns:
+                                                column_config_final[
+                                                    "price"
+                                                ] = st.column_config.NumberColumn(
+                                                    label="Price", disabled=True
+                                                )
+                                            if "guitarstylemultiplechoice" in column_config_final:
+                                                cfg = column_config_final[
+                                                    "guitarstylemultiplechoice"
+                                                ]
+                                                if hasattr(cfg, "label"):
+                                                    cfg.label = "Guitar style"
+                                                elif hasattr(cfg, "_label"):
+                                                    cfg._label = "Guitar style"
+
                                             editor_df = st.data_editor(
-                                                group.reset_index(drop=True),
+                                                group,
                                                 key=f"editor_set_{current_set_id}",
                                                 column_config={
                                                     key: value
-                                                    for key, value in column_config.items()
+                                                    for key, value in column_config_final.items()
                                                     if key in group.columns
                                                 },
                                                 column_order=ordered_columns,
-                                                disabled=disabled_cols,
                                                 use_container_width=True,
                                                 hide_index=True,
                                                 num_rows="fixed",
@@ -2518,6 +2639,16 @@ if df_original_key in st.session_state:
                                                     step2_state.get("wide_synced", {})
                                                     .get(current_set_id)
                                                 )
+                                                if (
+                                                    isinstance(
+                                                        base_synced, pd.DataFrame
+                                                    )
+                                                    and "attribute_set_id"
+                                                    in base_synced.columns
+                                                ):
+                                                    base_synced = base_synced.drop(
+                                                        columns=["attribute_set_id"]
+                                                    )
                                                 if _df_differs(
                                                     editor_df, base_synced
                                                 ):
