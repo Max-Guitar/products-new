@@ -1053,6 +1053,29 @@ def _values_equal(left: object, right: object) -> bool:
     return left == right
 
 
+def _df_differs(a: pd.DataFrame | None, b: pd.DataFrame | None) -> bool:
+    if not isinstance(a, pd.DataFrame) or not isinstance(b, pd.DataFrame):
+        return isinstance(a, pd.DataFrame) != isinstance(b, pd.DataFrame)
+
+    a2 = a.copy(deep=True)
+    b2 = b.copy(deep=True)
+    cols = list(dict.fromkeys(list(a2.columns) + list(b2.columns)))
+    a2 = a2.reindex(columns=cols).astype(object)
+    b2 = b2.reindex(columns=cols).astype(object)
+
+    if len(a2) != len(b2):
+        return True
+
+    for col in cols:
+        la = list(a2[col]) if col in a2 else [None] * len(a2)
+        lb = list(b2[col]) if col in b2 else [None] * len(b2)
+        for left, right in zip(la, lb):
+            if not _values_equal(left, right):
+                return True
+
+    return False
+
+
 def apply_product_update(session, api_base: str, sku: str, attributes: dict):
     if not attributes:
         return
@@ -1095,9 +1118,25 @@ def save_step2_to_magento():
         st.info("Нет изменений для сохранения.")
         return
 
-    if step2_state.get("staged"):
-        st.warning("Сначала нажмите \"💾 Сохранить изменения\".")
-        return
+    staged_map = (step2_state.get("staged") or {}).copy()
+    if staged_map:
+        for set_id, draft in staged_map.items():
+            if not isinstance(draft, pd.DataFrame):
+                continue
+            draft_wide = draft.copy(deep=True)
+            step2_state["wide"][set_id] = draft_wide
+            step2_state["wide_orig"][set_id] = draft_wide.copy(deep=True)
+            existing_long = step2_state["dfs"].get(set_id)
+            updated_long = apply_wide_edits_to_long(existing_long, draft_wide)
+            if isinstance(updated_long, pd.DataFrame):
+                if "value" in updated_long.columns:
+                    updated_long["value"] = updated_long["value"].astype(object)
+                step2_state["dfs"][set_id] = updated_long
+                step2_state["original"][set_id] = updated_long.copy(deep=True)
+            else:
+                step2_state["dfs"][set_id] = draft_wide.copy(deep=True)
+                step2_state["original"][set_id] = draft_wide.copy(deep=True)
+        step2_state["staged"].clear()
 
     wide_map: dict[int, pd.DataFrame] = step2_state.get("wide", {})
     wide_meta_map: dict[int, dict[str, dict]] = step2_state.get("wide_meta", {})
@@ -2150,9 +2189,22 @@ if df_original_key in st.session_state:
                                                     editor_df[column] = editor_df[
                                                         column
                                                     ].astype(object)
-                                                step2_state["staged"][
-                                                    current_set_id
-                                                ] = editor_df.copy(deep=True)
+                                                base_synced = (
+                                                    step2_state.get("wide_synced", {})
+                                                    .get(current_set_id)
+                                                )
+                                                if _df_differs(
+                                                    editor_df, base_synced
+                                                ):
+                                                    step2_state["staged"][
+                                                        current_set_id
+                                                    ] = editor_df.copy(
+                                                        deep=True
+                                                    )
+                                                else:
+                                                    step2_state["staged"].pop(
+                                                        current_set_id, None
+                                                    )
 
                                     if st.button(
                                         "💾 Сохранить изменения",
