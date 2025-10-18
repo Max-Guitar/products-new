@@ -359,6 +359,15 @@ def _meta_options(meta: dict) -> list:
     return unique
 
 
+def _options_for_aggrid(
+    col: str, meta_map: dict[str, dict], categories_labels_all: list[str]
+) -> list[str]:
+    if col == "categories":
+        return categories_labels_all
+    meta = meta_map.get(col, {}) if isinstance(meta_map, dict) else {}
+    return _meta_options(meta)
+
+
 def _attr_set_icon(name: str) -> str:
     if not isinstance(name, str) or not name.strip():
         return _DEFAULT_ATTRIBUTE_ICON
@@ -2752,29 +2761,35 @@ if df_original_key in st.session_state:
                                                 "cases_covers": "Cases & Covers",
                                             }
 
+                                            meta_map_current = (
+                                                wide_meta.get(current_set_id, {})
+                                                if isinstance(wide_meta, dict)
+                                                else {}
+                                            )
+                                            if not isinstance(meta_map_current, dict) or not meta_map_current:
+                                                meta_map_current = (
+                                                    meta_map
+                                                    if isinstance(meta_map, dict)
+                                                    else {}
+                                                )
+
                                             def _detect_type(
                                                 cfg_obj: Any,
-                                            ) -> tuple[str | None, list[str]]:
+                                            ) -> str | None:
                                                 if isinstance(
                                                     cfg_obj, st.column_config.CheckboxColumn
                                                 ):
-                                                    return "boolean", []
+                                                    return "boolean"
                                                 if isinstance(
                                                     cfg_obj, st.column_config.SelectboxColumn
                                                 ):
-                                                    options = getattr(
-                                                        cfg_obj, "options", None
-                                                    ) or []
-                                                    return "select", list(options)
+                                                    return "select"
                                                 if isinstance(
                                                     cfg_obj,
                                                     st.column_config.MultiselectColumn,
                                                 ):
-                                                    options = getattr(
-                                                        cfg_obj, "options", None
-                                                    ) or []
-                                                    return "multiselect", list(options)
-                                                return None, []
+                                                    return "multiselect"
+                                                return None
 
                                             for col in ordered_columns:
                                                 if col not in df_view.columns:
@@ -2792,33 +2807,45 @@ if df_original_key in st.session_state:
                                                     "editable": True
                                                 }
 
-                                                labels: list[str] = []
                                                 if isinstance(cfg, dict):
                                                     header_name = (
                                                         header_name
                                                         or cfg.get("label")
                                                         or cfg.get("header")
                                                     )
-                                                    ctype = (cfg.get("type") or "").lower()
-                                                    labels = (
-                                                        cfg.get("options_labels")
-                                                        or cfg.get("options")
-                                                        or []
-                                                    )
                                                 else:
-                                                    detected_type, detected_labels = _detect_type(
-                                                        cfg
-                                                    )
-                                                    if detected_type:
-                                                        ctype = detected_type
-                                                    else:
-                                                        ctype = ""
-                                                    labels = detected_labels
                                                     header_name = (
                                                         header_name
                                                         or getattr(cfg, "label", None)
                                                         or getattr(cfg, "_label", None)
                                                     )
+
+                                                meta = (
+                                                    meta_map_current.get(col, {})
+                                                    if isinstance(meta_map_current, dict)
+                                                    else {}
+                                                )
+                                                ctype_value = (
+                                                    meta.get("frontend_input")
+                                                    or meta.get("backend_type")
+                                                    or ""
+                                                )
+                                                ctype = (
+                                                    ctype_value.lower()
+                                                    if isinstance(ctype_value, str)
+                                                    else ""
+                                                )
+
+                                                if not ctype:
+                                                    if isinstance(cfg, dict):
+                                                        ctype = (cfg.get("type") or "").lower()
+                                                    else:
+                                                        detected_type = _detect_type(cfg)
+                                                        ctype = (detected_type or "").lower()
+
+                                                labels = _options_for_aggrid(
+                                                    col, meta_map_current, labels_all
+                                                )
 
                                                 if header_name:
                                                     column_kwargs["headerName"] = header_name
