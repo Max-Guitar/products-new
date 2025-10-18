@@ -77,29 +77,37 @@ TagCellRenderer = JsCode(
     """
 class TagCellRenderer {
   init(params) {
+    const v2l = (params.colDef.cellRendererParams && params.colDef.cellRendererParams.v2l) || {};
+    const toLabel = (x) => v2l[String(x)] || String(x || "");
+
     this.eGui = document.createElement('div');
     this.eGui.style.display = 'flex';
-    this.eGui.style.flexWrap = 'wrap';
-    this.eGui.style.gap = '4px';
+    this.eGui.style.flexWrap = 'nowrap';
+    this.eGui.style.alignItems = 'center';
+    this.eGui.style.gap = '6px';
+    this.eGui.style.overflow = 'hidden';
+    this.eGui.style.whiteSpace = 'nowrap';
+    this.eGui.style.textOverflow = 'ellipsis';
 
-    const v = params.value;
-    const map = params.colDef.cellRendererParams && params.colDef.cellRendererParams.v2l ? params.colDef.cellRendererParams.v2l : {};
-    const toLabel = (x) => map[String(x)] || String(x || "");
+    const values = Array.isArray(params.value) ? params.value : (params.value ? [params.value] : []);
+    const labels = values.map(toLabel);
 
-    const pills = Array.isArray(v) ? v.map(toLabel) : [toLabel(v)];
-    pills.forEach(lbl => {
-      const span = document.createElement('span');
-      span.textContent = lbl;
-      span.style.padding = '2px 8px';
-      span.style.borderRadius = '999px';
-      span.style.border = '1px solid #DDD';
-      span.style.fontSize = '12px';
-      span.style.background = '#f7f7f9';
-      this.eGui.appendChild(span);
+    labels.forEach(lbl => {
+      const pill = document.createElement('span');
+      pill.textContent = lbl;
+      pill.style.display = 'inline-flex';
+      pill.style.alignItems = 'center';
+      pill.style.padding = '2px 8px';
+      pill.style.border = '1px solid #DDD';
+      pill.style.borderRadius = '999px';
+      pill.style.background = '#f7f7f9';
+      pill.style.fontSize = '12px';
+      pill.style.whiteSpace = 'nowrap';
+      this.eGui.appendChild(pill);
     });
   }
-  getGui() { return this.eGui; }
-  refresh() { return false; }
+  getGui(){ return this.eGui; }
+  refresh(){ return false; }
 }
 """
 )
@@ -110,35 +118,37 @@ TagMultiEditor = JsCode(
 class TagMultiEditor {
   init(params) {
     this.params = params;
-    this.labels = (params && params.values) ? params.values : [];
-    this.v2l = (params && params.v2l) ? params.v2l : {};
-    this.l2v = (params && params.l2v) ? params.l2v : {};
-
-    const toId   = (s) => this.l2v.hasOwnProperty(String(s)) ? this.l2v[String(s)] : String(s);
-    const toLbl  = (id) => this.v2l.hasOwnProperty(String(id)) ? this.v2l[String(id)] : String(id);
+    const labels = (params && params.values) || [];
+    this.v2l = (params && params.v2l) || {};
+    this.l2v = (params && params.l2v) || {};
+    const toId  = (s) => this.l2v.hasOwnProperty(String(s)) ? this.l2v[String(s)] : String(s);
+    const toLbl = (id) => this.v2l.hasOwnProperty(String(id)) ? this.v2l[String(id)] : String(id);
 
     this.selected = Array.isArray(params.value) ? params.value.map(v => String(v)) :
                     (params.value ? [String(params.value)] : []);
 
     this.root = document.createElement('div');
     this.root.style.padding = '8px';
-    this.root.style.minWidth = '340px';
-    this.root.style.maxWidth = '520px';
+    this.root.style.minWidth = '360px';
+    this.root.style.maxWidth = '560px';
 
-    this.tagsLine = document.createElement('div');
-    this.tagsLine.style.display = 'flex';
-    this.tagsLine.style.flexWrap = 'wrap';
-    this.tagsLine.style.gap = '6px';
-    this.tagsLine.style.marginBottom = '8px';
-    this.root.appendChild(this.tagsLine);
+    this.tags = document.createElement('div');
+    this.tags.style.display = 'flex';
+    this.tags.style.flexWrap = 'nowrap';
+    this.tags.style.gap = '6px';
+    this.tags.style.whiteSpace = 'nowrap';
+    this.tags.style.overflow = 'hidden';
+    this.tags.style.textOverflow = 'ellipsis';
+    this.tags.style.marginBottom = '8px';
+    this.root.appendChild(this.tags);
 
-    const wrapper = document.createElement('div');
-    wrapper.style.display = 'flex';
-    wrapper.style.gap = '8px';
+    const row = document.createElement('div');
+    row.style.display = 'flex';
+    row.style.gap = '8px';
 
     this.input = document.createElement('input');
     this.input.type = 'text';
-    this.input.placeholder = 'Type to search...';
+    this.input.placeholder = 'Type to search…';
     this.input.style.flex = '1';
     this.input.style.padding = '6px 8px';
     this.input.style.border = '1px solid #DDD';
@@ -148,19 +158,18 @@ class TagMultiEditor {
     this.addBtn.textContent = 'Add';
     this.addBtn.style.padding = '6px 10px';
 
-    wrapper.appendChild(this.input);
-    wrapper.appendChild(this.addBtn);
-    this.root.appendChild(wrapper);
+    row.appendChild(this.input);
+    row.appendChild(this.addBtn);
+    this.root.appendChild(row);
 
-    this.suggestions = document.createElement('div');
-    this.suggestions.style.border = '1px solid #EEE';
-    this.suggestions.style.marginTop = '6px';
-    this.suggestions.style.maxHeight = '160px';
-    this.suggestions.style.overflowY = 'auto';
-    this.root.appendChild(this.suggestions);
+    this.sugg = document.createElement('div');
+    this.sugg.style.border = '1px solid #EEE';
+    this.sugg.style.marginTop = '6px';
+    this.sugg.style.maxHeight = '0px';
+    this.root.appendChild(this.sugg);
 
     const renderTags = () => {
-      this.tagsLine.innerHTML = '';
+      this.tags.innerHTML = '';
       this.selected.forEach(id => {
         const pill = document.createElement('span');
         pill.textContent = toLbl(id);
@@ -172,61 +181,40 @@ class TagMultiEditor {
         pill.style.display = 'inline-flex';
         pill.style.alignItems = 'center';
         pill.style.gap = '6px';
+        pill.style.whiteSpace = 'nowrap';
 
         const x = document.createElement('span');
         x.textContent = '×';
         x.style.cursor = 'pointer';
         x.onclick = () => { this.selected = this.selected.filter(v => v !== id); renderTags(); };
         pill.appendChild(x);
-
-        this.tagsLine.appendChild(pill);
+        this.tags.appendChild(pill);
       });
     };
 
-    const renderSuggestions = (q='') => {
-      const query = String(q).toLowerCase().trim();
-      this.suggestions.innerHTML = '';
-      const pool = this.labels.filter(lbl => lbl.toLowerCase().includes(query));
-      pool.forEach(lbl => {
-        const row = document.createElement('div');
-        row.textContent = lbl;
-        row.style.padding = '6px 8px';
-        row.style.cursor = 'pointer';
-        row.onmouseenter = () => { row.style.background = '#f0f4ff'; };
-        row.onmouseleave = () => { row.style.background = 'white'; };
-        row.onclick = () => {
-          const id = toId(lbl);
-          if (!this.selected.includes(String(id))) {
-            this.selected.push(String(id));
-            renderTags();
-          }
-        };
-        this.suggestions.appendChild(row);
-      });
-    };
-
-    this.input.addEventListener('input', () => renderSuggestions(this.input.value));
-    this.addBtn.onclick = () => {
-      const lbl = this.input.value.trim();
-      if (!lbl) return;
-      const id = toId(lbl);
+    const addLabel = (lbl) => {
+      const s = String(lbl || '').trim();
+      if (!s) return;
+      const id = toId(s);
       if (!this.selected.includes(String(id))) {
         this.selected.push(String(id));
         renderTags();
       }
-      this.input.value = '';
-      renderSuggestions('');
     };
 
-    renderTags();
-    renderSuggestions('');
-  }
+    this.input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { addLabel(this.input.value); this.input.value=''; }
+      if (e.key === 'Backspace' && !this.input.value) { this.selected.pop(); renderTags(); }
+    });
+    this.addBtn.onclick = () => { addLabel(this.input.value); this.input.value=''; };
 
-  getGui() { return this.root; }
-  afterGuiAttached() { if (this.input) this.input.focus(); }
-  getValue() { return this.selected.slice(); }
-  destroy() {}
-  isPopup() { return true; }
+    renderTags();
+  }
+  getGui(){ return this.root; }
+  afterGuiAttached(){ if (this.input) this.input.focus(); }
+  getValue(){ return this.selected.slice(); }
+  destroy(){}
+  isPopup(){ return true; }
 }
 """
 )
@@ -3025,7 +3013,9 @@ if df_original_key in st.session_state:
 
                                             gb = GridOptionsBuilder.from_dataframe(df_view)
                                             gb.configure_default_column(
-                                                editable=True, wrapText=True, autoHeight=True
+                                                editable=True,
+                                                wrapText=False,
+                                                autoHeight=False,
                                             )
 
                                             if "sku" in df_view.columns:
@@ -3173,6 +3163,7 @@ if df_original_key in st.session_state:
 
                                             gb.configure_grid_options(
                                                 domLayout="autoHeight",
+                                                rowHeight=34,
                                                 suppressColumnMove=True,
                                                 singleClickEdit=True,
                                                 stopEditingWhenCellsLoseFocus=True,
