@@ -3473,7 +3473,7 @@ if df_original_key in st.session_state:
                                                         ),
                                                         **column_kwargs,
                                                     )
-                                                    continue
+                                                continue
 
                                                 if ftype == "multiselect":
                                                     gb.configure_column(
