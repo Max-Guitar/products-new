@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlencode
@@ -12,6 +13,9 @@ from utils.http import build_magento_url, magento_get as _magento_get
 from utils.http import magento_get_logged as _magento_get_logged
 
 MAGENTO_ADMIN_TOKEN: str = os.environ.get("MAGENTO_ADMIN_TOKEN", "")
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def _with_query(path: str, params: Optional[Dict[str, Any]] = None) -> str:
@@ -102,7 +106,8 @@ def get_default_products(
         Optional attribute set identifier to filter server-side.
     enabled_only:
         When ``True`` adds a status filter restricting results to enabled
-        products. When ``None`` (default) no status filter is applied.
+        products. When ``False`` or ``None`` (default) no status filter is
+        applied.
     kwargs:
         Extra query parameters merged into the Magento search criteria.
     """
@@ -159,10 +164,14 @@ def get_default_products(
         params["searchCriteria[currentPage]"] = page
         params["searchCriteria[pageSize]"] = page_size
 
+        path = _with_query("/products", params)
+        final_url = build_magento_url(base_url, path)
+        _LOGGER.debug("get_default_products request URL: %s", final_url)
+
         data = _magento_get(
             session,
             base_url,
-            _with_query("/products", params),
+            path,
             timeout=30,
             token=_token_value(),
         )

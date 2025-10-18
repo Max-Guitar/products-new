@@ -1303,6 +1303,7 @@ def load_items(
                     "sku": product.get("sku", ""),
                     "name": product.get("name", ""),
                     "created_at": product.get("created_at", ""),
+                    "status": status,
                 }
             )
 
@@ -1341,6 +1342,7 @@ def load_items(
                     "sku": product.get("sku", ""),
                     "name": product.get("name", ""),
                     "created_at": product.get("created_at", ""),
+                    "status": status,
                 }
             )
 
@@ -1354,6 +1356,9 @@ def load_items(
     df = pd.DataFrame(rows)
     if df.empty:
         return pd.DataFrame(columns=["sku", "name", "attribute set", "created_at"])
+
+    if DEBUG and "status" in df.columns:
+        st.write("STATUS COUNTS:", df["status"].value_counts(dropna=False))
 
     st.info(
         f"STEP A — products in 'Default' after status/visibility/type: {len(df)}"
@@ -1431,11 +1436,30 @@ c1, c2 = st.columns(2)
 btn_all = c1.button("Load items", type="primary", key="btn_load_all")
 btn_50 = c2.button("Load 50 (fast)", key="btn_load_50_fast")
 
-limit = 50 if btn_50 else None
-enabled_only = True if btn_50 else None
+if btn_all:
+    requested_run_mode: str | None = "all"
+elif btn_50:
+    requested_run_mode = "fast50"
+else:
+    requested_run_mode = None
 
-if btn_all or btn_50:
-    st.session_state["step1_editor_mode"] = "50" if limit == 50 else "all"
+if requested_run_mode:
+    run_mode = requested_run_mode
+    other_mode = "fast50" if run_mode == "all" else "all"
+    limit = 50 if run_mode == "fast50" else None
+    enabled_only = True if run_mode == "fast50" else None
+    minimal_fields = run_mode == "fast50"
+    st.session_state["step1_editor_mode"] = run_mode
+    st.session_state["show_attributes_trigger"] = False
+
+    for prefix in ("default_products", "df_original", "df_edited", "attribute_sets"):
+        st.session_state.pop(f"{prefix}_{other_mode}", None)
+
+    cache_key = f"default_products_{run_mode}"
+    df_original_key = f"df_original_{run_mode}"
+    df_edited_key = f"df_edited_{run_mode}"
+    attribute_sets_key = f"attribute_sets_{run_mode}"
+
     st.info(
         f"Loading default products{f' (limit={limit})' if limit else ''}…"
     )
@@ -1447,9 +1471,10 @@ if btn_all or btn_50:
             attr_set_id=attr_set_id,
             qty_min=0,
             limit=limit,
-            minimal_fields=True,
+            minimal_fields=minimal_fields,
             enabled_only=enabled_only,
         )
+        st.session_state[cache_key] = data
         st.success(
             f"Loaded {len(data or [])} products{f' (limit={limit})' if limit else ''}"
         )
@@ -1461,10 +1486,9 @@ if btn_all or btn_50:
         )
         if df_items.empty:
             st.warning("No items match the Default set filter criteria.")
-            st.session_state.pop("df_original", None)
-            st.session_state.pop("df_edited", None)
-            st.session_state.pop("attribute_sets", None)
-            st.session_state["show_attributes_trigger"] = False
+            st.session_state.pop(df_original_key, None)
+            st.session_state.pop(df_edited_key, None)
+            st.session_state.pop(attribute_sets_key, None)
             _reset_step2_state()
         else:
             df_ui = df_items.copy()
@@ -1475,27 +1499,32 @@ if btn_all or btn_50:
             st.success(
                 f"Found {len(df_ui)} products (Default; qty>0 OR backorders=2)"
             )
-            st.session_state["df_original"] = df_ui.copy()
+            st.session_state[df_original_key] = df_ui.copy()
             try:
                 attribute_sets = list_attribute_sets(session, base_url)
             except Exception as exc:  # pragma: no cover - UI error handling
                 st.error(f"Failed to fetch attribute sets: {exc}")
                 attribute_sets = {}
-            st.session_state["attribute_sets"] = attribute_sets
+            st.session_state[attribute_sets_key] = attribute_sets
             df_for_edit = df_ui.copy()
             if "hint" not in df_for_edit.columns:
                 df_for_edit["hint"] = ""
             cols_order = ["sku", "name", "attribute set", "hint", "created_at"]
             df_for_edit = df_for_edit[[col for col in cols_order if col in df_for_edit.columns]]
-            st.session_state["df_edited"] = df_for_edit.copy()
-            st.session_state["show_attributes_trigger"] = False
+            st.session_state[df_edited_key] = df_for_edit.copy()
             _reset_step2_state()
     except Exception as exc:  # pragma: no cover - UI error handling
         st.error(f"Error: {exc}")
 
-if "df_original" in st.session_state:
-    df_ui = st.session_state["df_original"]
-    attribute_sets = st.session_state.get("attribute_sets", {})
+current_run_mode = st.session_state.get("step1_editor_mode", "all")
+df_original_key = f"df_original_{current_run_mode}"
+df_edited_key = f"df_edited_{current_run_mode}"
+attribute_sets_key = f"attribute_sets_{current_run_mode}"
+editor_key = f"editor_step1_{current_run_mode}"
+
+if df_original_key in st.session_state:
+    df_ui = st.session_state[df_original_key]
+    attribute_sets = st.session_state.get(attribute_sets_key, {})
 
     if df_ui.empty:
         st.warning("No items match the Default set filter criteria.")
@@ -1503,15 +1532,15 @@ if "df_original" in st.session_state:
         st.warning("Unable to load attribute sets for editing.")
         st.dataframe(df_ui, use_container_width=True)
     else:
-        if "df_edited" not in st.session_state:
+        if df_edited_key not in st.session_state:
             df_init = df_ui.copy()
             if "hint" not in df_init.columns:
                 df_init["hint"] = ""
             cols_order = ["sku", "name", "attribute set", "hint", "created_at"]
             df_init = df_init[[col for col in cols_order if col in df_init.columns]]
-            st.session_state["df_edited"] = df_init.copy()
+            st.session_state[df_edited_key] = df_init.copy()
 
-        df_base = st.session_state["df_edited"].copy()
+        df_base = st.session_state[df_edited_key].copy()
 
         if "hint" not in df_base.columns:
             df_base["hint"] = ""
@@ -1551,7 +1580,6 @@ if "df_original" in st.session_state:
                 "created_at",
             ]
             col_cfg, disabled_cols = _build_column_config_for_step1_like(step="step1")
-            editor_key = f"editor_step1_{st.session_state.get('step1_editor_mode', 'all')}"
             edited_df = st.data_editor(
                 df_base,
                 column_config=col_cfg,
@@ -1563,18 +1591,18 @@ if "df_original" in st.session_state:
             )
 
             if isinstance(edited_df, pd.DataFrame) and st.button("Show Attributes"):
-                st.session_state["df_edited"] = edited_df.copy()
+                st.session_state[df_edited_key] = edited_df.copy()
                 st.session_state["show_attributes_trigger"] = True
                 _reset_step2_state()
         else:
             st.markdown("### Step 2. Items with updated attribute sets")
 
-            if "df_edited" not in st.session_state or "df_original" not in st.session_state:
+            if df_edited_key not in st.session_state or df_original_key not in st.session_state:
                 st.warning("Нет изменённых товаров.")
                 st.session_state["show_attributes_trigger"] = False
             else:
-                df_new = st.session_state["df_edited"].copy()
-                df_old = st.session_state["df_original"].copy()
+                df_new = st.session_state[df_edited_key].copy()
+                df_old = st.session_state[df_original_key].copy()
 
                 required_cols = {"sku", "attribute set"}
                 if not (
