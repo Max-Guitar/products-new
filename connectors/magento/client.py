@@ -76,10 +76,12 @@ def magento_get_logged(
 def get_default_products(
     session: requests.Session,
     base_url: str,
+    *,
+    attr_set_id: Optional[int] = None,
     qty_min: int = 0,
     limit: Optional[int] = None,
     minimal_fields: bool = False,
-    attr_set_id: Optional[int] = None,
+    enabled_only: bool | None = None,
     **kwargs: Any,
 ) -> List[dict]:
     """Return products for the default attribute set with optional limit.
@@ -98,6 +100,9 @@ def get_default_products(
         response.
     attr_set_id:
         Optional attribute set identifier to filter server-side.
+    enabled_only:
+        When ``True`` adds a status filter restricting results to enabled
+        products. When ``None`` (default) no status filter is applied.
     kwargs:
         Extra query parameters merged into the Magento search criteria.
     """
@@ -105,13 +110,21 @@ def get_default_products(
     if limit is not None and limit <= 0:
         return []
 
-    base_params: Dict[str, Any] = {
-        "searchCriteria[filter_groups][0][filters][0][field]": "status",
-        "searchCriteria[filter_groups][0][filters][0][value]": "1",
-        "searchCriteria[filter_groups][0][filters][0][condition_type]": "eq",
-    }
+    base_params: Dict[str, Any] = {}
 
-    filter_index = 1
+    filter_index = 0
+    if enabled_only is True:
+        base_params[
+            f"searchCriteria[filter_groups][{filter_index}][filters][0][field]"
+        ] = "status"
+        base_params[
+            f"searchCriteria[filter_groups][{filter_index}][filters][0][value]"
+        ] = "1"
+        base_params[
+            f"searchCriteria[filter_groups][{filter_index}][filters][0][condition_type]"
+        ] = "eq"
+        filter_index += 1
+
     if attr_set_id is not None:
         base_params[
             f"searchCriteria[filter_groups][{filter_index}][filters][0][field]"
