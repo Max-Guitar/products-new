@@ -1118,6 +1118,12 @@ def save_step2_to_magento():
         st.info("Нет изменений для сохранения.")
         return
 
+    session = st.session_state.get("mg_session")
+    base_url = st.session_state.get("mg_base_url")
+    if not session or not base_url:
+        st.error("Magento session не инициализирован")
+        return
+
     staged_map = (step2_state.get("staged") or {}).copy()
     if staged_map:
         for set_id, draft in staged_map.items():
@@ -1239,11 +1245,6 @@ def save_step2_to_magento():
 
     if not payload_by_sku and not errors:
         st.info("Нет изменений для сохранения.")
-        return
-
-    session = st.session_state.get("session")
-    if session is None:
-        st.warning("Magento session не инициализирован.")
         return
 
     api_base = st.session_state.get("ai_api_base")
@@ -1461,9 +1462,24 @@ def load_items(
 
 st.set_page_config(page_title="Default Set In-Stock Browser", layout="wide")
 
-base_url = st.secrets["MAGENTO_BASE_URL"].rstrip("/")
-auth_token = st.secrets["MAGENTO_ADMIN_TOKEN"]
-session = get_session(auth_token)
+magento_base_url = st.secrets["MAGENTO_BASE_URL"].rstrip("/")
+magento_token = st.secrets["MAGENTO_ADMIN_TOKEN"]
+magento_session = get_session(auth_token=magento_token)
+st.session_state["mg_session"] = magento_session
+st.session_state["mg_base_url"] = magento_base_url
+
+if not st.session_state.get("_mg_auth_logged"):
+    st.write(
+        "Auth header:",
+        bool(st.session_state["mg_session"].headers.get("Authorization")),
+    )
+    st.session_state["_mg_auth_logged"] = True
+
+session = st.session_state.get("mg_session")
+base_url = st.session_state.get("mg_base_url")
+if not session or not base_url:
+    st.error("Magento session не инициализирован")
+    st.stop()
 
 st.markdown("### 🤖 AI Content Manager")
 st.info("Let’s find items that need attribute set assignment.")
@@ -2205,42 +2221,6 @@ if df_original_key in st.session_state:
                                                     step2_state["staged"].pop(
                                                         current_set_id, None
                                                     )
-
-                                    if st.button(
-                                        "💾 Сохранить изменения",
-                                        key="step2_commit",
-                                    ):
-                                        for set_id, draft in (
-                                            step2_state.get("staged") or {}
-                                        ).items():
-                                            if not isinstance(draft, pd.DataFrame):
-                                                continue
-                                            draft_wide = draft.copy(deep=True)
-                                            step2_state["wide"][set_id] = draft_wide
-                                            step2_state["wide_orig"][set_id] = draft_wide.copy(
-                                                deep=True
-                                            )
-                                            existing_long = step2_state["dfs"].get(set_id)
-                                            updated_long = apply_wide_edits_to_long(
-                                                existing_long, draft_wide
-                                            )
-                                            if isinstance(updated_long, pd.DataFrame):
-                                                if "value" in updated_long.columns:
-                                                    updated_long["value"] = updated_long[
-                                                        "value"
-                                                    ].astype(object)
-                                                step2_state["dfs"][set_id] = updated_long
-                                                step2_state["original"][
-                                                    set_id
-                                                ] = updated_long.copy(deep=True)
-                                            else:
-                                                step2_state["dfs"][set_id] = (
-                                                    draft_wide.copy(deep=True)
-                                                )
-                                                step2_state["original"][set_id] = (
-                                                    draft_wide.copy(deep=True)
-                                                )
-                                        step2_state["staged"].clear()
 
                                     if st.button(
                                         "Save to Magento",
