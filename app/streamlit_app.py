@@ -1646,7 +1646,13 @@ if requested_run_mode:
             if "hint" not in df_for_edit.columns:
                 df_for_edit["hint"] = ""
             cols_order = ["sku", "name", "attribute set", "hint", "created_at"]
-            df_for_edit = df_for_edit[[col for col in cols_order if col in df_for_edit.columns]]
+            column_order = [
+                col for col in cols_order if col in df_for_edit.columns
+            ]
+            lead_cols = [c for c in ("sku", "name") if c in column_order]
+            tail_cols = [c for c in column_order if c not in ("sku", "name")]
+            column_order = lead_cols + tail_cols
+            df_for_edit = df_for_edit[column_order]
             st.session_state[df_edited_key] = df_for_edit.copy()
             _reset_step2_state()
         pbar.progress(100)
@@ -1679,7 +1685,11 @@ if df_original_key in st.session_state:
             if "hint" not in df_init.columns:
                 df_init["hint"] = ""
             cols_order = ["sku", "name", "attribute set", "hint", "created_at"]
-            df_init = df_init[[col for col in cols_order if col in df_init.columns]]
+            column_order = [col for col in cols_order if col in df_init.columns]
+            lead_cols = [c for c in ("sku", "name") if c in column_order]
+            tail_cols = [c for c in column_order if c not in ("sku", "name")]
+            column_order = lead_cols + tail_cols
+            df_init = df_init[column_order]
             st.session_state[df_edited_key] = df_init.copy()
 
         df_base = st.session_state[df_edited_key].copy()
@@ -1688,7 +1698,11 @@ if df_original_key in st.session_state:
             df_base["hint"] = ""
 
         cols_order = ["sku", "name", "attribute set", "hint", "created_at"]
-        df_base = df_base[[col for col in cols_order if col in df_base.columns]]
+        column_order = [col for col in cols_order if col in df_base.columns]
+        lead_cols = [c for c in ("sku", "name") if c in column_order]
+        tail_cols = [c for c in column_order if c not in ("sku", "name")]
+        column_order = lead_cols + tail_cols
+        df_base = df_base[column_order]
         options = list(attribute_sets.keys())
         options.extend(
             name
@@ -1698,7 +1712,7 @@ if df_original_key in st.session_state:
         options = list(dict.fromkeys(options))
 
 
-        st.header("Step 1. Assign the product type (attribute set).")
+        st.header("Assign the product type (attribute set).")
         st.caption(
             "For each item, choose which product type (attribute set) it belongs to. "
             "This lets us show the correct attributes later. "
@@ -1709,8 +1723,12 @@ if df_original_key in st.session_state:
 
         if not step2_active:
             step1_column_config = {
-                "sku": st.column_config.TextColumn("SKU", disabled=True),
-                "name": st.column_config.TextColumn("Name", disabled=True),
+                "sku": st.column_config.Column(
+                    label="SKU", disabled=True, width="small"
+                ),
+                "name": st.column_config.TextColumn(
+                    label="Name", disabled=False, width="medium"
+                ),
                 "attribute set": st.column_config.SelectboxColumn(
                     label="Product Type (attribute set)",
                     help="Change attribute set",
@@ -1723,10 +1741,18 @@ if df_original_key in st.session_state:
             st.session_state["step1_column_config_cache"] = step1_column_config
             st.session_state["step1_disabled_cols_cache"] = [
                 "sku",
-                "name",
                 "created_at",
             ]
             col_cfg, disabled_cols = _build_column_config_for_step1_like(step="step1")
+            if "sku" in df_base.columns:
+                col_cfg["sku"] = st.column_config.Column(
+                    label="SKU", disabled=True, width="small"
+                )
+            if "name" in df_base.columns:
+                col_cfg["name"] = st.column_config.TextColumn(
+                    label="Name", disabled=False, width="medium"
+                )
+            disabled_cols = [col for col in disabled_cols if col != "name"]
             if "attribute set" in col_cfg:
                 cfg = col_cfg["attribute set"]
                 if hasattr(cfg, "label"):
@@ -1748,18 +1774,38 @@ if df_original_key in st.session_state:
                 df_base,
                 column_config=col_cfg,
                 disabled=disabled_cols,
-                column_order=["sku", "name", "attribute set", "hint", "created_at"],
+                column_order=column_order,
                 use_container_width=True,
                 num_rows="fixed",
                 key=editor_key,
             )
 
-            if isinstance(edited_df, pd.DataFrame) and st.button("Show Attributes"):
+            go_attrs = st.button(
+                "🔎 Show attributes",
+                key="btn_show_attrs",
+                help="Build attribute editor for selected items",
+            )
+            if isinstance(edited_df, pd.DataFrame) and go_attrs:
                 st.session_state[df_edited_key] = edited_df.copy()
                 st.session_state["show_attributes_trigger"] = True
+                st.session_state["_go_step2_requested"] = True
                 _reset_step2_state()
+                st.rerun()
         else:
-            st.header("Step 2. Filling in attributes.")
+            st.header("Filling in attributes.")
+            if st.session_state.get("_go_step2_requested"):
+                st.session_state["_go_step2_requested"] = False
+
+            c1, c2 = st.columns([1, 1])
+            btn_save = c1.button("💾 Save to Magento", key="btn_step2_save")
+            btn_reset = c2.button("🔄 Reset all", key="btn_step2_reset")
+
+            if btn_save:
+                save_step2_to_magento()
+
+            if btn_reset:
+                _reset_step2_state()
+                st.rerun()
 
             if df_edited_key not in st.session_state or df_original_key not in st.session_state:
                 st.warning("Нет изменённых товаров.")
@@ -1828,60 +1874,23 @@ if df_original_key in st.session_state:
                                 status2 = st.status(
                                     "Building attribute editor…", expanded=True
                                 )
-                                p2 = st.progress(0)
-                                p2.progress(20)
-                                status2.update(
-                                    label="Fetching metadata from Magento…"
-                                )
+                                progress = st.progress(0)
+                                progress.progress(5)
+                                status2.update(label="Collecting selected sets…")
                                 step2_state = _ensure_step2_state()
                                 step2_state.setdefault("staged", {})
 
-                                # Унифицированный кэш метаданных
                                 meta_cache: AttributeMetaCache | None = step2_state.get(
                                     "meta_cache"
                                 )
                                 if not isinstance(meta_cache, AttributeMetaCache):
-                                    # Первый запуск — создаём и сохраняем
                                     meta_cache = AttributeMetaCache(session, api_base)
                                     step2_state["meta_cache"] = meta_cache
 
-                                categories_meta = step2_state.get("categories_meta")
-                                if not isinstance(categories_meta, dict) or not categories_meta.get(
-                                    "options"
-                                ):
-                                    try:
-                                        with st.spinner("📂 Загрузка категорий…"):
-                                            categories_meta = ensure_categories_meta(
-                                                meta_cache,
-                                                session,
-                                                api_base,
-                                                store_id=0,
-                                            )
-                                        if not isinstance(categories_meta, dict):
-                                            categories_meta = (
-                                                meta_cache.get("categories")
-                                                if isinstance(
-                                                    meta_cache, AttributeMetaCache
-                                                )
-                                                else {}
-                                            )
-                                        st.session_state["step2_categories_failed"] = False
-                                    except Exception as exc:  # pragma: no cover - UI interaction
-                                        st.warning(
-                                            f"Не удалось загрузить категории: {exc}"
-                                        )
-                                        categories_meta = (
-                                            meta_cache.get("categories")
-                                            if isinstance(meta_cache, AttributeMetaCache)
-                                            else {}
-                                        )
-                                        st.session_state["step2_categories_failed"] = True
-                                    step2_state["categories_meta"] = categories_meta
-                                else:
-                                    st.session_state["step2_categories_failed"] = False
-
-                                p2.progress(60)
-                                status2.update(label="Preparing columns…")
+                                progress.progress(15)
+                                status2.update(
+                                    label="Resolving attribute codes (brand, condition)…"
+                                )
 
                                 if not step2_state["dfs"]:
                                     (
@@ -2037,153 +2046,189 @@ if df_original_key in st.session_state:
                                             meta_for_debug,
                                             sample_df=step2_state["wide"].get(set_id),
                                         )
-                                    step2_state["meta_cache"] = meta_cache
 
-                                    for set_id, df0 in step2_state["dfs"].items():
-                                        if "value" in df0.columns:
-                                            df0["value"] = df0["value"].astype(object)
+                                step2_state["meta_cache"] = meta_cache
 
-                                    if step2_state["dfs"] and not step2_state["wide"]:
-                                        for set_id, df_existing in step2_state["dfs"].items():
-                                            if not isinstance(df_existing, pd.DataFrame):
-                                                continue
-                                            wide_df = make_wide(df_existing)
-                                            if "attribute_set_id" in wide_df.columns:
-                                                wide_df["attribute_set_id"] = set_id
-                                            else:
-                                                wide_df.insert(1, "attribute_set_id", set_id)
-                                            for column in wide_df.columns:
-                                                wide_df[column] = wide_df[column].astype(object)
-                                            step2_state["wide"][set_id] = wide_df
-                                            step2_state["wide_orig"][set_id] = wide_df.copy(
+                                for set_id, df0 in step2_state["dfs"].items():
+                                    if "value" in df0.columns:
+                                        df0["value"] = df0["value"].astype(object)
+
+                                if step2_state["dfs"] and not step2_state["wide"]:
+                                    for set_id, df_existing in step2_state["dfs"].items():
+                                        if not isinstance(df_existing, pd.DataFrame):
+                                            continue
+                                        wide_df = make_wide(df_existing)
+                                        if "attribute_set_id" in wide_df.columns:
+                                            wide_df["attribute_set_id"] = set_id
+                                        else:
+                                            wide_df.insert(1, "attribute_set_id", set_id)
+                                        for column in wide_df.columns:
+                                            wide_df[column] = wide_df[column].astype(object)
+                                        step2_state["wide"][set_id] = wide_df
+                                        step2_state["wide_orig"][set_id] = wide_df.copy(
+                                            deep=True
+                                        )
+                                        if set_id not in step2_state["wide_synced"]:
+                                            step2_state["wide_synced"][set_id] = wide_df.copy(
                                                 deep=True
                                             )
-                                            if set_id not in step2_state["wide_synced"]:
-                                                step2_state["wide_synced"][
-                                                    set_id
-                                                ] = wide_df.copy(deep=True)
-                                            attr_codes = [
-                                                col
-                                                for col in wide_df.columns
-                                                if col not in ("sku", "name")
-                                            ]
-                                            cacheable = isinstance(
-                                                meta_cache, AttributeMetaCache
+                                        attr_cols = [
+                                            col
+                                            for col in wide_df.columns
+                                            if col not in ("sku", "name")
+                                        ]
+                                        cacheable = isinstance(
+                                            meta_cache, AttributeMetaCache
+                                        )
+                                        if DEBUG:
+                                            st.write(
+                                                "DEBUG attr_cols:",
+                                                sorted(attr_cols),
+                                            )
+                                        resolved_map: dict[str, str] = {}
+                                        if cacheable:
+                                            resolved_map = meta_cache.resolve_codes_in_set(
+                                                set_id, ["brand", "condition"]
+                                            )
+                                            effective_codes: list[str] = []
+                                            seen_effective: set[str] = set()
+                                            for code in attr_cols:
+                                                if not isinstance(code, str):
+                                                    continue
+                                                effective = resolved_map.get(code, code)
+                                                if effective and effective not in seen_effective:
+                                                    seen_effective.add(effective)
+                                                    effective_codes.append(effective)
+                                            if effective_codes:
+                                                meta_cache.build_and_set_static_for(
+                                                    effective_codes, store_id=0
+                                                )
+                                            dbg_source = getattr(
+                                                meta_cache, "_debug_http", {}
+                                            )
+                                            dbg_snapshot = (
+                                                dbg_source.copy()
+                                                if isinstance(dbg_source, dict)
+                                                else {}
                                             )
                                             if DEBUG:
                                                 st.write(
-                                                    "DEBUG attr_cols:",
-                                                    sorted(attr_codes),
+                                                    "SET ATTRS DEBUG:",
+                                                    dbg_snapshot.get(f"set_{set_id}"),
+                                                    dbg_snapshot.get(f"set_{set_id}_err"),
                                                 )
-                                            resolved_map: dict[str, str] = {}
-                                            if cacheable:
-                                                resolved_map = meta_cache.resolve_codes_in_set(
-                                                    set_id, ["brand", "condition"]
-                                                )
-                                                effective_codes: list[str] = []
-                                                seen_effective: set[str] = set()
-                                                for code in attr_codes:
-                                                    if not isinstance(code, str):
-                                                        continue
-                                                    effective = resolved_map.get(code, code)
-                                                    if effective and effective not in seen_effective:
-                                                        seen_effective.add(effective)
-                                                        effective_codes.append(effective)
-                                                if effective_codes:
-                                                    meta_cache.build_and_set_static_for(
-                                                        effective_codes, store_id=0
-                                                    )
-                                                dbg_source = getattr(
-                                                    meta_cache, "_debug_http", {}
-                                                )
-                                                dbg_snapshot = (
-                                                    dbg_source.copy()
-                                                    if isinstance(dbg_source, dict)
-                                                    else {}
-                                                )
-                                                if DEBUG:
-                                                    st.write(
-                                                        "SET ATTRS DEBUG:",
-                                                        dbg_snapshot.get(
-                                                            f"set_{set_id}"
-                                                        ),
-                                                        dbg_snapshot.get(
-                                                            f"set_{set_id}_err"
-                                                        ),
-                                                    )
-                                                    st.write("RESOLVED:", resolved_map)
-                                            wide_meta = step2_state.setdefault(
-                                                "wide_meta", {}
-                                            )
-                                            meta_map: dict[str, dict] = {}
-                                            if cacheable:
-                                                for code in attr_codes:
-                                                    actual_code = resolved_map.get(code, code)
-                                                    cached = meta_cache.get(actual_code) or {}
-                                                    if not isinstance(cached, dict):
-                                                        cached = {}
-                                                    meta_map[code] = cached
-                                            else:
-                                                meta_map = {
-                                                    code: {} for code in attr_codes
+                                                st.write("RESOLVED:", resolved_map)
+                                        wide_meta = step2_state.setdefault("wide_meta", {})
+                                        meta_map: dict[str, dict] = {}
+                                        if cacheable:
+                                            for code in attr_cols:
+                                                actual_code = resolved_map.get(code, code)
+                                                cached = meta_cache.get(actual_code) or {}
+                                                if not isinstance(cached, dict):
+                                                    cached = {}
+                                                meta_map[code] = cached
+                                        else:
+                                            meta_map = {code: {} for code in attr_cols}
+                                        wide_meta[set_id] = meta_map
+                                        resolved_storage = step2_state.setdefault(
+                                            "resolved_codes", {}
+                                        )
+                                        resolved_storage[set_id] = resolved_map
+                                        _apply_categories_fallback(meta_map)
+                                        _ensure_wide_meta_options(
+                                            meta_map,
+                                            step2_state["wide"].get(set_id),
+                                        )
+                                        meta_for_debug = wide_meta[set_id]
+                                        if DEBUG:
+                                            def _meta_shot(code: str) -> dict:
+                                                m = meta_for_debug.get(code, {})
+                                                if not isinstance(m, dict):
+                                                    m = {}
+                                                return {
+                                                    "frontend_input": m.get("frontend_input"),
+                                                    "options_count": len(m.get("options") or []),
+                                                    "first_options": (m.get("options") or [])[:5],
+                                                    "has_maps": bool(m.get("options_map"))
+                                                    and bool(m.get("values_to_labels")),
+                                                    "options_source": m.get("options_source"),
                                                 }
-                                            wide_meta[set_id] = meta_map
-                                            resolved_storage = step2_state.setdefault(
-                                                "resolved_codes", {}
+
+                                            counts: dict[str, int] = {}
+                                            for meta in meta_for_debug.values():
+                                                if not isinstance(meta, dict):
+                                                    continue
+                                                t = str(meta.get("frontend_input") or "text").lower()
+                                                counts[t] = counts.get(t, 0) + 1
+
+                                            st.caption(f"DEBUG set_id={set_id}")
+                                            st.write("brand:", _meta_shot("brand"))
+                                            st.write("condition:", _meta_shot("condition"))
+                                            st.write("DEBUG types distribution:", counts)
+
+                                        step2_state["wide_colcfg"][set_id] = build_wide_colcfg(
+                                            meta_for_debug,
+                                            sample_df=step2_state["wide"].get(set_id),
+                                        )
+
+                                progress.progress(30)
+                                status2.update(label="Fetching metadata from Magento…")
+
+                                categories_meta = step2_state.get("categories_meta")
+                                if not isinstance(categories_meta, dict) or not categories_meta.get(
+                                    "options"
+                                ):
+                                    try:
+                                        with st.spinner("📂 Загрузка категорий…"):
+                                            categories_meta = ensure_categories_meta(
+                                                meta_cache,
+                                                session,
+                                                api_base,
+                                                store_id=0,
                                             )
-                                            resolved_storage[set_id] = resolved_map
-                                            _apply_categories_fallback(meta_map)
-                                            _ensure_wide_meta_options(
-                                                meta_map,
-                                                step2_state["wide"].get(set_id),
+                                        if not isinstance(categories_meta, dict):
+                                            categories_meta = (
+                                                meta_cache.get("categories")
+                                                if isinstance(
+                                                    meta_cache, AttributeMetaCache
+                                                )
+                                                else {}
                                             )
-                                            meta_for_debug = wide_meta[set_id]
-                                            if DEBUG:
-                                                def _meta_shot(code: str) -> dict:
-                                                    m = meta_for_debug.get(code, {})
-                                                    if not isinstance(m, dict):
-                                                        m = {}
-                                                    return {
-                                                        "frontend_input": m.get("frontend_input"),
-                                                        "options_count": len(m.get("options") or []),
-                                                        "first_options": (m.get("options") or [])[:5],
-                                                        "has_maps": bool(m.get("options_map"))
-                                                        and bool(m.get("values_to_labels")),
-                                                        "options_source": m.get("options_source"),
-                                                    }
+                                        st.session_state["step2_categories_failed"] = False
+                                    except Exception as exc:  # pragma: no cover - UI interaction
+                                        st.warning(
+                                            f"Не удалось загрузить категории: {exc}"
+                                        )
+                                        categories_meta = (
+                                            meta_cache.get("categories")
+                                            if isinstance(meta_cache, AttributeMetaCache)
+                                            else {}
+                                        )
+                                        st.session_state["step2_categories_failed"] = True
+                                    step2_state["categories_meta"] = categories_meta
+                                else:
+                                    st.session_state["step2_categories_failed"] = False
 
-                                                counts: dict[str, int] = {}
-                                                for meta in meta_for_debug.values():
-                                                    if not isinstance(meta, dict):
-                                                        continue
-                                                    t = str(meta.get("frontend_input") or "text").lower()
-                                                    counts[t] = counts.get(t, 0) + 1
+                                progress.progress(45)
+                                status2.update(label="Preparing categories (full tree)…")
 
-                                                st.caption(f"DEBUG set_id={set_id}")
-                                                st.write("brand:", _meta_shot("brand"))
-                                                st.write("condition:", _meta_shot("condition"))
-                                                st.write("DEBUG types distribution:", counts)
-
-                                            step2_state["wide_colcfg"][set_id] = build_wide_colcfg(
-                                                meta_for_debug,
-                                                sample_df=step2_state["wide"].get(set_id),
-                                            )
-
-                                    st.session_state["show_attrs"] = bool(
-                                        step2_state["wide"]
-                                    )
+                                st.session_state["show_attrs"] = bool(
+                                    step2_state["wide"]
+                                )
 
                                 completed = False
                                 if not step2_state["wide"]:
                                     st.warning("Нет атрибутов для отображения.")
-                                    p2.progress(100)
+                                    progress.progress(100)
                                     status2.update(
                                         state="complete", label="Attributes ready"
                                     )
                                     completed = True
                                 elif st.session_state.get("show_attrs"):
-                                    p2.progress(90)
-                                    status2.update(label="Rendering tables…")
+                                    progress.progress(60)
+                                    status2.update(
+                                        label="Normalizing values (IDs ↔ labels)…"
+                                    )
                                     wide_meta = step2_state.setdefault("wide_meta", {})
                                     categories_meta = step2_state.get("categories_meta", {})
                                     if not isinstance(categories_meta, dict):
@@ -2193,6 +2238,9 @@ if df_original_key in st.session_state:
                                         for opt in (categories_meta.get("options") or [])
                                         if isinstance(opt, dict) and opt.get("label")
                                     ]
+                                    progress.progress(75)
+                                    status2.update(label="Composing column configs…")
+                                    render_stage_done = False
                                     for set_id in sorted(step2_state["wide"].keys()):
                                         wide_df = step2_state["wide"].get(set_id)
                                         if not isinstance(wide_df, pd.DataFrame):
@@ -2287,23 +2335,26 @@ if df_original_key in st.session_state:
                                             for col in df_ref.columns
                                             if col != "attribute_set_id"
                                         ]
-                                        lead = [
-                                            col
-                                            for col in ("sku", "name", "price")
-                                            if col in column_order
+                                        lead_cols = [
+                                            c for c in ("sku", "name") if c in column_order
                                         ]
-                                        tail = [
-                                            col
-                                            for col in column_order
-                                            if col not in ("sku", "name", "price")
+                                        tail_cols = [
+                                            c
+                                            for c in column_order
+                                            if c not in ("sku", "name")
                                         ]
-                                        column_order = lead + tail
+                                        column_order = lead_cols + tail_cols
 
                                         if DEBUG:
                                             st.write(
                                                 "DEBUG column_order:",
                                                 column_order,
                                             )
+
+                                        if not render_stage_done:
+                                            progress.progress(90)
+                                            status2.update(label="Rendering tables…")
+                                            render_stage_done = True
 
                                         for current_set_id, group in df_ref.groupby(
                                             "attribute_set_id"
@@ -2379,28 +2430,13 @@ if df_original_key in st.session_state:
                                                         current_set_id, None
                                                     )
 
-                                    p2.progress(100)
+                                    progress.progress(100)
                                     status2.update(
                                         state="complete", label="Attributes ready"
                                     )
                                     completed = True
                                 if not completed:
-                                    p2.progress(100)
+                                    progress.progress(100)
                                     status2.update(
                                         state="complete", label="Attributes ready"
                                     )
-                                    if st.button(
-                                        "Save to Magento",
-                                        type="primary",
-                                        key="step2_save",
-                                    ):
-                                        save_step2_to_magento()
-
-                                    if st.button(
-                                        "Reload", key="btn_step2_reload"
-                                    ):
-                                        _reset_step2_state()
-                                        (
-                                            getattr(st, "rerun", None)
-                                            or getattr(st, "experimental_rerun")
-                                        )()
