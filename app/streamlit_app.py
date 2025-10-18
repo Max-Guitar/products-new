@@ -28,8 +28,23 @@ st.set_page_config(
 )
 st.title("🤖 Peter v.1.0 (AI Content Manager)")
 
+st.markdown(
+    """
+<style>
+.ag-theme-balham .ag-cell,
+.ag-theme-balham .ag-header-cell {
+  border-right: 1px solid #eee !important;
+}
+.ag-theme-balham .ag-header {
+  border-bottom: 1px solid #e6e6e6 !important;
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
 from connectors.magento.attributes import AttributeMetaCache
-from connectors.magento.categories import ensure_categories_meta
+from connectors.magento.categories import ensure_categories_meta, get_categories_tree
 from connectors.magento.client import get_default_products
 from services.ai_fill import (
     ALWAYS_ATTRS,
@@ -215,6 +230,206 @@ class TagMultiEditor {
   getValue(){ return this.selected.slice(); }
   destroy(){}
   isPopup(){ return true; }
+}
+"""
+)
+
+
+TagOneLineRenderer = JsCode(
+    """
+class TagOneLineRenderer {
+  init(p){
+    const map = (p.colDef.cellRendererParams && p.colDef.cellRendererParams.v2l) || {};
+    this.eGui = document.createElement('div');
+    this.eGui.style.display='flex';
+    this.eGui.style.flexWrap='nowrap';
+    this.eGui.style.alignItems='center';
+    this.eGui.style.gap='6px';
+    this.eGui.style.overflow='hidden';
+    this.eGui.style.whiteSpace='nowrap';
+    this.eGui.style.textOverflow='ellipsis';
+    const values = Array.isArray(p.value) ? p.value : (p.value ? [p.value] : []);
+    values.map(v=>map[String(v)]||String(v||"")).forEach(lbl=>{
+      const pill=document.createElement('span');
+      pill.textContent=lbl;
+      pill.style.padding='2px 8px';
+      pill.style.border='1px solid #DDD';
+      pill.style.borderRadius='999px';
+      pill.style.background='#f7f7f9';
+      pill.style.fontSize='12px';
+      pill.style.whiteSpace='nowrap';
+      this.eGui.appendChild(pill);
+    });
+  }
+  getGui(){return this.eGui}
+  refresh(){return false}
+}
+"""
+)
+
+
+TreeMultiEditor = JsCode(
+    """
+class TreeMultiEditor {
+  init(p){
+    this.p=p;
+    const tree = (p && p.tree) || [];
+    const v2l  = (p && p.v2l)  || {};
+    const sel = Array.isArray(p.value) ? p.value.map(String) : (p.value?[String(p.value)]:[]);
+    this.selected = new Set(sel);
+
+    this.root = document.createElement('div');
+    this.root.style.minWidth='540px';
+    this.root.style.maxWidth='740px';
+    this.root.style.maxHeight='70vh';
+    this.root.style.overflow='auto';
+    this.root.style.padding='8px';
+
+    const sWrap=document.createElement('div');
+    sWrap.style.display='flex';
+    sWrap.style.marginBottom='8px';
+    const input=document.createElement('input');
+    input.type='text'; input.placeholder='Search categories...';
+    input.style.flex='1'; input.style.padding='6px 8px';
+    input.style.border='1px solid #DDD'; input.style.borderRadius='6px';
+    sWrap.appendChild(input); this.root.appendChild(sWrap);
+
+    this.treeBox=document.createElement('div'); this.root.appendChild(this.treeBox);
+
+    const renderNode=(node, level=0)=>{
+      const row=document.createElement('div');
+      row.style.display='flex'; row.style.alignItems='center';
+      row.style.gap='8px'; row.style.padding='4px 4px 4px '+(12*level)+'px';
+      const cb=document.createElement('input'); cb.type='checkbox';
+      const id=String(node.id||""); const name=String(node.name||"");
+      cb.checked=this.selected.has(id);
+      cb.onchange=()=>{ if(cb.checked) this.selected.add(id); else this.selected.delete(id); };
+      const lbl=document.createElement('span'); lbl.textContent=name;
+      row.appendChild(cb); row.appendChild(lbl);
+      return {row, cb};
+    };
+
+    const renderTree=(nodes, box, level=0)=>{
+      (nodes||[]).forEach(nd=>{
+        const {row}=renderNode(nd, level);
+        box.appendChild(row);
+        const ch=nd.children_data||[];
+        if(ch.length){
+          renderTree(ch, box, level+1);
+        }
+      });
+    };
+
+    const fullTree = (this.p.treeData || []).length ? this.p.treeData : tree;
+    const build = (filter='')=>{
+      this.treeBox.innerHTML='';
+      if(!filter){
+        renderTree(fullTree, this.treeBox, 0);
+      }else{
+        const q=filter.toLowerCase();
+        Object.keys(v2l).forEach(id=>{
+          const path=v2l[id].toLowerCase();
+          if(path.includes(q)){
+            const row=document.createElement('div');
+            row.style.display='flex'; row.style.alignItems='center';
+            row.style.gap='8px'; row.style.padding='4px';
+            const cb=document.createElement('input'); cb.type='checkbox';
+            cb.checked=this.selected.has(id);
+            cb.onchange=()=>{ if(cb.checked) this.selected.add(id); else this.selected.delete(id); };
+            const lbl=document.createElement('span'); lbl.textContent=v2l[id];
+            row.appendChild(cb); row.appendChild(lbl);
+            this.treeBox.appendChild(row);
+          }
+        });
+      }
+    };
+
+    input.addEventListener('input', ()=>build(input.value));
+    build('');
+  }
+  getGui(){ return this.root }
+  afterGuiAttached(){}
+  getValue(){ return Array.from(this.selected) }
+  isPopup(){ return true }
+  destroy(){}
+}
+"""
+)
+
+
+SearchableSelectEditor = JsCode(
+    """
+class SearchableSelectEditor {
+  init(p){
+    this.p=p;
+    const labels=(p && p.values)||[];
+    this.l2v=p.l2v||{};
+    const toId=(s)=>this.l2v.hasOwnProperty(String(s))?this.l2v[String(s)]:String(s);
+    const cur=p.value!=null?String(p.value):"";
+
+    this.root=document.createElement('div');
+    this.root.style.minWidth='280px'; this.root.style.maxHeight='50vh';
+    this.root.style.overflow='auto'; this.root.style.padding='8px';
+
+    const input=document.createElement('input');
+    input.type='text'; input.placeholder='Search...';
+    input.style.width='100%'; input.style.padding='6px 8px';
+    input.style.border='1px solid #DDD'; input.style.borderRadius='6px';
+    this.root.appendChild(input);
+
+    const box=document.createElement('div');
+    box.style.marginTop='6px'; this.root.appendChild(box);
+
+    const render=(q='')=>{
+      box.innerHTML='';
+      const pool=labels.filter(l=>l.toLowerCase().includes(q.toLowerCase()));
+      pool.forEach(lbl=>{
+        const row=document.createElement('div');
+        row.textContent=lbl; row.style.padding='6px 8px'; row.style.cursor='pointer';
+        row.onmouseenter=()=>row.style.background='#f0f4ff';
+        row.onmouseleave=()=>row.style.background='white';
+        row.onclick=()=>{ this.value=toId(lbl); };
+        box.appendChild(row);
+      });
+    };
+    input.addEventListener('input', ()=>render(input.value));
+    render('');
+    this.value=cur;
+  }
+  getGui(){return this.root}
+  afterGuiAttached(){}
+  getValue(){return this.value}
+  isPopup(){return true}
+  destroy(){}
+}
+"""
+)
+
+
+HtmlEditor = JsCode(
+    """
+class HtmlEditor {
+  init(p){
+    this.p=p;
+    const val = (p.value==null) ? "" : String(p.value);
+    this.root=document.createElement('div');
+    this.root.style.minWidth='500px'; this.root.style.maxWidth='800px';
+    this.root.style.maxHeight='70vh'; this.root.style.overflow='auto';
+    const box=document.createElement('div');
+    box.contentEditable='true';
+    box.style.minHeight='140px';
+    box.style.padding='8px';
+    box.style.border='1px solid #DDD';
+    box.style.borderRadius='6px';
+    box.innerHTML=val;
+    this.root.appendChild(box);
+    this.box=box;
+  }
+  getGui(){return this.root}
+  afterGuiAttached(){ this.box.focus(); }
+  getValue(){ return this.box.innerHTML; }
+  isPopup(){ return true }
+  destroy(){}
 }
 """
 )
@@ -2711,6 +2926,56 @@ if df_original_key in st.session_state:
 
                                 _pupdate(40, "Fetching metadata from Magento…")
 
+                                if (
+                                    "categories_tree" not in step2_state
+                                    or "categories_v2l" not in step2_state
+                                ):
+                                    try:
+                                        categories_tree = get_categories_tree(
+                                            session, api_base
+                                        )
+                                    except Exception:
+                                        categories_tree = {}
+                                    if not isinstance(categories_tree, dict):
+                                        categories_tree = {}
+
+                                    def _flatten_tree(node: Any, prefix: str = "") -> list[dict[str, str]]:
+                                        out: list[dict[str, str]] = []
+                                        if not isinstance(node, dict):
+                                            return out
+                                        label = str(node.get("name") or "").strip()
+                                        cat_id = str(node.get("id") or "").strip()
+                                        path = f"{prefix} / {label}".strip(" /")
+                                        if cat_id and label:
+                                            out.append({
+                                                "id": cat_id,
+                                                "label": label,
+                                                "path": path,
+                                            })
+                                        children = node.get("children_data") or []
+                                        for child in children:
+                                            out.extend(_flatten_tree(child, path))
+                                        return out
+
+                                    flat: list[dict[str, str]] = []
+                                    if categories_tree:
+                                        flat = _flatten_tree(categories_tree)
+
+                                    step2_state["categories_tree"] = categories_tree
+                                    step2_state["categories_flat"] = flat
+                                    v2l = {
+                                        item["id"]: item["path"]
+                                        for item in flat
+                                        if item.get("id") and item.get("path")
+                                    }
+                                    l2v = {
+                                        item["path"]: item["id"]
+                                        for item in flat
+                                        if item.get("id") and item.get("path")
+                                    }
+                                    step2_state["categories_v2l"] = v2l
+                                    step2_state["categories_l2v"] = l2v
+
                                 categories_meta = step2_state.get("categories_meta")
                                 if not isinstance(categories_meta, dict) or not categories_meta.get(
                                     "options"
@@ -3052,6 +3317,23 @@ if df_original_key in st.session_state:
                                                 "cases_covers": "Cases & Covers",
                                             }
 
+                                            cats_v2l_state = (
+                                                step2_state.get("categories_v2l") or {}
+                                            )
+                                            cats_v2l = {
+                                                str(k): str(v)
+                                                for k, v in cats_v2l_state.items()
+                                            }
+                                            cats_tree_state = step2_state.get("categories_tree")
+                                            if isinstance(cats_tree_state, dict):
+                                                cats_tree_children = (
+                                                    cats_tree_state.get("children_data", []) or []
+                                                )
+                                            elif isinstance(cats_tree_state, list):
+                                                cats_tree_children = cats_tree_state
+                                            else:
+                                                cats_tree_children = []
+
                                             for col in ordered_columns:
                                                 if col not in df_view.columns:
                                                     continue
@@ -3106,6 +3388,50 @@ if df_original_key in st.session_state:
                                                     ).items()
                                                 }
 
+                                                if col == "short_description":
+                                                    gb.configure_column(
+                                                        col,
+                                                        editable=True,
+                                                        cellEditor=HtmlEditor,
+                                                        valueFormatter=JsCode(
+                                                            """
+                        function(p){
+                          var s = String(p.value||"");
+                          var div=document.createElement('div'); div.innerHTML=s;
+                          return (div.textContent||div.innerText||"").replace(/\s+/g,' ').trim();
+                        }
+                        """
+                                                        ),
+                                                        **column_kwargs,
+                                                    )
+                                                    continue
+
+                                                if col == "categories":
+                                                    cats_formatter = JsCode(
+                                                        f"""
+                        function(p){{
+                          var m={json.dumps(cats_v2l)};
+                          var v=p.value;
+                          if(Array.isArray(v)) return v.map(x=>m[String(x)]||String(x)).join(\", \");
+                          return v==null?\"\":(m[String(v)]||String(v));
+                        }}
+                        """
+                                                    )
+                                                    gb.configure_column(
+                                                        col,
+                                                        editable=True,
+                                                        cellRenderer=TagOneLineRenderer,
+                                                        cellRendererParams={"v2l": cats_v2l},
+                                                        cellEditor=TreeMultiEditor,
+                                                        cellEditorParams={
+                                                            "tree": cats_tree_children,
+                                                            "v2l": cats_v2l,
+                                                        },
+                                                        valueFormatter=cats_formatter,
+                                                        **column_kwargs,
+                                                    )
+                                                    continue
+
                                                 if ftype == "boolean":
                                                     gb.configure_column(
                                                         col,
@@ -3120,8 +3446,11 @@ if df_original_key in st.session_state:
                                                     gb.configure_column(
                                                         col,
                                                         editable=True,
-                                                        cellEditor="agSelectCellEditor",
-                                                        cellEditorParams={"values": labels},
+                                                        cellEditor=SearchableSelectEditor,
+                                                        cellEditorParams={
+                                                            "values": labels,
+                                                            "l2v": l2v,
+                                                        },
                                                         valueFormatter=JsCode(
                                                             f"function(p){{var m={json.dumps(v2l)};var v=p.value;return m[String(v)]||String(v||'');}}"
                                                         ),
@@ -3168,39 +3497,6 @@ if df_original_key in st.session_state:
                                                 singleClickEdit=True,
                                                 stopEditingWhenCellsLoseFocus=True,
                                                 rowSelection="none",
-                                            )
-
-                                            dbg_meta = meta_map_current.get(
-                                                "categories", {}
-                                            )
-                                            if not isinstance(dbg_meta, dict):
-                                                dbg_meta = {}
-                                            st.write(
-                                                "DBG categories meta OK:",
-                                                {
-                                                    "type": dbg_meta.get(
-                                                        "frontend_input"
-                                                    ),
-                                                    "opts": len(
-                                                        dbg_meta.get("options") or []
-                                                    ),
-                                                    "sample_opts": (
-                                                        dbg_meta.get("options") or []
-                                                    )[:3],
-                                                },
-                                            )
-                                            st.write(
-                                                "DBG df sample values:",
-                                                {
-                                                    "raw": (
-                                                        group["categories"]
-                                                        .head(2)
-                                                        .tolist()
-                                                        if "categories"
-                                                        in group.columns
-                                                        else None
-                                                    )
-                                                },
                                             )
 
                                             if st.checkbox(
