@@ -361,26 +361,50 @@ def _meta_options(meta: dict) -> list:
     return unique
 
 
-def make_value_formatter(v2l: dict[str, str]) -> JsCode:
-    js = f"""
+def _meta_options_list(meta: dict) -> list[str]:
+    return [
+        str(opt.get("label", "")).strip()
+        for opt in (meta.get("options") or [])
+        if isinstance(opt, dict)
+        and str(opt.get("label", "")).strip()
+    ]
+
+
+def _v2l(meta: dict) -> dict[str, str]:
+    return {
+        str(key): str(value)
+        for key, value in (meta.get("values_to_labels") or {}).items()
+    }
+
+
+def _l2v(meta: dict) -> dict[str, str]:
+    return {
+        str(key): str(value)
+        for key, value in (meta.get("options_map") or {}).items()
+    }
+
+
+def _make_value_formatter(v2l: dict[str, str]) -> JsCode:
+    return JsCode(
+        f"""
     function(p) {{
       var map = {json.dumps(v2l)};
       var v = p.value;
       if (Array.isArray(v)) return v.map(x => map[String(x)] || String(x)).join(", ");
       if (v === null || v === undefined) return "";
       return map[String(v)] || String(v);
-    }}
-    """
-    return JsCode(js)
+    }}"""
+    )
 
 
-def make_value_setter(l2v: dict[str, str], is_multi: bool) -> JsCode:
-    js = f"""
+def _make_value_setter(l2v: dict[str, str], is_multi: bool) -> JsCode:
+    return JsCode(
+        f"""
     function(p) {{
       var map = {json.dumps(l2v)};
       var nv = p.newValue;
       function toId(x) {{
-        if (x === null || x === undefined) return null;
+        if (x == null) return null;
         var s = String(x).trim();
         return map.hasOwnProperty(s) ? map[s] : s;
       }}
@@ -390,16 +414,15 @@ def make_value_setter(l2v: dict[str, str], is_multi: bool) -> JsCode:
           p.data[p.colDef.field] = nv.map(toId).filter(x => x !== null);
           return true;
         }}
-        var parts = String(nv).split(",").map(s => s.trim()).filter(s => s.length);
+        var parts = String(nv).split(",").map(s => s.trim()).filter(Boolean);
         p.data[p.colDef.field] = parts.map(toId);
         return true;
       }} else {{
         p.data[p.colDef.field] = toId(nv);
         return true;
       }}
-    }}
-    """
-    return JsCode(js)
+    }}"""
+    )
 
 
 def _attr_set_icon(name: str) -> str:
@@ -1083,9 +1106,13 @@ def _apply_categories_fallback(meta_map: dict[str, dict]) -> None:
     if not st.session_state.get("step2_categories_failed"):
         return
     meta = meta_map.get("categories")
-    if isinstance(meta, dict):
-        meta["frontend_input"] = "text"
-        meta.pop("options", None)
+    if isinstance(meta, dict) and meta.get("options"):
+        return
+    fallback = meta_map.setdefault("categories", {})
+    fallback["frontend_input"] = "text"
+    fallback.pop("options", None)
+    fallback.pop("options_map", None)
+    fallback.pop("values_to_labels", None)
 
 
 def colcfg_from_meta(
@@ -2557,12 +2584,40 @@ if df_original_key in st.session_state:
                                         categories_meta = (
                                             meta_cache.get("categories")
                                             if isinstance(meta_cache, AttributeMetaCache)
-                                            else {}
-                                        )
-                                        st.session_state["step2_categories_failed"] = True
-                                    step2_state["categories_meta"] = categories_meta
+                                        else {}
+                                    )
+                                    st.session_state["step2_categories_failed"] = True
                                 else:
                                     st.session_state["step2_categories_failed"] = False
+
+                                if not isinstance(categories_meta, dict):
+                                    categories_meta = {}
+                                step2_state["categories_meta"] = categories_meta
+
+                                step2_state["categories_all_labels"] = [
+                                    o.get("label", "")
+                                    for o in (categories_meta.get("options") or [])
+                                    if isinstance(o, dict)
+                                ]
+
+                                wide_meta_all = step2_state.get("wide_meta")
+                                if isinstance(wide_meta_all, dict):
+                                    for sid, meta_map_all in wide_meta_all.items():
+                                        if not isinstance(meta_map_all, dict):
+                                            continue
+                                        categories_slot = meta_map_all.setdefault(
+                                            "categories", {}
+                                        )
+                                        categories_slot["frontend_input"] = "multiselect"
+                                        categories_slot["options"] = (
+                                            categories_meta.get("options", []) or []
+                                        )
+                                        categories_slot["options_map"] = (
+                                            categories_meta.get("options_map", {}) or {}
+                                        )
+                                        categories_slot["values_to_labels"] = (
+                                            categories_meta.get("values_to_labels", {}) or {}
+                                        )
 
                                 _pupdate(45, "Preparing categories (full tree)…")
 
@@ -2808,43 +2863,6 @@ if df_original_key in st.session_state:
                                             )
                                             if not isinstance(meta_map_current, dict):
                                                 meta_map_current = {}
-                                            if not meta_map_current:
-                                                meta_map_current = (
-                                                    meta_map
-                                                    if isinstance(meta_map, dict)
-                                                    else {}
-                                                )
-
-                                            def meta_options(col: str) -> list[str]:
-                                                if col == "categories":
-                                                    labels = step2_state.get(
-                                                        "categories_all_labels", []
-                                                    )
-                                                    return list(dict.fromkeys(labels))
-                                                meta = (meta_map_current or {}).get(col, {}) or {}
-                                                opts = meta.get("options") or []
-                                                labels = [
-                                                    str(opt.get("label", "")).strip()
-                                                    for opt in opts
-                                                    if isinstance(opt, dict)
-                                                ]
-                                                return [label for label in labels if label]
-
-                                            def values_to_labels_map(col: str) -> dict[str, str]:
-                                                meta = (meta_map_current or {}).get(col, {}) or {}
-                                                v2l = meta.get("values_to_labels") or {}
-                                                return {
-                                                    str(key): str(value)
-                                                    for key, value in v2l.items()
-                                                }
-
-                                            def labels_to_values_map(col: str) -> dict[str, str]:
-                                                meta = (meta_map_current or {}).get(col, {}) or {}
-                                                l2v = meta.get("options_map") or {}
-                                                return {
-                                                    str(key): str(value)
-                                                    for key, value in l2v.items()
-                                                }
 
                                             for col in ordered_columns:
                                                 if col not in df_view.columns:
@@ -2877,13 +2895,12 @@ if df_original_key in st.session_state:
                                                 if header_name:
                                                     column_kwargs["headerName"] = header_name
 
-                                                meta = (meta_map_current or {}).get(col, {}) or {}
+                                                meta = meta_map_current.get(col, {})
+                                                if not isinstance(meta, dict):
+                                                    meta = {}
                                                 ctype = str(
                                                     meta.get("frontend_input") or ""
                                                 ).lower()
-
-                                                if col == "categories":
-                                                    ctype = "multiselect"
 
                                                 if ctype == "boolean":
                                                     gb.configure_column(
@@ -2893,9 +2910,9 @@ if df_original_key in st.session_state:
                                                         **column_kwargs,
                                                     )
                                                 elif ctype in {"select", "multiselect"}:
-                                                    labels = meta_options(col)
-                                                    v2l = values_to_labels_map(col)
-                                                    l2v = labels_to_values_map(col)
+                                                    labels = _meta_options_list(meta)
+                                                    v2l = _v2l(meta)
+                                                    l2v = _l2v(meta)
                                                     is_multi = (
                                                         ctype == "multiselect"
                                                     )
@@ -2908,8 +2925,8 @@ if df_original_key in st.session_state:
                                                             "filterList": True,
                                                             "multiple": is_multi,
                                                         },
-                                                        valueFormatter=make_value_formatter(v2l),
-                                                        valueSetter=make_value_setter(
+                                                        valueFormatter=_make_value_formatter(v2l),
+                                                        valueSetter=_make_value_setter(
                                                             l2v, is_multi
                                                         ),
                                                         **column_kwargs,
@@ -2922,6 +2939,29 @@ if df_original_key in st.session_state:
                                                 singleClickEdit=True,
                                                 stopEditingWhenCellsLoseFocus=True,
                                                 rowSelection="none",
+                                            )
+
+                                            dbg_meta = meta_map_current.get(
+                                                "categories", {}
+                                            )
+                                            if not isinstance(dbg_meta, dict):
+                                                dbg_meta = {}
+                                            st.write(
+                                                "DBG categories meta:",
+                                                {
+                                                    "type": dbg_meta.get(
+                                                        "frontend_input"
+                                                    ),
+                                                    "opts": len(
+                                                        dbg_meta.get("options") or []
+                                                    ),
+                                                    "has_v2l": bool(
+                                                        dbg_meta.get("values_to_labels")
+                                                    ),
+                                                    "has_l2v": bool(
+                                                        dbg_meta.get("options_map")
+                                                    ),
+                                                },
                                             )
 
                                             if st.checkbox(
@@ -2947,10 +2987,18 @@ if df_original_key in st.session_state:
                                                                     )
                                                                 ),
                                                                 "opts": len(
-                                                                    meta_options(probe)
+                                                                    _meta_options_list(
+                                                                        meta_map_current.get(
+                                                                            probe, {}
+                                                                        )
+                                                                    )
                                                                 ),
                                                                 "v2l": list(
-                                                                    values_to_labels_map(probe).items()
+                                                                    _v2l(
+                                                                        meta_map_current.get(
+                                                                            probe, {}
+                                                                        )
+                                                                    ).items()
                                                                 )[:5],
                                                             },
                                                         )
@@ -2987,28 +3035,32 @@ if df_original_key in st.session_state:
 
                                             editor_df = editor_df.reindex(columns=df_view.columns)
 
-                                            def _to_list(value: Any) -> list[Any]:
-                                                if value is None or value == "" or value == []:
-                                                    return []
-                                                if isinstance(value, list):
-                                                    return value
-                                                return [value]
-
-                                            multi_columns = {
-                                                col_name
-                                                for col_name, meta in (meta_map_current or {}).items()
-                                                if isinstance(meta, dict)
-                                                and str(
-                                                    meta.get("frontend_input") or ""
-                                                ).lower()
-                                                == "multiselect"
-                                            }
-
                                             for column in editor_df.columns:
-                                                if (
-                                                    column == "categories"
-                                                    or column in multi_columns
-                                                ):
+                                                meta_for_column = (
+                                                    meta_map_current.get(column, {})
+                                                    if isinstance(meta_map_current, dict)
+                                                    else {}
+                                                )
+                                                if not isinstance(meta_for_column, dict):
+                                                    meta_for_column = {}
+                                                ctype = str(
+                                                    meta_for_column.get(
+                                                        "frontend_input"
+                                                    )
+                                                    or ""
+                                                ).lower()
+                                                if ctype == "multiselect":
+                                                    def _to_list(value: Any) -> list[Any]:
+                                                        if (
+                                                            value is None
+                                                            or value == ""
+                                                            or value == []
+                                                        ):
+                                                            return []
+                                                        if isinstance(value, list):
+                                                            return value
+                                                        return [value]
+
                                                     editor_df[column] = (
                                                         editor_df[column]
                                                         .apply(_to_list)
