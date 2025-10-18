@@ -47,6 +47,58 @@ _HAS_FIXED_KW = _supports_column_fixed_param(cc.TextColumn) and _supports_column
 )
 _HAS_FIXED_COLUMNS_ARG = _supports_editor_fixed_columns_param()
 
+
+def _render_pin_self_test() -> None:  # pragma: no cover - UI helper
+    with st.expander("🧪 PIN support self-test", expanded=False):
+        st.write("DEBUG supports fixed_columns in st.data_editor:", _HAS_FIXED_COLUMNS_ARG)
+        st.write("DEBUG supports fixed=True in column_config classes:", _HAS_FIXED_KW)
+
+        df_test = pd.DataFrame(
+            {
+                "sku": [f"A{i:03d}" for i in range(20)],
+                "name": [f"Product {i}" for i in range(20)],
+                "price": np.random.randint(10, 999, size=20).astype(int),
+            }
+        )
+        for idx in range(15):
+            df_test[f"col_{idx:02d}"] = [f"val_{idx}_{i}" for i in range(20)]
+
+        column_config: dict[str, object] = {
+            "sku": cc.TextColumn("SKU", disabled=True, width="small"),
+            "name": cc.TextColumn("Name", disabled=False, width="medium"),
+            "price": cc.NumberColumn("Price", disabled=True, width="small", step=1),
+        }
+
+        if _HAS_FIXED_KW:
+            column_config["sku"] = cc.TextColumn(
+                "SKU", disabled=True, width="small", fixed=True
+            )
+            column_config["name"] = cc.TextColumn(
+                "Name", disabled=False, width="medium", fixed=True
+            )
+
+        column_order = [
+            "sku",
+            "name",
+            "price",
+            *[col for col in df_test.columns if col not in {"sku", "name", "price"}],
+        ]
+        df_test = df_test[column_order]
+
+        editor_kwargs: dict[str, object] = {"hide_index": True, "use_container_width": True}
+        if _HAS_FIXED_COLUMNS_ARG:
+            editor_kwargs["fixed_columns"] = {"left": 2}
+
+        st.data_editor(
+            df_test,
+            column_config=column_config,
+            column_order=column_order,
+            **editor_kwargs,
+        )
+
+
+_render_pin_self_test()
+
 from connectors.magento.attributes import AttributeMetaCache
 from connectors.magento.categories import ensure_categories_meta
 from connectors.magento.client import get_default_products
