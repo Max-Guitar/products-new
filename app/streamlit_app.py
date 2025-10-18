@@ -69,6 +69,169 @@ _ATTRIBUTE_SET_ICONS = {
 _DEFAULT_ATTRIBUTE_ICON = "🧩"
 
 
+EMPTY_ID = ""
+EMPTY_LABEL = "(none)"
+
+
+TagCellRenderer = JsCode(
+    """
+class TagCellRenderer {
+  init(params) {
+    this.eGui = document.createElement('div');
+    this.eGui.style.display = 'flex';
+    this.eGui.style.flexWrap = 'wrap';
+    this.eGui.style.gap = '4px';
+
+    const v = params.value;
+    const map = params.colDef.cellRendererParams && params.colDef.cellRendererParams.v2l ? params.colDef.cellRendererParams.v2l : {};
+    const toLabel = (x) => map[String(x)] || String(x || "");
+
+    const pills = Array.isArray(v) ? v.map(toLabel) : [toLabel(v)];
+    pills.forEach(lbl => {
+      const span = document.createElement('span');
+      span.textContent = lbl;
+      span.style.padding = '2px 8px';
+      span.style.borderRadius = '999px';
+      span.style.border = '1px solid #DDD';
+      span.style.fontSize = '12px';
+      span.style.background = '#f7f7f9';
+      this.eGui.appendChild(span);
+    });
+  }
+  getGui() { return this.eGui; }
+  refresh() { return false; }
+}
+"""
+)
+
+
+TagMultiEditor = JsCode(
+    """
+class TagMultiEditor {
+  init(params) {
+    this.params = params;
+    this.labels = (params && params.values) ? params.values : [];
+    this.v2l = (params && params.v2l) ? params.v2l : {};
+    this.l2v = (params && params.l2v) ? params.l2v : {};
+
+    const toId   = (s) => this.l2v.hasOwnProperty(String(s)) ? this.l2v[String(s)] : String(s);
+    const toLbl  = (id) => this.v2l.hasOwnProperty(String(id)) ? this.v2l[String(id)] : String(id);
+
+    this.selected = Array.isArray(params.value) ? params.value.map(v => String(v)) :
+                    (params.value ? [String(params.value)] : []);
+
+    this.root = document.createElement('div');
+    this.root.style.padding = '8px';
+    this.root.style.minWidth = '340px';
+    this.root.style.maxWidth = '520px';
+
+    this.tagsLine = document.createElement('div');
+    this.tagsLine.style.display = 'flex';
+    this.tagsLine.style.flexWrap = 'wrap';
+    this.tagsLine.style.gap = '6px';
+    this.tagsLine.style.marginBottom = '8px';
+    this.root.appendChild(this.tagsLine);
+
+    const wrapper = document.createElement('div');
+    wrapper.style.display = 'flex';
+    wrapper.style.gap = '8px';
+
+    this.input = document.createElement('input');
+    this.input.type = 'text';
+    this.input.placeholder = 'Type to search...';
+    this.input.style.flex = '1';
+    this.input.style.padding = '6px 8px';
+    this.input.style.border = '1px solid #DDD';
+    this.input.style.borderRadius = '6px';
+
+    this.addBtn = document.createElement('button');
+    this.addBtn.textContent = 'Add';
+    this.addBtn.style.padding = '6px 10px';
+
+    wrapper.appendChild(this.input);
+    wrapper.appendChild(this.addBtn);
+    this.root.appendChild(wrapper);
+
+    this.suggestions = document.createElement('div');
+    this.suggestions.style.border = '1px solid #EEE';
+    this.suggestions.style.marginTop = '6px';
+    this.suggestions.style.maxHeight = '160px';
+    this.suggestions.style.overflowY = 'auto';
+    this.root.appendChild(this.suggestions);
+
+    const renderTags = () => {
+      this.tagsLine.innerHTML = '';
+      this.selected.forEach(id => {
+        const pill = document.createElement('span');
+        pill.textContent = toLbl(id);
+        pill.style.padding = '2px 8px';
+        pill.style.border = '1px solid #DDD';
+        pill.style.borderRadius = '999px';
+        pill.style.background = '#f7f7f9';
+        pill.style.fontSize = '12px';
+        pill.style.display = 'inline-flex';
+        pill.style.alignItems = 'center';
+        pill.style.gap = '6px';
+
+        const x = document.createElement('span');
+        x.textContent = '×';
+        x.style.cursor = 'pointer';
+        x.onclick = () => { this.selected = this.selected.filter(v => v !== id); renderTags(); };
+        pill.appendChild(x);
+
+        this.tagsLine.appendChild(pill);
+      });
+    };
+
+    const renderSuggestions = (q='') => {
+      const query = String(q).toLowerCase().trim();
+      this.suggestions.innerHTML = '';
+      const pool = this.labels.filter(lbl => lbl.toLowerCase().includes(query));
+      pool.forEach(lbl => {
+        const row = document.createElement('div');
+        row.textContent = lbl;
+        row.style.padding = '6px 8px';
+        row.style.cursor = 'pointer';
+        row.onmouseenter = () => { row.style.background = '#f0f4ff'; };
+        row.onmouseleave = () => { row.style.background = 'white'; };
+        row.onclick = () => {
+          const id = toId(lbl);
+          if (!this.selected.includes(String(id))) {
+            this.selected.push(String(id));
+            renderTags();
+          }
+        };
+        this.suggestions.appendChild(row);
+      });
+    };
+
+    this.input.addEventListener('input', () => renderSuggestions(this.input.value));
+    this.addBtn.onclick = () => {
+      const lbl = this.input.value.trim();
+      if (!lbl) return;
+      const id = toId(lbl);
+      if (!this.selected.includes(String(id))) {
+        this.selected.push(String(id));
+        renderTags();
+      }
+      this.input.value = '';
+      renderSuggestions('');
+    };
+
+    renderTags();
+    renderSuggestions('');
+  }
+
+  getGui() { return this.root; }
+  afterGuiAttached() { if (this.input) this.input.focus(); }
+  getValue() { return this.selected.slice(); }
+  destroy() {}
+  isPopup() { return true; }
+}
+"""
+)
+
+
 BASE_ORDER = [
     "sku",
     "name",
@@ -384,6 +547,19 @@ def _l2v(meta: dict) -> dict[str, str]:
     }
 
 
+def _inject_empty_option(meta: dict):
+    opts = meta.setdefault("options", [])
+    has_empty = any(
+        str(o.get("value", "")) == "" for o in opts if isinstance(o, dict)
+    )
+    if not has_empty:
+        opts.insert(0, {"label": EMPTY_LABEL, "value": EMPTY_ID})
+    v2l = meta.setdefault("values_to_labels", {})
+    l2v = meta.setdefault("options_map", {})
+    v2l[str(EMPTY_ID)] = EMPTY_LABEL
+    l2v[str(EMPTY_LABEL)] = str(EMPTY_ID)
+
+
 def _coerce_multiselect_cell(v, l2v: dict[str, str]) -> list[str]:
     if v is None or v == "" or v == []:
         return []
@@ -414,101 +590,6 @@ def _coerce_multiselect_cell(v, l2v: dict[str, str]) -> list[str]:
             if x.strip()
         ]
     return [l2v.get(s, s)]
-
-
-def make_value_formatter(v2l: dict) -> JsCode:
-    return JsCode(
-        f"""
-    function(p) {{
-      var map = {json.dumps({})};
-      map = {json.dumps(v2l)};
-      var v = p.value;
-      if (Array.isArray(v)) return v.map(x => map[String(x)] || String(x)).join(", ");
-      if (v === null || v === undefined) return "";
-      return map[String(v)] || String(v);
-    }}
-    """
-    )
-
-
-def make_value_setter(l2v: dict, is_multi: bool) -> JsCode:
-    return JsCode(
-        f"""
-    function(p) {{
-      var map = {json.dumps(l2v)};
-      function toId(x) {{
-        if (x == null) return null;
-        var s = String(x).trim();
-        return map.hasOwnProperty(s) ? map[s] : s;
-      }}
-      var nv = p.newValue;
-      if ({str(is_multi).lower()}) {{
-        if (nv == null) {{ p.data[p.colDef.field] = []; return true; }}
-        if (Array.isArray(nv)) {{
-          p.data[p.colDef.field] = nv.map(toId).filter(x => x !== null);
-          return true;
-        }}
-        var parts = String(nv).split(",").map(s => s.trim()).filter(Boolean);
-        p.data[p.colDef.field] = parts.map(toId);
-        return true;
-      }} else {{
-        p.data[p.colDef.field] = toId(nv);
-        return true;
-      }}
-    }}
-    """
-    )
-
-
-# КАСТОМНЫЙ MULTISELECT EDITOR (Community)
-MultiSelectEditor = JsCode(
-    """
-class MultiSelectEditor {
-  init(params) {
-    this.params = params;
-    this.values = (params && params.values) ? params.values : [];
-    this.container = document.createElement('div');
-    this.container.style.padding = '4px';
-    this.select = document.createElement('select');
-    this.select.setAttribute('multiple', 'multiple');
-    this.select.style.width = '100%';
-    this.select.style.minWidth = '200px';
-    this.select.style.minHeight = '120px';
-
-    // значения колонке сейчас: массив ID или массив строк/лейблов
-    const current = Array.isArray(params.value) ? params.value.map(v => String(v)) : [];
-
-    // заполняем опции (labels)
-    this.values.forEach(label => {
-      const opt = document.createElement('option');
-      opt.value = String(label);
-      opt.textContent = String(label);
-      this.select.appendChild(opt);
-      // если текущее значение содержит label — помечаем выбранным (форматтер/сеттер конвертнёт в ID)
-      if (current.includes(String(label))) {
-        opt.selected = true;
-      }
-    });
-
-    this.container.appendChild(this.select);
-  }
-
-  getGui() { return this.container; }
-
-  afterGuiAttached() {
-    if (this.select) this.select.focus();
-  }
-
-  getValue() {
-    const selected = Array.from(this.select.selectedOptions || []).map(o => o.value);
-    return selected; // valueSetter конвертирует labels -> ids
-  }
-
-  destroy() {}
-  isPopup() { return true; } // рендер в попапе
-}
-"""
-)
 
 
 def _attr_set_icon(name: str) -> str:
@@ -2914,6 +2995,8 @@ if df_original_key in st.session_state:
                                                 ftype = (
                                                     meta.get("frontend_input") or ""
                                                 ).lower()
+                                                if ftype in ("select", "multiselect"):
+                                                    _inject_empty_option(meta)
                                                 if ftype == "multiselect":
                                                     l2v = {
                                                         str(k): str(v)
@@ -2941,7 +3024,9 @@ if df_original_key in st.session_state:
                                                 wcfg = {}
 
                                             gb = GridOptionsBuilder.from_dataframe(df_view)
-                                            gb.configure_default_column(editable=True)
+                                            gb.configure_default_column(
+                                                editable=True, wrapText=True, autoHeight=True
+                                            )
 
                                             if "sku" in df_view.columns:
                                                 gb.configure_column(
@@ -3009,6 +3094,8 @@ if df_original_key in st.session_state:
                                                 ftype = (
                                                     meta.get("frontend_input") or ""
                                                 ).lower()
+                                                if ftype in ("select", "multiselect"):
+                                                    _inject_empty_option(meta)
                                                 labels = [
                                                     str(o.get("label", "")).strip()
                                                     for o in (meta.get("options") or [])
@@ -3045,9 +3132,8 @@ if df_original_key in st.session_state:
                                                         editable=True,
                                                         cellEditor="agSelectCellEditor",
                                                         cellEditorParams={"values": labels},
-                                                        valueFormatter=make_value_formatter(v2l),
-                                                        valueSetter=make_value_setter(
-                                                            l2v, False
+                                                        valueFormatter=JsCode(
+                                                            f"function(p){{var m={json.dumps(v2l)};var v=p.value;return m[String(v)]||String(v||'');}}"
                                                         ),
                                                         **column_kwargs,
                                                     )
@@ -3057,11 +3143,23 @@ if df_original_key in st.session_state:
                                                     gb.configure_column(
                                                         col,
                                                         editable=True,
-                                                        cellEditor=MultiSelectEditor,
-                                                        cellEditorParams={"values": labels},
-                                                        valueFormatter=make_value_formatter(v2l),
-                                                        valueSetter=make_value_setter(
-                                                            l2v, True
+                                                        cellRenderer=TagCellRenderer,
+                                                        cellRendererParams={"v2l": v2l},
+                                                        cellEditor=TagMultiEditor,
+                                                        cellEditorParams={
+                                                            "values": labels,
+                                                            "v2l": v2l,
+                                                            "l2v": l2v,
+                                                        },
+                                                        valueFormatter=JsCode(
+                                                            f"""
+                      function(p){{
+                        var m={json.dumps(v2l)};
+                        var v=p.value;
+                        if(Array.isArray(v)) return v.map(x=>m[String(x)]||String(x)).join(\", \");
+                        return v==null?\"\":(m[String(v)]||String(v));
+                      }}
+                    """
                                                         ),
                                                         **column_kwargs,
                                                     )
@@ -3074,6 +3172,7 @@ if df_original_key in st.session_state:
                                                 )
 
                                             gb.configure_grid_options(
+                                                domLayout="autoHeight",
                                                 suppressColumnMove=True,
                                                 singleClickEdit=True,
                                                 stopEditingWhenCellsLoseFocus=True,
@@ -3157,9 +3256,6 @@ if df_original_key in st.session_state:
                                                 gridOptions=gb.build(),
                                                 update_mode=GridUpdateMode.VALUE_CHANGED,
                                                 allow_unsafe_jscode=True,
-                                                height=min(
-                                                    440, 64 + 32 * len(df_view)
-                                                ),
                                                 fit_columns_on_grid_load=False,
                                                 theme="balham",
                                                 key=f"aggrid_set_{current_set_id}",
