@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import inspect
 import math
 import sys
 from pathlib import Path
@@ -15,10 +14,8 @@ from collections.abc import Iterable
 from urllib.parse import quote
 import re
 
-import numpy as np
 import pandas as pd
 import streamlit as st
-from streamlit import column_config as cc
 
 st.set_page_config(
     page_title="🤖 Peter v.1.0 (AI Content Manager)",
@@ -76,24 +73,6 @@ BASE_ORDER = [
     "country_of_manufacture",
     "brand",
 ]
-
-
-
-def _supports_editor_fixed_columns_param() -> bool:
-    try:
-        return "fixed_columns" in inspect.signature(st.data_editor).parameters
-    except Exception:
-        return False
-
-
-_EDITOR_SUPPORTS_FIXED_COLUMNS = _supports_editor_fixed_columns_param()
-
-_EDITOR_BASE_KWARGS: dict[str, object] = {
-    "hide_index": True,
-    "use_container_width": True,
-}
-if _EDITOR_SUPPORTS_FIXED_COLUMNS:
-    _EDITOR_BASE_KWARGS["fixed_columns"] = {"left": 2}
 
 
 def build_column_order_for_set(
@@ -300,181 +279,6 @@ def _pin_sku_name(order: Iterable[str], df_cols: Iterable[str]) -> list[str]:
     rest = [c for c in order if c not in lead and c in df_cols]
     missing = [c for c in df_cols if c not in lead and c not in rest]
     return lead + rest + missing
-
-
-def _prepare_editor_view(
-    df_view: pd.DataFrame,
-    *,
-    column_config: dict[str, object] | None = None,
-    column_order: Iterable[str] | None = None,
-) -> tuple[pd.DataFrame, dict[str, object], list[str]]:
-    assert isinstance(df_view, pd.DataFrame)
-    df_local = df_view.copy()
-
-    cfg: dict[str, object] = dict(column_config or {})
-
-    if column_order is not None:
-        try:
-            preferred_order = [
-                col for col in column_order if col in df_local.columns
-            ]
-            remaining = [
-                col for col in df_local.columns if col not in preferred_order
-            ]
-            ordered = preferred_order + remaining
-            if ordered:
-                df_local = df_local[ordered]
-        except KeyError:
-            pass
-
-    pinned_cfg: dict[str, object] = {}
-    if "sku" in df_local.columns:
-        pinned_cfg["sku"] = cc.TextColumn(
-            "SKU", disabled=True, width="small"
-        )
-    if "name" in df_local.columns:
-        pinned_cfg["name"] = cc.TextColumn(
-            "Name", disabled=False, width="medium"
-        )
-    if "price" in df_local.columns:
-        pinned_cfg["price"] = cc.NumberColumn(
-            "Price", disabled=True, width="small", step=1
-        )
-
-    cfg.update(pinned_cfg)
-
-    pinned_order = [
-        col
-        for col in ["sku", "name", "price"]
-        if col in df_local.columns
-    ]
-    rest_order = [
-        col
-        for col in df_local.columns
-        if col not in ("sku", "name", "price")
-    ]
-    final_order = pinned_order + rest_order
-    if final_order:
-        df_local = df_local[final_order]
-
-    return df_local, cfg, final_order
-
-
-def _render_editor_fallback(
-    df_view: pd.DataFrame,
-    *,
-    column_config: dict[str, object],
-    column_order: list[str],
-    **kwargs,
-):
-    fallback_kwargs = dict(kwargs)
-    key = fallback_kwargs.pop("key", None)
-    disabled = fallback_kwargs.pop("disabled", None)
-
-    df_local = df_view.copy()
-    if column_order:
-        try:
-            df_local = df_local[column_order]
-        except KeyError:
-            pass
-    df_local = df_local.reset_index(drop=True)
-
-    fixed_cols = [
-        col for col in ["sku", "name", "price"] if col in df_local.columns
-    ]
-    rest_cols = [col for col in df_local.columns if col not in fixed_cols]
-
-    if not fixed_cols or not rest_cols:
-        single_kwargs = dict(fallback_kwargs)
-        if key is not None:
-            single_kwargs["key"] = key
-        if disabled is not None:
-            single_kwargs["disabled"] = disabled
-        return st.data_editor(
-            df_local,
-            column_config=column_config,
-            column_order=column_order,
-            **single_kwargs,
-        )
-
-    left_cfg = {col: column_config[col] for col in fixed_cols if col in column_config}
-    right_cfg = {col: column_config[col] for col in rest_cols if col in column_config}
-
-    disabled_left = disabled
-    disabled_right = disabled
-    if isinstance(disabled, (list, tuple, set)):
-        disabled_left = [col for col in disabled if col in fixed_cols]
-        disabled_right = [col for col in disabled if col in rest_cols]
-
-    colL, colR = st.columns([1.2, 4.0], vertical_alignment="top")
-
-    left_kwargs = dict(fallback_kwargs)
-    if disabled_left is not None:
-        left_kwargs["disabled"] = disabled_left
-    if key is not None:
-        left_kwargs["key"] = f"{key}__fixed"
-    with colL:
-        left_edit = st.data_editor(
-            df_local[fixed_cols],
-            column_config=left_cfg,
-            column_order=fixed_cols,
-            **left_kwargs,
-        )
-    left_result = (
-        left_edit
-        if isinstance(left_edit, pd.DataFrame)
-        else df_local[fixed_cols].copy()
-    )
-
-    right_kwargs = dict(fallback_kwargs)
-    if disabled_right is not None:
-        right_kwargs["disabled"] = disabled_right
-    if key is not None:
-        right_kwargs["key"] = f"{key}__rest"
-    with colR:
-        right_edit = st.data_editor(
-            df_local[rest_cols],
-            column_config=right_cfg,
-            column_order=rest_cols,
-            **right_kwargs,
-        )
-    right_result = (
-        right_edit
-        if isinstance(right_edit, pd.DataFrame)
-        else df_local[rest_cols].copy()
-    )
-
-    merged = pd.concat([left_result, right_result], axis=1)
-    df_local.loc[:, merged.columns] = merged.values
-    if column_order:
-        try:
-            df_local = df_local[column_order]
-        except KeyError:
-            pass
-    return df_local
-
-
-def _render_data_editor(
-    df_view: pd.DataFrame,
-    *,
-    column_config: dict[str, object],
-    column_order: list[str],
-    **kwargs,
-):
-    editor_kwargs = {**_EDITOR_BASE_KWARGS, **kwargs}
-    if _EDITOR_SUPPORTS_FIXED_COLUMNS:
-        return st.data_editor(
-            df_view,
-            column_config=column_config,
-            column_order=column_order,
-            **editor_kwargs,
-        )
-    return _render_editor_fallback(
-        df_view,
-        column_config=column_config,
-        column_order=column_order,
-        **editor_kwargs,
-    )
 
 
 def _parse_category_token(token: object) -> int | None:
@@ -1071,16 +875,12 @@ def _probe_editor_groups(
         }
         sub_disabled = [col for col in disabled if col in columns_chunk]
         try:
-            prepared_df, prepared_cfg, prepared_order = _prepare_editor_view(
+            st.data_editor(
                 sub_df,
                 column_config=sub_cfg,
-                column_order=columns_chunk,
-            )
-            _render_data_editor(
-                prepared_df,
-                column_config=prepared_cfg,
-                column_order=prepared_order,
                 disabled=sub_disabled,
+                use_container_width=True,
+                hide_index=True,
                 num_rows="fixed",
                 key=f"{key_prefix}::{suffix}",
             )
@@ -2061,44 +1861,6 @@ if df_original_key in st.session_state:
             "Edit the **Product Type (attribute set)** column: replace **default** with the right value from the dropdown."
         )
 
-        if DEBUG:
-            st.write("DEBUG Streamlit version:", st.__version__)
-            _test = pd.DataFrame(
-                {
-                    "sku": [f"A{i:03d}" for i in range(15)],
-                    "name": [f"Product {i}" for i in range(15)],
-                    "price": np.random.randint(10, 999, size=15).astype(int),
-                    **{
-                        f"col_{j:02d}": [f"v{j}_{i}" for i in range(15)]
-                        for j in range(10)
-                    },
-                }
-            )
-            _test_cfg = {
-                "sku": cc.TextColumn("SKU", disabled=True, width="small"),
-                "name": cc.TextColumn("Name", disabled=False, width="medium"),
-                "price": cc.NumberColumn("Price", disabled=True, width="small", step=1),
-            }
-            _test_order = [
-                "sku",
-                "name",
-                "price",
-                *[
-                    c
-                    for c in _test.columns
-                    if c not in ("sku", "name", "price")
-                ],
-            ]
-            _test = _test[_test_order]
-            _render_data_editor(
-                _test,
-                column_config=_test_cfg,
-                column_order=_test_order,
-            )
-            st.write(
-                "↑ В этом тесте при горизонтальном скролле 'sku' и 'name' должны быть пришиты слева."
-            )
-
         step2_active = st.session_state.get("show_attributes_trigger", False)
 
         if not step2_active:
@@ -2125,12 +1887,12 @@ if df_original_key in st.session_state:
             ]
             col_cfg, disabled_cols = _build_column_config_for_step1_like(step="step1")
             if "sku" in df_base.columns:
-                col_cfg["sku"] = cc.TextColumn(
-                    "SKU", disabled=True, width="small"
+                col_cfg["sku"] = st.column_config.Column(
+                    label="SKU", disabled=True, width="small"
                 )
             if "name" in df_base.columns:
-                col_cfg["name"] = cc.TextColumn(
-                    "Name", disabled=False, width="medium"
+                col_cfg["name"] = st.column_config.TextColumn(
+                    label="Name", disabled=False, width="medium"
                 )
             disabled_cols = [col for col in disabled_cols if col != "name"]
             if "attribute set" in col_cfg:
@@ -2150,17 +1912,13 @@ if df_original_key in st.session_state:
                     label="Product Type (attribute set)",
                     disabled=False,
                 )
-            pinned_order = _pin_sku_name(column_order, list(df_base.columns))
-            df_view, editor_config, editor_order = _prepare_editor_view(
+            column_order = _pin_sku_name(column_order, list(df_base.columns))
+            edited_df = st.data_editor(
                 df_base,
                 column_config=col_cfg,
-                column_order=pinned_order,
-            )
-            edited_df = _render_data_editor(
-                df_view,
-                column_config=editor_config,
                 disabled=disabled_cols,
-                column_order=editor_order,
+                column_order=column_order,
+                use_container_width=True,
                 num_rows="fixed",
                 key=editor_key,
             )
@@ -2827,6 +2585,28 @@ if df_original_key in st.session_state:
                                             )
 
                                             column_config_final = dict(column_config or {})
+                                            if "sku" in group.columns:
+                                                column_config_final[
+                                                    "sku"
+                                                ] = st.column_config.Column(
+                                                    label="SKU",
+                                                    disabled=True,
+                                                    width="small",
+                                                )
+                                            if "name" in group.columns:
+                                                column_config_final[
+                                                    "name"
+                                                ] = st.column_config.TextColumn(
+                                                    label="Name",
+                                                    disabled=False,
+                                                    width="medium",
+                                                )
+                                            if "price" in group.columns:
+                                                column_config_final[
+                                                    "price"
+                                                ] = st.column_config.NumberColumn(
+                                                    label="Price", disabled=True
+                                                )
                                             if "guitarstylemultiplechoice" in column_config_final:
                                                 cfg = column_config_final[
                                                     "guitarstylemultiplechoice"
@@ -2836,24 +2616,17 @@ if df_original_key in st.session_state:
                                                 elif hasattr(cfg, "_label"):
                                                     cfg._label = "Guitar style"
 
-                                            cfg_for_group = {
-                                                key: value
-                                                for key, value in column_config_final.items()
-                                                if key in group.columns
-                                            }
-                                            df_view, editor_cfg, editor_order = (
-                                                _prepare_editor_view(
-                                                    group,
-                                                    column_config=cfg_for_group,
-                                                    column_order=ordered_columns,
-                                                )
-                                            )
-
-                                            editor_df = _render_data_editor(
-                                                df_view,
+                                            editor_df = st.data_editor(
+                                                group,
                                                 key=f"editor_set_{current_set_id}",
-                                                column_config=editor_cfg,
-                                                column_order=editor_order,
+                                                column_config={
+                                                    key: value
+                                                    for key, value in column_config_final.items()
+                                                    if key in group.columns
+                                                },
+                                                column_order=ordered_columns,
+                                                use_container_width=True,
+                                                hide_index=True,
                                                 num_rows="fixed",
                                             )
 
