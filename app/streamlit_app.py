@@ -384,7 +384,39 @@ def _l2v(meta: dict) -> dict[str, str]:
     }
 
 
-def _make_value_formatter(v2l: dict[str, str]) -> JsCode:
+def _coerce_multiselect_cell(v, l2v: dict[str, str]) -> list[str]:
+    if v is None or v == "" or v == []:
+        return []
+    if isinstance(v, list):
+        out: list[str] = []
+        for el in v:
+            if isinstance(el, dict):
+                val = (
+                    el.get("value")
+                    or el.get("id")
+                    or el.get("category_id")
+                )
+                if val is None:
+                    lbl = str(el.get("label", "")).strip()
+                    if lbl:
+                        val = l2v.get(lbl) or lbl
+                if val is not None:
+                    out.append(str(val))
+            else:
+                s = str(el).strip()
+                out.append(l2v.get(s, s))
+        return out
+    s = str(v).strip()
+    if "," in s:
+        return [
+            l2v.get(x.strip(), x.strip())
+            for x in s.split(",")
+            if x.strip()
+        ]
+    return [l2v.get(s, s)]
+
+
+def make_value_formatter(v2l: dict[str, str]) -> JsCode:
     return JsCode(
         f"""
     function(p) {{
@@ -397,7 +429,7 @@ def _make_value_formatter(v2l: dict[str, str]) -> JsCode:
     )
 
 
-def _make_value_setter(l2v: dict[str, str], is_multi: bool) -> JsCode:
+def make_value_setter(l2v: dict[str, str], is_multi: bool) -> JsCode:
     return JsCode(
         f"""
     function(p) {{
@@ -2810,6 +2842,42 @@ if df_original_key in st.session_state:
                                                 list(group.columns), set_name
                                             )
 
+                                            wide_meta_map = step2_state.get(
+                                                "wide_meta", {}
+                                            )
+                                            if not isinstance(wide_meta_map, dict):
+                                                wide_meta_map = {}
+                                            meta_map_current = wide_meta_map.get(
+                                                current_set_id, {}
+                                            )
+                                            if not isinstance(meta_map_current, dict):
+                                                meta_map_current = {}
+
+                                            for col in list(group.columns):
+                                                meta = (meta_map_current or {}).get(
+                                                    col, {}
+                                                ) or {}
+                                                ftype = (
+                                                    meta.get("frontend_input") or ""
+                                                ).lower()
+                                                if ftype == "multiselect":
+                                                    l2v = {
+                                                        str(k): str(v)
+                                                        for k, v in (
+                                                            meta.get("options_map")
+                                                            or {}
+                                                        ).items()
+                                                    }
+                                                    group[col] = (
+                                                        group[col]
+                                                        .apply(
+                                                            lambda x: _coerce_multiselect_cell(
+                                                                x, l2v
+                                                            )
+                                                        )
+                                                        .astype(object)
+                                                    )
+
                                             df_view = group[ordered_columns].copy()
                                             wcfg = (
                                                 step2_state.get("wide_colcfg", {})
@@ -2854,15 +2922,6 @@ if df_original_key in st.session_state:
                                                 "short_description": "Short Description",
                                                 "cases_covers": "Cases & Covers",
                                             }
-
-                                            wide_meta_map = step2_state.get("wide_meta", {})
-                                            if not isinstance(wide_meta_map, dict):
-                                                wide_meta_map = {}
-                                            meta_map_current = wide_meta_map.get(
-                                                current_set_id, {}
-                                            )
-                                            if not isinstance(meta_map_current, dict):
-                                                meta_map_current = {}
 
                                             for col in ordered_columns:
                                                 if col not in df_view.columns:
@@ -2925,8 +2984,8 @@ if df_original_key in st.session_state:
                                                             "filterList": True,
                                                             "multiple": is_multi,
                                                         },
-                                                        valueFormatter=_make_value_formatter(v2l),
-                                                        valueSetter=_make_value_setter(
+                                                        valueFormatter=make_value_formatter(v2l),
+                                                        valueSetter=make_value_setter(
                                                             l2v, is_multi
                                                         ),
                                                         **column_kwargs,
@@ -2947,7 +3006,7 @@ if df_original_key in st.session_state:
                                             if not isinstance(dbg_meta, dict):
                                                 dbg_meta = {}
                                             st.write(
-                                                "DBG categories meta:",
+                                                "DBG categories meta OK:",
                                                 {
                                                     "type": dbg_meta.get(
                                                         "frontend_input"
@@ -2955,12 +3014,22 @@ if df_original_key in st.session_state:
                                                     "opts": len(
                                                         dbg_meta.get("options") or []
                                                     ),
-                                                    "has_v2l": bool(
-                                                        dbg_meta.get("values_to_labels")
-                                                    ),
-                                                    "has_l2v": bool(
-                                                        dbg_meta.get("options_map")
-                                                    ),
+                                                    "sample_opts": (
+                                                        dbg_meta.get("options") or []
+                                                    )[:3],
+                                                },
+                                            )
+                                            st.write(
+                                                "DBG df sample values:",
+                                                {
+                                                    "raw": (
+                                                        group["categories"]
+                                                        .head(2)
+                                                        .tolist()
+                                                        if "categories"
+                                                        in group.columns
+                                                        else None
+                                                    )
                                                 },
                                             )
 
@@ -3050,20 +3119,25 @@ if df_original_key in st.session_state:
                                                     or ""
                                                 ).lower()
                                                 if ctype == "multiselect":
-                                                    def _to_list(value: Any) -> list[Any]:
-                                                        if (
-                                                            value is None
-                                                            or value == ""
-                                                            or value == []
-                                                        ):
-                                                            return []
-                                                        if isinstance(value, list):
-                                                            return value
-                                                        return [value]
-
                                                     editor_df[column] = (
                                                         editor_df[column]
-                                                        .apply(_to_list)
+                                                        .apply(
+                                                            lambda v: (
+                                                                v
+                                                                if isinstance(v, list)
+                                                                else (
+                                                                    []
+                                                                    if v
+                                                                    in (
+                                                                        None,
+                                                                        "",
+                                                                    )
+                                                                    else [
+                                                                        str(v)
+                                                                    ]
+                                                                )
+                                                            )
+                                                        )
                                                         .astype(object)
                                                     )
                                                 else:
