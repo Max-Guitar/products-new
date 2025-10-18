@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import math
 import sys
 from pathlib import Path
@@ -16,7 +17,7 @@ import re
 
 import pandas as pd
 import streamlit as st
-from packaging import version
+from streamlit import column_config as cc
 
 st.set_page_config(
     page_title="🤖 Peter v.1.0 (AI Content Manager)",
@@ -25,10 +26,27 @@ st.set_page_config(
 )
 st.title("🤖 Peter v.1.0 (AI Content Manager)")
 
-SUPPORTS_EDITOR_FIXED_COLUMNS = version.parse(st.__version__) >= version.parse(
-    "1.35.0"
-)
-FIXED_COLUMNS_KWARGS = {"fixed_columns": {"left": 2}} if SUPPORTS_EDITOR_FIXED_COLUMNS else {}
+
+def _supports_editor_fixed_columns_param() -> bool:
+    try:
+        sig = inspect.signature(st.data_editor)
+        return "fixed_columns" in sig.parameters
+    except Exception:
+        return False
+
+
+def _supports_column_fixed_param(col_cls) -> bool:
+    try:
+        sig = inspect.signature(col_cls)
+        return "fixed" in sig.parameters
+    except Exception:
+        return False
+
+
+_HAS_FIXED_KW_IN_COL = _supports_column_fixed_param(
+    cc.TextColumn
+) and _supports_column_fixed_param(cc.NumberColumn)
+_HAS_FIXED_COLUMNS_IN_EDITOR = _supports_editor_fixed_columns_param()
 
 from connectors.magento.attributes import AttributeMetaCache
 from connectors.magento.categories import ensure_categories_meta
@@ -1870,23 +1888,39 @@ if df_original_key in st.session_state:
         step2_active = st.session_state.get("show_attributes_trigger", False)
 
         if not step2_active:
-            fixed_col_flag = {"fixed": True} if SUPPORTS_EDITOR_FIXED_COLUMNS else {}
             step1_column_config = {
-                "sku": st.column_config.TextColumn(
-                    label="SKU", disabled=True, width="small", **fixed_col_flag
-                ),
-                "name": st.column_config.TextColumn(
-                    label="Name", disabled=False, width="medium", **fixed_col_flag
-                ),
+                "sku": cc.TextColumn(label="SKU", disabled=True, width="small"),
+                "name": cc.TextColumn(label="Name", disabled=False, width="medium"),
                 "attribute set": st.column_config.SelectboxColumn(
                     label="Product Type (attribute set)",
                     help="Change attribute set",
                     options=options,
                     required=True,
                 ),
-                "hint": st.column_config.TextColumn("Hint"),
-                "created_at": st.column_config.DatetimeColumn("Created At", disabled=True),
+                "hint": cc.TextColumn("Hint"),
+                "created_at": st.column_config.DatetimeColumn(
+                    "Created At", disabled=True
+                ),
             }
+            if "price" in df_base.columns:
+                step1_column_config["price"] = cc.NumberColumn(
+                    label="Price", disabled=True, width="small", step=1
+                )
+            if _HAS_FIXED_KW_IN_COL:
+                step1_column_config["sku"] = cc.TextColumn(
+                    label="SKU", disabled=True, width="small", fixed=True
+                )
+                step1_column_config["name"] = cc.TextColumn(
+                    label="Name", disabled=False, width="medium", fixed=True
+                )
+                if "price" in step1_column_config:
+                    step1_column_config["price"] = cc.NumberColumn(
+                        label="Price",
+                        disabled=True,
+                        width="small",
+                        step=1,
+                        fixed=True,
+                    )
             st.session_state["step1_column_config_cache"] = step1_column_config
             st.session_state["step1_disabled_cols_cache"] = [
                 "sku",
@@ -1894,22 +1928,25 @@ if df_original_key in st.session_state:
             ]
             col_cfg, disabled_cols = _build_column_config_for_step1_like(step="step1")
             if "sku" in df_base.columns:
-                col_cfg["sku"] = st.column_config.TextColumn(
-                    label="SKU", disabled=True, width="small", **fixed_col_flag
-                )
+                sku_kwargs = {"label": "SKU", "disabled": True, "width": "small"}
+                if _HAS_FIXED_KW_IN_COL:
+                    sku_kwargs["fixed"] = True
+                col_cfg["sku"] = cc.TextColumn(**sku_kwargs)
             if "name" in df_base.columns:
-                col_cfg["name"] = st.column_config.TextColumn(
-                    label="Name", disabled=False, width="medium", **fixed_col_flag
-                )
+                name_kwargs = {"label": "Name", "disabled": False, "width": "medium"}
+                if _HAS_FIXED_KW_IN_COL:
+                    name_kwargs["fixed"] = True
+                col_cfg["name"] = cc.TextColumn(**name_kwargs)
             if "price" in df_base.columns:
-                price_flag = {"fixed": True} if SUPPORTS_EDITOR_FIXED_COLUMNS else {}
-                col_cfg["price"] = st.column_config.NumberColumn(
-                    label="Price",
-                    disabled=True,
-                    width="small",
-                    step=1,
-                    **price_flag,
-                )
+                price_kwargs = {
+                    "label": "Price",
+                    "disabled": True,
+                    "width": "small",
+                    "step": 1,
+                }
+                if _HAS_FIXED_KW_IN_COL:
+                    price_kwargs["fixed"] = True
+                col_cfg["price"] = cc.NumberColumn(**price_kwargs)
             disabled_cols = [col for col in disabled_cols if col != "name"]
             if "attribute set" in col_cfg:
                 cfg = col_cfg["attribute set"]
@@ -1929,10 +1966,18 @@ if df_original_key in st.session_state:
                     disabled=False,
                 )
             column_order = _pin_sku_name(column_order, list(df_base.columns))
-            pinned_cols = [c for c in ["sku", "name", "price"] if c in df_base.columns]
-            column_order = pinned_cols + [
-                col for col in column_order if col not in pinned_cols
+            column_order = [
+                c
+                for c in ["sku", "name", "price"]
+                if c in df_base.columns
+            ] + [
+                c
+                for c in column_order
+                if c not in ("sku", "name", "price")
             ]
+            editor_kwargs: dict[str, object] = {}
+            if _HAS_FIXED_COLUMNS_IN_EDITOR:
+                editor_kwargs["fixed_columns"] = {"left": 2}
             edited_df = st.data_editor(
                 df_base,
                 column_config=col_cfg,
@@ -1941,7 +1986,7 @@ if df_original_key in st.session_state:
                 use_container_width=True,
                 num_rows="fixed",
                 key=editor_key,
-                **FIXED_COLUMNS_KWARGS,
+                **editor_kwargs,
             )
 
             go_attrs = st.button(
@@ -2604,55 +2649,70 @@ if df_original_key in st.session_state:
                                             ordered_columns = _pin_sku_name(
                                                 ordered_columns, list(group.columns)
                                             )
-                                            pinned_cols = [
+                                            ordered_columns = [
                                                 c
                                                 for c in ["sku", "name", "price"]
                                                 if c in group.columns
-                                            ]
-                                            ordered_columns = pinned_cols + [
-                                                col
-                                                for col in ordered_columns
-                                                if col not in pinned_cols
+                                            ] + [
+                                                c
+                                                for c in ordered_columns
+                                                if c not in ("sku", "name", "price")
                                             ]
 
                                             column_config_final = dict(column_config or {})
-                                            fixed_col_flag = (
-                                                {"fixed": True}
-                                                if SUPPORTS_EDITOR_FIXED_COLUMNS
-                                                else {}
-                                            )
                                             if "sku" in group.columns:
                                                 column_config_final[
                                                     "sku"
-                                                ] = st.column_config.TextColumn(
+                                                ] = cc.TextColumn(
                                                     label="SKU",
                                                     disabled=True,
                                                     width="small",
-                                                    **fixed_col_flag,
                                                 )
+                                                if _HAS_FIXED_KW_IN_COL:
+                                                    column_config_final[
+                                                        "sku"
+                                                    ] = cc.TextColumn(
+                                                        label="SKU",
+                                                        disabled=True,
+                                                        width="small",
+                                                        fixed=True,
+                                                    )
                                             if "name" in group.columns:
                                                 column_config_final[
                                                     "name"
-                                                ] = st.column_config.TextColumn(
+                                                ] = cc.TextColumn(
                                                     label="Name",
                                                     disabled=False,
                                                     width="medium",
-                                                    **fixed_col_flag,
                                                 )
+                                                if _HAS_FIXED_KW_IN_COL:
+                                                    column_config_final[
+                                                        "name"
+                                                    ] = cc.TextColumn(
+                                                        label="Name",
+                                                        disabled=False,
+                                                        width="medium",
+                                                        fixed=True,
+                                                    )
                                             if "price" in group.columns:
                                                 column_config_final[
                                                     "price"
-                                                ] = st.column_config.NumberColumn(
+                                                ] = cc.NumberColumn(
                                                     label="Price",
                                                     disabled=True,
                                                     width="small",
                                                     step=1,
-                                                    **(
-                                                        {"fixed": True}
-                                                        if SUPPORTS_EDITOR_FIXED_COLUMNS
-                                                        else {}
-                                                    ),
                                                 )
+                                                if _HAS_FIXED_KW_IN_COL:
+                                                    column_config_final[
+                                                        "price"
+                                                    ] = cc.NumberColumn(
+                                                        label="Price",
+                                                        disabled=True,
+                                                        width="small",
+                                                        step=1,
+                                                        fixed=True,
+                                                    )
                                             if "guitarstylemultiplechoice" in column_config_final:
                                                 cfg = column_config_final[
                                                     "guitarstylemultiplechoice"
@@ -2674,7 +2734,11 @@ if df_original_key in st.session_state:
                                                 use_container_width=True,
                                                 hide_index=True,
                                                 num_rows="fixed",
-                                                **FIXED_COLUMNS_KWARGS,
+                                                **(
+                                                    {"fixed_columns": {"left": 2}}
+                                                    if _HAS_FIXED_COLUMNS_IN_EDITOR
+                                                    else {}
+                                                ),
                                             )
 
                                             if isinstance(editor_df, pd.DataFrame):
