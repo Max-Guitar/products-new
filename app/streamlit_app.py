@@ -16,6 +16,7 @@ import re
 
 import pandas as pd
 import streamlit as st
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
 
 st.set_page_config(
     page_title="🤖 Peter v.1.0 (AI Content Manager)",
@@ -74,113 +75,240 @@ BASE_ORDER = [
     "brand",
 ]
 
+ALIASES = {
+    "product type (attribute set)": "attribute_set_id",
+    "attribute set": "attribute_set_id",
+    "cases covers": "cases_covers",
+    "short description": "short_description",
+    "guitar style": "guitarstylemultiplechoice",
+    "series": "series",
+    "model": "model",
+    "amp type": "amp_type",
+    "effect type": "effect_type",
+    "accessory type": "accessory_type",
+    "power (watt)": "power_watt",
+    "built in fx": "built_in_fx",
+    "footswitch included": "footswitch_included",
+    "cover included": "cover_included",
+    "power polarity": "power_polarity",
+}
+
+
+def norm_name(s: str) -> str:
+    k = (s or "").strip().lower()
+    return ALIASES.get(k, k).replace(" ", "_")
+
+
+ORDER_BY_SET_NAME = {
+    "acoustic guitar": [
+        "series",
+        "acoustic_guitar_style",
+        "acoustic_body_shape",
+        "body_material",
+        "top_material",
+        "finish",
+        "bridge",
+        "controls",
+        "acoustic_pickup",
+        "neck_profile",
+        "neck_material",
+        "neck_radius",
+        "neck_nutwidth",
+        "fretboard_material",
+        "tuning_machines",
+        "scale_mensur",
+        "amount_of_frets",
+        "no_strings",
+        "orientation",
+        "acoustic_cutaway",
+        "electro_acoustic",
+        "kids_size",
+        "vintage",
+        "cases_covers",
+        "categories",
+        "short_description",
+    ],
+    "electric guitar": [
+        "series",
+        "model",
+        "guitarstylemultiplechoice",
+        "body_material",
+        "top_material",
+        "finish",
+        "bridge_type",
+        "bridge",
+        "pickup_config",
+        "bridge_pickup",
+        "middle_pickup",
+        "neck_pickup",
+        "controls",
+        "neck_profile",
+        "neck_material",
+        "neck_radius",
+        "neck_nutwidth",
+        "fretboard_material",
+        "tuning_machines",
+        "scale_mensur",
+        "amount_of_frets",
+        "no_strings",
+        "orientation",
+        "semi_hollow_body",
+        "kids_size",
+        "vintage",
+        "cases_covers",
+        "categories",
+        "short_description",
+    ],
+    "electric guitars": [
+        "series",
+        "model",
+        "guitarstylemultiplechoice",
+        "body_material",
+        "top_material",
+        "finish",
+        "bridge_type",
+        "bridge",
+        "pickup_config",
+        "bridge_pickup",
+        "middle_pickup",
+        "neck_pickup",
+        "controls",
+        "neck_profile",
+        "neck_material",
+        "neck_radius",
+        "neck_nutwidth",
+        "fretboard_material",
+        "tuning_machines",
+        "scale_mensur",
+        "amount_of_frets",
+        "no_strings",
+        "orientation",
+        "semi_hollow_body",
+        "kids_size",
+        "vintage",
+        "cases_covers",
+        "categories",
+        "short_description",
+    ],
+    "bass guitar": [
+        "series",
+        "model",
+        "body_material",
+        "top_material",
+        "finish",
+        "bridge",
+        "pickup_config",
+        "bridge_pickup",
+        "middle_pickup",
+        "neck_pickup",
+        "controls",
+        "neck_profile",
+        "neck_material",
+        "neck_radius",
+        "neck_nutwidth",
+        "fretboard_material",
+        "tuning_machines",
+        "scale_mensur",
+        "amount_of_frets",
+        "no_strings",
+        "orientation",
+        "acoustic_bass",
+        "kids_size",
+        "vintage",
+        "cases_covers",
+        "categories",
+        "short_description",
+    ],
+    "amps": [
+        "series",
+        "model",
+        "amp_type",
+        "built_in_fx",
+        "cover_included",
+        "footswitch_included",
+        "battery",
+        "power",
+        "power_watt",
+        "power_polarity",
+        "controls",
+        "categories",
+        "short_description",
+    ],
+    "effects": [
+        "series",
+        "model",
+        "brand",
+        "effect_type",
+        "controls",
+        "battery",
+        "power",
+        "power_polarity",
+        "vintage",
+        "categories",
+        "short_description",
+    ],
+    "accessories": [
+        "accessory_type",
+        "type",
+        "cables",
+        "strings",
+        "cases_covers",
+        "merchandise",
+        "parts",
+        "categories",
+        "short_description",
+    ],
+}
+
+ORDER_BY_SET_NAME["acoustic guitars"] = ORDER_BY_SET_NAME["acoustic guitar"]
+ORDER_BY_SET_NAME["bass guitars"] = ORDER_BY_SET_NAME["bass guitar"]
+ORDER_BY_SET_NAME["amplifiers"] = ORDER_BY_SET_NAME["amps"]
+
 
 def build_column_order_for_set(
-    df_cols: list[str], set_id: int, set_name: str | None = None
+    df_cols: list[str], set_name: str | None
 ) -> list[str]:
-    alias = {
-        "cases covers": "cases_covers",
-        "guitarstylemultiplechoice": "guitarstylemultiplechoice",
-        "short description": "short_description",
-        "attribute set": "attribute_set_id",
-        "product type (attribute set)": "attribute_set_id",
-    }
+    normalized_to_actual: dict[str, str] = {}
+    ordered_actual: list[str] = []
+    for col in df_cols:
+        if col == "attribute_set_id":
+            continue
+        normalized = norm_name(col)
+        if normalized not in normalized_to_actual:
+            normalized_to_actual[normalized] = col
+            ordered_actual.append(col)
 
-    def norm(cols: Iterable[str | None]) -> list[str]:
-        out: list[str] = []
-        for c in cols:
-            k = (c or "").strip()
-            lowered = k.lower()
-            mapped = alias.get(lowered, k)
-            out.append(mapped)
-        return out
+    name = (set_name or "").strip().lower()
 
-    order = norm(BASE_ORDER)
+    base_candidates = [norm_name(c) for c in BASE_ORDER]
+    base = [
+        normalized_to_actual[norm]
+        for norm in base_candidates
+        if norm in normalized_to_actual
+    ]
 
-    per_set: list[str]
-    name_lc = (set_name or "").strip().lower()
-    if name_lc == "acoustic guitar":
-        per_set = norm(
-            [
-                "series",
-                "acoustic_guitar_style",
-                "acoustic_body_shape",
-                "body_material",
-                "top_material",
-                "finish",
-                "bridge",
-                "controls",
-                "acoustic_pickup",
-                "neck_profile",
-                "neck_material",
-                "neck_radius",
-                "neck_nutwidth",
-                "fretboard_material",
-                "tuning_machines",
-                "scale_mensur",
-                "amount_of_frets",
-                "no_strings",
-                "orientation",
-                "acoustic_cutaway",
-                "electro_acoustic",
-                "kids_size",
-                "vintage",
-                "cases_covers",
-                "categories",
-                "short_description",
-            ]
-        )
-    elif name_lc == "electric guitars":
-        per_set = norm(
-            [
-                "series",
-                "model",
-                "guitarstylemultiplechoice",
-                "body_material",
-                "top_material",
-                "finish",
-                "bridge_type",
-                "bridge",
-                "pickup_config",
-                "bridge_pickup",
-                "middle_pickup",
-                "neck_pickup",
-                "controls",
-                "neck_profile",
-                "neck_material",
-                "neck_radius",
-                "neck_nutwidth",
-                "fretboard_material",
-                "tuning_machines",
-                "scale_mensur",
-                "amount_of_frets",
-                "no_strings",
-                "orientation",
-                "semi_hollow_body",
-                "kids_size",
-                "vintage",
-                "cases_covers",
-                "categories",
-                "short_description",
-            ]
-        )
-    else:
-        per_set = []
+    specific_list = ORDER_BY_SET_NAME.get(name, [])
+    specific_candidates = [norm_name(c) for c in specific_list]
+    specific = [
+        normalized_to_actual[norm]
+        for norm in specific_candidates
+        if norm in normalized_to_actual
+    ]
 
-    seen: dict[str, None] = {}
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for seq in (base, specific):
+        for actual in seq:
+            if actual not in seen:
+                seen.add(actual)
+                ordered.append(actual)
 
-    def add_seq(seq: Iterable[str]) -> None:
-        for c in seq:
-            if c in df_cols and c not in seen:
-                seen[c] = None
+    for actual in ordered_actual:
+        if actual not in seen:
+            seen.add(actual)
+            ordered.append(actual)
 
-    add_seq(order)
-    add_seq(per_set)
-    for c in df_cols:
-        if c not in seen:
-            seen[c] = None
-
-    return list(seen.keys())
+    return ordered
 
 
 ID_RX = re.compile(r"#(\d+)\)?$")
@@ -2573,94 +2701,206 @@ if df_original_key in st.session_state:
                                                     columns=["attribute_set_id"]
                                                 )
 
+                                            set_name = attribute_set_names.get(
+                                                current_set_id, ""
+                                            )
                                             ordered_columns = build_column_order_for_set(
-                                                df_cols=list(group.columns),
-                                                set_id=current_set_id,
-                                                set_name=attribute_set_names.get(
-                                                    current_set_id, ""
-                                                ),
-                                            )
-                                            ordered_columns = _pin_sku_name(
-                                                ordered_columns, list(group.columns)
+                                                list(group.columns), set_name
                                             )
 
-                                            column_config_final = dict(column_config or {})
-                                            if "sku" in group.columns:
-                                                column_config_final[
-                                                    "sku"
-                                                ] = st.column_config.Column(
-                                                    label="SKU",
-                                                    disabled=True,
-                                                    width="small",
-                                                )
-                                            if "name" in group.columns:
-                                                column_config_final[
-                                                    "name"
-                                                ] = st.column_config.TextColumn(
-                                                    label="Name",
-                                                    disabled=False,
-                                                    width="medium",
-                                                )
-                                            if "price" in group.columns:
-                                                column_config_final[
-                                                    "price"
-                                                ] = st.column_config.NumberColumn(
-                                                    label="Price", disabled=True
-                                                )
-                                            if "guitarstylemultiplechoice" in column_config_final:
-                                                cfg = column_config_final[
-                                                    "guitarstylemultiplechoice"
-                                                ]
-                                                if hasattr(cfg, "label"):
-                                                    cfg.label = "Guitar style"
-                                                elif hasattr(cfg, "_label"):
-                                                    cfg._label = "Guitar style"
-
-                                            editor_df = st.data_editor(
-                                                group,
-                                                key=f"editor_set_{current_set_id}",
-                                                column_config={
-                                                    key: value
-                                                    for key, value in column_config_final.items()
-                                                    if key in group.columns
-                                                },
-                                                column_order=ordered_columns,
-                                                use_container_width=True,
-                                                hide_index=True,
-                                                num_rows="fixed",
+                                            df_view = group[ordered_columns].copy()
+                                            wcfg = step2_state["wide_colcfg"].get(
+                                                current_set_id, {}
                                             )
 
-                                            if isinstance(editor_df, pd.DataFrame):
-                                                for column in editor_df.columns:
-                                                    editor_df[column] = editor_df[
-                                                        column
-                                                    ].astype(object)
-                                                base_synced = (
-                                                    step2_state.get("wide_synced", {})
-                                                    .get(current_set_id)
+                                            gb = GridOptionsBuilder.from_dataframe(df_view)
+                                            gb.configure_default_column(editable=True)
+
+                                            header_overrides = {
+                                                "guitarstylemultiplechoice": "Guitar style",
+                                                "amp_type": "Amp type",
+                                                "effect_type": "Effect type",
+                                                "accessory_type": "Accessory type",
+                                                "short_description": "Short Description",
+                                                "cases_covers": "Cases & Covers",
+                                            }
+
+                                            norm_to_actual = {
+                                                norm_name(col): col
+                                                for col in ordered_columns
+                                            }
+
+                                            sku_col = norm_to_actual.get("sku")
+                                            if sku_col and sku_col in df_view.columns:
+                                                gb.configure_column(
+                                                    sku_col,
+                                                    pinned="left",
+                                                    editable=False,
+                                                    width=120,
+                                                    headerName="SKU",
                                                 )
-                                                if (
-                                                    isinstance(
-                                                        base_synced, pd.DataFrame
-                                                    )
-                                                    and "attribute_set_id"
-                                                    in base_synced.columns
+
+                                            name_col = norm_to_actual.get("name")
+                                            if name_col and name_col in df_view.columns:
+                                                gb.configure_column(
+                                                    name_col,
+                                                    pinned="left",
+                                                    editable=True,
+                                                    width=280,
+                                                    headerName="Name",
+                                                )
+
+                                            price_col = norm_to_actual.get("price")
+                                            if price_col and price_col in df_view.columns:
+                                                gb.configure_column(
+                                                    price_col,
+                                                    editable=False,
+                                                    headerName="Price",
+                                                )
+
+                                            def _detect_type(cfg_obj) -> tuple[str | None, list[str]]:
+                                                if isinstance(
+                                                    cfg_obj, st.column_config.CheckboxColumn
                                                 ):
-                                                    base_synced = base_synced.drop(
-                                                        columns=["attribute_set_id"]
-                                                    )
-                                                if _df_differs(
-                                                    editor_df, base_synced
+                                                    return "boolean", []
+                                                if isinstance(
+                                                    cfg_obj, st.column_config.SelectboxColumn
                                                 ):
-                                                    step2_state["staged"][
-                                                        current_set_id
-                                                    ] = editor_df.copy(
-                                                        deep=True
+                                                    options = getattr(
+                                                        cfg_obj, "options", None
+                                                    ) or []
+                                                    return "select", list(options)
+                                                if isinstance(
+                                                    cfg_obj,
+                                                    st.column_config.MultiselectColumn,
+                                                ):
+                                                    options = getattr(
+                                                        cfg_obj, "options", None
+                                                    ) or []
+                                                    return "multiselect", list(options)
+                                                return None, []
+
+                                            for col in ordered_columns:
+                                                norm_col = norm_name(col)
+                                                if norm_col in {"sku", "name", "price"}:
+                                                    continue
+
+                                                cfg_obj = (
+                                                    wcfg.get(norm_col)
+                                                    if isinstance(wcfg, dict)
+                                                    else {}
+                                                )
+                                                header_name = header_overrides.get(norm_col)
+                                                col_type: str | None = None
+                                                options_labels: list[str] = []
+
+                                                if isinstance(cfg_obj, dict):
+                                                    col_type = cfg_obj.get("type")
+                                                    options_labels = list(
+                                                        cfg_obj.get("options_labels")
+                                                        or cfg_obj.get("options")
+                                                        or []
+                                                    )
+                                                    header_name = (
+                                                        header_name
+                                                        or cfg_obj.get("label")
+                                                        or cfg_obj.get("header")
                                                     )
                                                 else:
-                                                    step2_state["staged"].pop(
-                                                        current_set_id, None
+                                                    col_type, options_labels = _detect_type(
+                                                        cfg_obj
                                                     )
+                                                    header_name = header_name or getattr(
+                                                        cfg_obj, "label", None
+                                                    )
+                                                    if not header_name:
+                                                        header_name = getattr(
+                                                            cfg_obj, "_label", None
+                                                        )
+
+                                                column_kwargs: dict = {"editable": True}
+                                                if header_name:
+                                                    column_kwargs["headerName"] = header_name
+
+                                                if col_type == "boolean":
+                                                    gb.configure_column(
+                                                        col,
+                                                        cellEditor="agCheckboxCellEditor",
+                                                        cellRenderer="agCheckboxCellRenderer",
+                                                        editable=True,
+                                                        **column_kwargs,
+                                                    )
+                                                elif col_type in {"select", "multiselect"}:
+                                                    gb.configure_column(
+                                                        col,
+                                                        editable=True,
+                                                        cellEditor="agRichSelectCellEditor",
+                                                        cellEditorParams={
+                                                            "values": options_labels,
+                                                            "allowTyping": True,
+                                                            "filterList": True,
+                                                            "multiple": col_type
+                                                            == "multiselect",
+                                                        },
+                                                        **column_kwargs,
+                                                    )
+                                                else:
+                                                    gb.configure_column(
+                                                        col,
+                                                        **column_kwargs,
+                                                    )
+
+                                            gb.configure_grid_options(
+                                                suppressColumnMove=True,
+                                                singleClickEdit=True,
+                                                stopEditingWhenCellsLoseFocus=True,
+                                                rowSelection="none",
+                                            )
+
+                                            grid = AgGrid(
+                                                df_view,
+                                                gridOptions=gb.build(),
+                                                update_mode=GridUpdateMode.VALUE_CHANGED,
+                                                allow_unsafe_jscode=True,
+                                                height=min(
+                                                    440, 64 + 32 * len(df_view)
+                                                ),
+                                                fit_columns_on_grid_load=False,
+                                                theme="balham",
+                                                key=f"aggrid_set_{current_set_id}",
+                                            )
+
+                                            grid_data = grid.get("data")
+                                            editor_df = pd.DataFrame(grid_data or [])
+                                            editor_df = editor_df.reindex(
+                                                columns=df_view.columns
+                                            )
+
+                                            for column in editor_df.columns:
+                                                editor_df[column] = editor_df[
+                                                    column
+                                                ].astype(object)
+
+                                            base_synced = (
+                                                step2_state.get("wide_synced", {})
+                                                .get(current_set_id)
+                                            )
+                                            if (
+                                                isinstance(base_synced, pd.DataFrame)
+                                                and "attribute_set_id"
+                                                in base_synced.columns
+                                            ):
+                                                base_synced = base_synced.drop(
+                                                    columns=["attribute_set_id"]
+                                                )
+                                            if _df_differs(editor_df, base_synced):
+                                                step2_state["staged"][
+                                                    current_set_id
+                                                ] = editor_df.copy(deep=True)
+                                            else:
+                                                step2_state["staged"].pop(
+                                                    current_set_id, None
+                                                )
 
                                     _pupdate(100, "Attributes ready")
                                     status2.update(

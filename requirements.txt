@@ -2,3 +2,4 @@ streamlit
 requests
 pandas
 urllib3
+streamlit-aggrid>=0.3.4
