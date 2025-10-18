@@ -146,6 +146,19 @@ def _format_multiselect_display_value(values) -> str:
     return ", ".join(parts)
 
 
+def _pin_sku_name(column_order: list[str] | None) -> list[str]:
+    if not isinstance(column_order, list):
+        if column_order is None:
+            return []
+        try:
+            column_order = list(column_order)  # type: ignore[arg-type]
+        except TypeError:
+            return []
+    lead = [c for c in ("sku", "name") if c in column_order]
+    tail = [c for c in column_order if c not in ("sku", "name")]
+    return lead + tail
+
+
 def _parse_category_token(token: object) -> int | None:
     if token is None:
         return None
@@ -1770,6 +1783,7 @@ if df_original_key in st.session_state:
                     label="Product Type (attribute set)",
                     disabled=False,
                 )
+            column_order = _pin_sku_name(column_order)
             edited_df = st.data_editor(
                 df_base,
                 column_config=col_cfg,
@@ -1795,17 +1809,6 @@ if df_original_key in st.session_state:
             st.header("Filling in attributes.")
             if st.session_state.get("_go_step2_requested"):
                 st.session_state["_go_step2_requested"] = False
-
-            c1, c2 = st.columns([1, 1])
-            btn_save = c1.button("💾 Save to Magento", key="btn_step2_save")
-            btn_reset = c2.button("🔄 Reset all", key="btn_step2_reset")
-
-            if btn_save:
-                save_step2_to_magento()
-
-            if btn_reset:
-                _reset_step2_state()
-                st.rerun()
 
             if df_edited_key not in st.session_state or df_original_key not in st.session_state:
                 st.warning("Нет изменённых товаров.")
@@ -1875,8 +1878,14 @@ if df_original_key in st.session_state:
                                     "Building attribute editor…", expanded=True
                                 )
                                 progress = st.progress(0)
-                                progress.progress(5)
-                                status2.update(label="Collecting selected sets…")
+
+                                def _pupdate(pct: int, msg: str) -> None:
+                                    clamped = max(0, min(int(pct), 100))
+                                    progress.progress(clamped)
+                                    status2.update(label=msg)
+
+                                _pupdate(5, "Collecting selected sets…")
+                                selected_set_ids: list[int] = []
                                 step2_state = _ensure_step2_state()
                                 step2_state.setdefault("staged", {})
 
@@ -1886,11 +1895,6 @@ if df_original_key in st.session_state:
                                 if not isinstance(meta_cache, AttributeMetaCache):
                                     meta_cache = AttributeMetaCache(session, api_base)
                                     step2_state["meta_cache"] = meta_cache
-
-                                progress.progress(15)
-                                status2.update(
-                                    label="Resolving attribute codes (brand, condition)…"
-                                )
 
                                 if not step2_state["dfs"]:
                                     (
@@ -1908,8 +1912,14 @@ if df_original_key in st.session_state:
                                         attr_sets_map,
                                         meta_cache,
                                     )
+                                    selected_set_ids = sorted(dfs_by_set.keys())
+                                    total_sets = len(selected_set_ids) or 1
 
-                                    for set_id, df_set in dfs_by_set.items():
+                                    for i, set_id in enumerate(selected_set_ids, start=1):
+                                        df_set = dfs_by_set.get(set_id)
+                                        if not isinstance(df_set, pd.DataFrame):
+                                            continue
+
                                         stored_df = df_set.copy(deep=True)
                                         step2_state["dfs"][set_id] = stored_df
                                         step2_state["original"][set_id] = stored_df.copy(
@@ -1962,11 +1972,18 @@ if df_original_key in st.session_state:
                                                 sorted(attr_cols),
                                             )
                                         resolved_map: dict[str, str] = {}
+                                        effective_codes: list[str] = []
+                                        pct_resolve = 10 + int(
+                                            20 * i / max(total_sets, 1)
+                                        )
+                                        _pupdate(
+                                            pct_resolve,
+                                            f"Resolving codes for set {set_id} ({i}/{total_sets})…",
+                                        )
                                         if cacheable:
                                             resolved_map = meta_cache.resolve_codes_in_set(
                                                 set_id, ["brand", "condition"]
                                             )
-                                            effective_codes: list[str] = []
                                             seen_effective: set[str] = set()
                                             for code in attr_cols:
                                                 if not isinstance(code, str):
@@ -1975,6 +1992,14 @@ if df_original_key in st.session_state:
                                                 if effective and effective not in seen_effective:
                                                     seen_effective.add(effective)
                                                     effective_codes.append(effective)
+                                        pct_meta = 30 + int(
+                                            10 * i / max(total_sets, 1)
+                                        )
+                                        _pupdate(
+                                            pct_meta,
+                                            f"Fetching metadata (set {set_id})…",
+                                        )
+                                        if cacheable:
                                             if effective_codes:
                                                 meta_cache.build_and_set_static_for(
                                                     effective_codes, store_id=0
@@ -2049,12 +2074,21 @@ if df_original_key in st.session_state:
 
                                 step2_state["meta_cache"] = meta_cache
 
+                                if not selected_set_ids:
+                                    selected_set_ids = sorted(step2_state["dfs"].keys())
+
                                 for set_id, df0 in step2_state["dfs"].items():
                                     if "value" in df0.columns:
                                         df0["value"] = df0["value"].astype(object)
 
                                 if step2_state["dfs"] and not step2_state["wide"]:
-                                    for set_id, df_existing in step2_state["dfs"].items():
+                                    ordered_sets = (
+                                        selected_set_ids
+                                        or sorted(step2_state["dfs"].keys())
+                                    )
+                                    total_sets = len(ordered_sets) or 1
+                                    for i, set_id in enumerate(ordered_sets, start=1):
+                                        df_existing = step2_state["dfs"].get(set_id)
                                         if not isinstance(df_existing, pd.DataFrame):
                                             continue
                                         wide_df = make_wide(df_existing)
@@ -2086,11 +2120,18 @@ if df_original_key in st.session_state:
                                                 sorted(attr_cols),
                                             )
                                         resolved_map: dict[str, str] = {}
+                                        effective_codes: list[str] = []
+                                        pct_resolve = 10 + int(
+                                            20 * i / max(total_sets, 1)
+                                        )
+                                        _pupdate(
+                                            pct_resolve,
+                                            f"Resolving codes for set {set_id} ({i}/{total_sets})…",
+                                        )
                                         if cacheable:
                                             resolved_map = meta_cache.resolve_codes_in_set(
                                                 set_id, ["brand", "condition"]
                                             )
-                                            effective_codes: list[str] = []
                                             seen_effective: set[str] = set()
                                             for code in attr_cols:
                                                 if not isinstance(code, str):
@@ -2099,6 +2140,14 @@ if df_original_key in st.session_state:
                                                 if effective and effective not in seen_effective:
                                                     seen_effective.add(effective)
                                                     effective_codes.append(effective)
+                                        pct_meta = 30 + int(
+                                            10 * i / max(total_sets, 1)
+                                        )
+                                        _pupdate(
+                                            pct_meta,
+                                            f"Fetching metadata (set {set_id})…",
+                                        )
+                                        if cacheable:
                                             if effective_codes:
                                                 meta_cache.build_and_set_static_for(
                                                     effective_codes, store_id=0
@@ -2171,8 +2220,13 @@ if df_original_key in st.session_state:
                                             sample_df=step2_state["wide"].get(set_id),
                                         )
 
-                                progress.progress(30)
-                                status2.update(label="Fetching metadata from Magento…")
+                                if step2_state["wide"]:
+                                    selected_set_ids = sorted(
+                                        set(selected_set_ids)
+                                        | set(step2_state["wide"].keys())
+                                    )
+
+                                _pupdate(40, "Fetching metadata from Magento…")
 
                                 categories_meta = step2_state.get("categories_meta")
                                 if not isinstance(categories_meta, dict) or not categories_meta.get(
@@ -2209,8 +2263,7 @@ if df_original_key in st.session_state:
                                 else:
                                     st.session_state["step2_categories_failed"] = False
 
-                                progress.progress(45)
-                                status2.update(label="Preparing categories (full tree)…")
+                                _pupdate(45, "Preparing categories (full tree)…")
 
                                 st.session_state["show_attrs"] = bool(
                                     step2_state["wide"]
@@ -2219,16 +2272,12 @@ if df_original_key in st.session_state:
                                 completed = False
                                 if not step2_state["wide"]:
                                     st.warning("Нет атрибутов для отображения.")
-                                    progress.progress(100)
+                                    _pupdate(100, "Attributes ready")
                                     status2.update(
                                         state="complete", label="Attributes ready"
                                     )
                                     completed = True
                                 elif st.session_state.get("show_attrs"):
-                                    progress.progress(60)
-                                    status2.update(
-                                        label="Normalizing values (IDs ↔ labels)…"
-                                    )
                                     wide_meta = step2_state.setdefault("wide_meta", {})
                                     categories_meta = step2_state.get("categories_meta", {})
                                     if not isinstance(categories_meta, dict):
@@ -2238,9 +2287,17 @@ if df_original_key in st.session_state:
                                         for opt in (categories_meta.get("options") or [])
                                         if isinstance(opt, dict) and opt.get("label")
                                     ]
-                                    progress.progress(75)
-                                    status2.update(label="Composing column configs…")
-                                    render_stage_done = False
+                                    total_rows = sum(
+                                        len(df)
+                                        for df in step2_state["wide"].values()
+                                        if isinstance(df, pd.DataFrame)
+                                    )
+                                    normalized_rows = 0
+                                    if total_rows == 0:
+                                        _pupdate(70, "Normalizing values…")
+                                    config_stage_logged = False
+                                    render_counter = 0
+                                    total_sets_render = len(selected_set_ids) or 1
                                     for set_id in sorted(step2_state["wide"].keys()):
                                         wide_df = step2_state["wide"].get(set_id)
                                         if not isinstance(wide_df, pd.DataFrame):
@@ -2275,12 +2332,37 @@ if df_original_key in st.session_state:
                                         string_cols = [
                                             col
                                             for col in ("brand", "condition")
-                                            if col in df_ref.columns
+                                            if isinstance(df_ref, pd.DataFrame)
+                                            and col in df_ref.columns
                                         ]
                                         if string_cols:
                                             df_ref[string_cols] = df_ref[
                                                 string_cols
                                             ].astype("string")
+
+                                        if (
+                                            isinstance(df_ref, pd.DataFrame)
+                                            and "sku" in df_ref.columns
+                                            and total_rows > 0
+                                        ):
+                                            sku_values = df_ref["sku"].tolist()
+                                            for idx, sku in enumerate(sku_values, start=1):
+                                                normalized_rows += 1
+                                                if (
+                                                    idx == len(sku_values)
+                                                    or idx % 25 == 0
+                                                    or normalized_rows == total_rows
+                                                ):
+                                                    pct = 45 + int(
+                                                        25
+                                                        * normalized_rows
+                                                        / max(total_rows, 1)
+                                                    )
+                                                    _pupdate(
+                                                        pct,
+                                                        f"Normalizing values… SKU {sku} "
+                                                        f"({normalized_rows}/{total_rows})",
+                                                    )
 
                                         if DEBUG:
                                             st.caption(f"DEBUG set_id={set_id}")
@@ -2296,27 +2378,43 @@ if df_original_key in st.session_state:
                                                 },
                                             )
 
+                                        if not config_stage_logged:
+                                            _pupdate(75, "Composing column configs…")
+                                            config_stage_logged = True
+
                                         column_config = build_wide_colcfg(
                                             meta_map, sample_df=df_ref
                                         )
                                         column_config["attribute_set_id"] = (
                                             st.column_config.Column(label="", disabled=True)
                                         )
-                                        if "sku" in df_ref.columns:
+                                        if (
+                                            isinstance(df_ref, pd.DataFrame)
+                                            and "sku" in df_ref.columns
+                                        ):
                                             column_config["sku"] = st.column_config.Column(
                                                 label="SKU", disabled=True, width="small"
                                             )
-                                        if "name" in df_ref.columns:
+                                        if (
+                                            isinstance(df_ref, pd.DataFrame)
+                                            and "name" in df_ref.columns
+                                        ):
                                             column_config["name"] = st.column_config.TextColumn(
                                                 label="Name",
                                                 disabled=False,
                                                 width="medium",
                                             )
-                                        if "price" in df_ref.columns:
+                                        if (
+                                            isinstance(df_ref, pd.DataFrame)
+                                            and "price" in df_ref.columns
+                                        ):
                                             column_config["price"] = st.column_config.NumberColumn(
                                                 label="Price", disabled=True
                                             )
-                                        if "categories" in df_ref.columns:
+                                        if (
+                                            isinstance(df_ref, pd.DataFrame)
+                                            and "categories" in df_ref.columns
+                                        ):
                                             existing_cfg = column_config.get("categories")
                                             label = (
                                                 getattr(existing_cfg, "label", None)
@@ -2332,18 +2430,10 @@ if df_original_key in st.session_state:
 
                                         column_order = [
                                             col
-                                            for col in df_ref.columns
+                                            for col in getattr(df_ref, "columns", [])
                                             if col != "attribute_set_id"
                                         ]
-                                        lead_cols = [
-                                            c for c in ("sku", "name") if c in column_order
-                                        ]
-                                        tail_cols = [
-                                            c
-                                            for c in column_order
-                                            if c not in ("sku", "name")
-                                        ]
-                                        column_order = lead_cols + tail_cols
+                                        column_order = _pin_sku_name(column_order)
 
                                         if DEBUG:
                                             st.write(
@@ -2351,14 +2441,24 @@ if df_original_key in st.session_state:
                                                 column_order,
                                             )
 
-                                        if not render_stage_done:
-                                            progress.progress(90)
-                                            status2.update(label="Rendering tables…")
-                                            render_stage_done = True
+                                        if not isinstance(df_ref, pd.DataFrame):
+                                            continue
 
                                         for current_set_id, group in df_ref.groupby(
                                             "attribute_set_id"
                                         ):
+                                            render_counter += 1
+                                            pct_render = 80 + int(
+                                                15
+                                                * render_counter
+                                                / max(total_sets_render, 1)
+                                            )
+                                            _pupdate(
+                                                pct_render,
+                                                f"Rendering table: set {current_set_id} "
+                                                f"({render_counter}/{total_sets_render})…",
+                                            )
+
                                             raw_title = step2_state["set_names"].get(
                                                 current_set_id, str(current_set_id)
                                             )
@@ -2384,6 +2484,7 @@ if df_original_key in st.session_state:
                                                     for col in ordered_columns
                                                     if col != "attribute_set_id"
                                                 ]
+                                            ordered_columns = _pin_sku_name(ordered_columns)
                                             disabled_cols = [
                                                 col
                                                 for col in (
@@ -2430,13 +2531,32 @@ if df_original_key in st.session_state:
                                                         current_set_id, None
                                                     )
 
-                                    progress.progress(100)
+                                    _pupdate(100, "Attributes ready")
                                     status2.update(
                                         state="complete", label="Attributes ready"
                                     )
                                     completed = True
                                 if not completed:
-                                    progress.progress(100)
+                                    _pupdate(100, "Attributes ready")
                                     status2.update(
                                         state="complete", label="Attributes ready"
                                     )
+
+                                if st.session_state.get("show_attrs"):
+                                    st.markdown("---")
+                                    c1, c2 = st.columns([1, 1])
+                                    btn_save = c1.button(
+                                        "💾 Save to Magento",
+                                        key="btn_step2_save_bottom",
+                                    )
+                                    btn_reset = c2.button(
+                                        "🔄 Reset all",
+                                        key="btn_step2_reset_bottom",
+                                    )
+
+                                    if btn_save:
+                                        save_step2_to_magento()
+
+                                    if btn_reset:
+                                        _reset_step2_state()
+                                        st.rerun()
