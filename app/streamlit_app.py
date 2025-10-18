@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import hashlib
 import math
 import sys
@@ -18,16 +17,12 @@ import re
 import pandas as pd
 import streamlit as st
 
-supports_fixed = "fixed_columns" in inspect.signature(st.data_editor).parameters
-
 st.set_page_config(
     page_title="🤖 Peter v.1.0 (AI Content Manager)",
     page_icon="🤖",
     layout="wide",
 )
 st.title("🤖 Peter v.1.0 (AI Content Manager)")
-
-st.write("DEBUG supports fixed_columns:", supports_fixed)
 
 from connectors.magento.attributes import AttributeMetaCache
 from connectors.magento.categories import ensure_categories_meta
@@ -879,7 +874,6 @@ def _probe_editor_groups(
             if col in column_config
         }
         sub_disabled = [col for col in disabled if col in columns_chunk]
-        fixed_args = {"fixed_columns": {"left": 2}} if supports_fixed else {}
         try:
             st.data_editor(
                 sub_df,
@@ -889,7 +883,6 @@ def _probe_editor_groups(
                 hide_index=True,
                 num_rows="fixed",
                 key=f"{key_prefix}::{suffix}",
-                **fixed_args,
             )
         except Exception as exc:
             st.warning(
@@ -1920,7 +1913,6 @@ if df_original_key in st.session_state:
                     disabled=False,
                 )
             column_order = _pin_sku_name(column_order, list(df_base.columns))
-            fixed_args = {"fixed_columns": {"left": 2}} if supports_fixed else {}
             edited_df = st.data_editor(
                 df_base,
                 column_config=col_cfg,
@@ -1929,7 +1921,6 @@ if df_original_key in st.session_state:
                 use_container_width=True,
                 num_rows="fixed",
                 key=editor_key,
-                **fixed_args,
             )
 
             go_attrs = st.button(
@@ -2625,7 +2616,6 @@ if df_original_key in st.session_state:
                                                 elif hasattr(cfg, "_label"):
                                                     cfg._label = "Guitar style"
 
-                                            fixed_args = {"fixed_columns": {"left": 2}} if supports_fixed else {}
                                             editor_df = st.data_editor(
                                                 group,
                                                 key=f"editor_set_{current_set_id}",
@@ -2638,7 +2628,6 @@ if df_original_key in st.session_state:
                                                 use_container_width=True,
                                                 hide_index=True,
                                                 num_rows="fixed",
-                                                **fixed_args,
                                             )
 
                                             if isinstance(editor_df, pd.DataFrame):
