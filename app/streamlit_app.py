@@ -38,6 +38,17 @@ st.markdown(
 .ag-theme-balham .ag-header {
   border-bottom: 1px solid #e6e6e6 !important;
 }
+.ag-theme-balham .ag-root-wrapper,
+.ag-theme-balham .ag-root-wrapper-body,
+.ag-theme-balham .ag-center-cols-viewport {
+  overflow: visible !important;
+}
+.ag-popup, .ag-popup-editor, .ag-menu, .ag-select-list {
+  z-index: 9999 !important;
+}
+.block-container, .stApp {
+  overflow: visible !important;
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -3388,13 +3399,15 @@ if df_original_key in st.session_state:
                                                     ).items()
                                                 }
 
-                                                if col == "short_description":
-                                                    gb.configure_column(
-                                                        col,
-                                                        editable=True,
-                                                        cellEditor=HtmlEditor,
-                                                        valueFormatter=JsCode(
-                                                            """
+                                            if col == "short_description":
+                                                gb.configure_column(
+                                                    col,
+                                                    editable=True,
+                                                    cellEditor=HtmlEditor,
+                                                    cellEditorPopup=True,
+                                                    cellEditorPopupPosition="over",
+                                                    valueFormatter=JsCode(
+                                                        """
                         function(p){
                           var s = String(p.value||"");
                           var div=document.createElement('div'); div.innerHTML=s;
@@ -3427,6 +3440,8 @@ if df_original_key in st.session_state:
                                                             "tree": cats_tree_children,
                                                             "v2l": cats_v2l,
                                                         },
+                                                        cellEditorPopup=True,
+                                                        cellEditorPopupPosition="over",
                                                         valueFormatter=cats_formatter,
                                                         **column_kwargs,
                                                     )
@@ -3451,6 +3466,8 @@ if df_original_key in st.session_state:
                                                             "values": labels,
                                                             "l2v": l2v,
                                                         },
+                                                        cellEditorPopup=True,
+                                                        cellEditorPopupPosition="over",
                                                         valueFormatter=JsCode(
                                                             f"function(p){{var m={json.dumps(v2l)};var v=p.value;return m[String(v)]||String(v||'');}}"
                                                         ),
@@ -3470,6 +3487,8 @@ if df_original_key in st.session_state:
                                                             "v2l": v2l,
                                                             "l2v": l2v,
                                                         },
+                                                        cellEditorPopup=True,
+                                                        cellEditorPopupPosition="over",
                                                         valueFormatter=JsCode(
                                                             f"""
                       function(p){{
@@ -3493,6 +3512,7 @@ if df_original_key in st.session_state:
                                             gb.configure_grid_options(
                                                 domLayout="autoHeight",
                                                 rowHeight=34,
+                                                popupParent=JsCode("document.body"),
                                                 suppressColumnMove=True,
                                                 singleClickEdit=True,
                                                 stopEditingWhenCellsLoseFocus=True,
