@@ -4,6 +4,7 @@ import hashlib
 import math
 import sys
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -2709,12 +2710,38 @@ if df_original_key in st.session_state:
                                             )
 
                                             df_view = group[ordered_columns].copy()
-                                            wcfg = step2_state["wide_colcfg"].get(
-                                                current_set_id, {}
+                                            wcfg = (
+                                                step2_state.get("wide_colcfg", {})
+                                                .get(current_set_id, {})
                                             )
 
                                             gb = GridOptionsBuilder.from_dataframe(df_view)
                                             gb.configure_default_column(editable=True)
+
+                                            if "sku" in df_view.columns:
+                                                gb.configure_column(
+                                                    "sku",
+                                                    pinned="left",
+                                                    editable=False,
+                                                    width=120,
+                                                    headerName="SKU",
+                                                )
+
+                                            if "name" in df_view.columns:
+                                                gb.configure_column(
+                                                    "name",
+                                                    pinned="left",
+                                                    editable=True,
+                                                    width=280,
+                                                    headerName="Name",
+                                                )
+
+                                            if "price" in df_view.columns:
+                                                gb.configure_column(
+                                                    "price",
+                                                    editable=False,
+                                                    headerName="Price",
+                                                )
 
                                             header_overrides = {
                                                 "guitarstylemultiplechoice": "Guitar style",
@@ -2725,40 +2752,9 @@ if df_original_key in st.session_state:
                                                 "cases_covers": "Cases & Covers",
                                             }
 
-                                            norm_to_actual = {
-                                                norm_name(col): col
-                                                for col in ordered_columns
-                                            }
-
-                                            sku_col = norm_to_actual.get("sku")
-                                            if sku_col and sku_col in df_view.columns:
-                                                gb.configure_column(
-                                                    sku_col,
-                                                    pinned="left",
-                                                    editable=False,
-                                                    width=120,
-                                                    headerName="SKU",
-                                                )
-
-                                            name_col = norm_to_actual.get("name")
-                                            if name_col and name_col in df_view.columns:
-                                                gb.configure_column(
-                                                    name_col,
-                                                    pinned="left",
-                                                    editable=True,
-                                                    width=280,
-                                                    headerName="Name",
-                                                )
-
-                                            price_col = norm_to_actual.get("price")
-                                            if price_col and price_col in df_view.columns:
-                                                gb.configure_column(
-                                                    price_col,
-                                                    editable=False,
-                                                    headerName="Price",
-                                                )
-
-                                            def _detect_type(cfg_obj) -> tuple[str | None, list[str]]:
+                                            def _detect_type(
+                                                cfg_obj: Any,
+                                            ) -> tuple[str | None, list[str]]:
                                                 if isinstance(
                                                     cfg_obj, st.column_config.CheckboxColumn
                                                 ):
@@ -2781,74 +2777,85 @@ if df_original_key in st.session_state:
                                                 return None, []
 
                                             for col in ordered_columns:
-                                                norm_col = norm_name(col)
-                                                if norm_col in {"sku", "name", "price"}:
+                                                if col not in df_view.columns:
+                                                    continue
+                                                if col in {"sku", "name", "price"}:
                                                     continue
 
-                                                cfg_obj = (
-                                                    wcfg.get(norm_col)
+                                                cfg = (
+                                                    wcfg.get(col, {})
                                                     if isinstance(wcfg, dict)
                                                     else {}
                                                 )
-                                                header_name = header_overrides.get(norm_col)
-                                                col_type: str | None = None
-                                                options_labels: list[str] = []
+                                                header_name = header_overrides.get(col)
+                                                column_kwargs: dict[str, Any] = {
+                                                    "editable": True
+                                                }
 
-                                                if isinstance(cfg_obj, dict):
-                                                    col_type = cfg_obj.get("type")
-                                                    options_labels = list(
-                                                        cfg_obj.get("options_labels")
-                                                        or cfg_obj.get("options")
-                                                        or []
-                                                    )
+                                                labels: list[str] = []
+                                                if isinstance(cfg, dict):
                                                     header_name = (
                                                         header_name
-                                                        or cfg_obj.get("label")
-                                                        or cfg_obj.get("header")
+                                                        or cfg.get("label")
+                                                        or cfg.get("header")
+                                                    )
+                                                    ctype = (cfg.get("type") or "").lower()
+                                                    labels = (
+                                                        cfg.get("options_labels")
+                                                        or cfg.get("options")
+                                                        or []
                                                     )
                                                 else:
-                                                    col_type, options_labels = _detect_type(
-                                                        cfg_obj
+                                                    detected_type, detected_labels = _detect_type(
+                                                        cfg
                                                     )
-                                                    header_name = header_name or getattr(
-                                                        cfg_obj, "label", None
+                                                    if detected_type:
+                                                        ctype = detected_type
+                                                    else:
+                                                        ctype = ""
+                                                    labels = detected_labels
+                                                    header_name = (
+                                                        header_name
+                                                        or getattr(cfg, "label", None)
+                                                        or getattr(cfg, "_label", None)
                                                     )
-                                                    if not header_name:
-                                                        header_name = getattr(
-                                                            cfg_obj, "_label", None
-                                                        )
 
-                                                column_kwargs: dict = {"editable": True}
                                                 if header_name:
                                                     column_kwargs["headerName"] = header_name
 
-                                                if col_type == "boolean":
+                                                if ctype == "boolean":
                                                     gb.configure_column(
                                                         col,
                                                         cellEditor="agCheckboxCellEditor",
                                                         cellRenderer="agCheckboxCellRenderer",
-                                                        editable=True,
                                                         **column_kwargs,
                                                     )
-                                                elif col_type in {"select", "multiselect"}:
+                                                elif ctype == "select":
                                                     gb.configure_column(
                                                         col,
-                                                        editable=True,
                                                         cellEditor="agRichSelectCellEditor",
                                                         cellEditorParams={
-                                                            "values": options_labels,
+                                                            "values": labels,
                                                             "allowTyping": True,
                                                             "filterList": True,
-                                                            "multiple": col_type
-                                                            == "multiselect",
+                                                            "multiple": False,
+                                                        },
+                                                        **column_kwargs,
+                                                    )
+                                                elif ctype == "multiselect":
+                                                    gb.configure_column(
+                                                        col,
+                                                        cellEditor="agRichSelectCellEditor",
+                                                        cellEditorParams={
+                                                            "values": labels,
+                                                            "allowTyping": True,
+                                                            "filterList": True,
+                                                            "multiple": True,
                                                         },
                                                         **column_kwargs,
                                                     )
                                                 else:
-                                                    gb.configure_column(
-                                                        col,
-                                                        **column_kwargs,
-                                                    )
+                                                    gb.configure_column(col, **column_kwargs)
 
                                             gb.configure_grid_options(
                                                 suppressColumnMove=True,
@@ -2867,14 +2874,54 @@ if df_original_key in st.session_state:
                                                 ),
                                                 fit_columns_on_grid_load=False,
                                                 theme="balham",
-                                                key=f"aggrid_set_{current_set_id}",
+                                                key=f"aggrid_set_{current_set_id}_{render_counter}",
                                             )
 
-                                            grid_data = grid.get("data")
-                                            editor_df = pd.DataFrame(grid_data or [])
-                                            editor_df = editor_df.reindex(
-                                                columns=df_view.columns
-                                            )
+                                            grid_data = grid.get("data", None)
+
+                                            if grid_data is None:
+                                                editor_df = df_view.copy()
+                                            elif isinstance(grid_data, pd.DataFrame):
+                                                editor_df = grid_data.copy()
+                                            elif isinstance(grid_data, list):
+                                                editor_df = pd.DataFrame(grid_data)
+                                            elif isinstance(grid_data, dict):
+                                                editor_df = (
+                                                    pd.DataFrame([grid_data])
+                                                    if grid_data
+                                                    else df_view.copy()
+                                                )
+                                            else:
+                                                editor_df = df_view.copy()
+
+                                            editor_df = editor_df.reindex(columns=df_view.columns)
+
+                                            def _to_list(value: Any) -> list[Any]:
+                                                if value is None or value == "":
+                                                    return []
+                                                if isinstance(value, list):
+                                                    return value
+                                                if isinstance(value, str):
+                                                    return [
+                                                        item.strip()
+                                                        for item in value.split(",")
+                                                        if item.strip()
+                                                    ]
+                                                return [value]
+
+                                            if isinstance(wcfg, dict):
+                                                for col_name, cfg in wcfg.items():
+                                                    if col_name not in editor_df.columns:
+                                                        continue
+                                                    if isinstance(cfg, dict):
+                                                        cfg_type = (cfg.get("type") or "").lower()
+                                                    else:
+                                                        cfg_type, _ = _detect_type(cfg)
+                                                        cfg_type = cfg_type or ""
+                                                    if cfg_type == "multiselect":
+                                                        editor_df[col_name] = editor_df[
+                                                            col_name
+                                                        ].apply(_to_list)
 
                                             for column in editor_df.columns:
                                                 editor_df[column] = editor_df[
