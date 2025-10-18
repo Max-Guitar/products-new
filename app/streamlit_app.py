@@ -24,29 +24,28 @@ st.set_page_config(
     page_icon="🤖",
     layout="wide",
 )
+st.write("DEBUG Streamlit version:", st.__version__)
 st.title("🤖 Peter v.1.0 (AI Content Manager)")
 
 
 def _supports_editor_fixed_columns_param() -> bool:
     try:
-        sig = inspect.signature(st.data_editor)
-        return "fixed_columns" in sig.parameters
+        return "fixed_columns" in inspect.signature(st.data_editor).parameters
     except Exception:
         return False
 
 
 def _supports_column_fixed_param(col_cls) -> bool:
     try:
-        sig = inspect.signature(col_cls)
-        return "fixed" in sig.parameters
+        return "fixed" in inspect.signature(col_cls).parameters
     except Exception:
         return False
 
 
-_HAS_FIXED_KW_IN_COL = _supports_column_fixed_param(
-    cc.TextColumn
-) and _supports_column_fixed_param(cc.NumberColumn)
-_HAS_FIXED_COLUMNS_IN_EDITOR = _supports_editor_fixed_columns_param()
+_HAS_FIXED_KW = _supports_column_fixed_param(cc.TextColumn) and _supports_column_fixed_param(
+    cc.NumberColumn
+)
+_HAS_FIXED_COLUMNS_ARG = _supports_editor_fixed_columns_param()
 
 from connectors.magento.attributes import AttributeMetaCache
 from connectors.magento.categories import ensure_categories_meta
@@ -1868,7 +1867,10 @@ if df_original_key in st.session_state:
         lead_cols = [c for c in ("sku", "name") if c in column_order]
         tail_cols = [c for c in column_order if c not in ("sku", "name")]
         column_order = lead_cols + tail_cols
-        df_base = df_base[column_order]
+        df_view = df_base[column_order]
+        # Known Streamlit quirk: pinning + column_order behave better when
+        # the DataFrame already matches the requested order.
+        df_base = df_view.copy()
         options = list(attribute_sets.keys())
         options.extend(
             name
@@ -1906,7 +1908,7 @@ if df_original_key in st.session_state:
                 step1_column_config["price"] = cc.NumberColumn(
                     label="Price", disabled=True, width="small", step=1
                 )
-            if _HAS_FIXED_KW_IN_COL:
+            if _HAS_FIXED_KW:
                 step1_column_config["sku"] = cc.TextColumn(
                     label="SKU", disabled=True, width="small", fixed=True
                 )
@@ -1929,12 +1931,12 @@ if df_original_key in st.session_state:
             col_cfg, disabled_cols = _build_column_config_for_step1_like(step="step1")
             if "sku" in df_base.columns:
                 sku_kwargs = {"label": "SKU", "disabled": True, "width": "small"}
-                if _HAS_FIXED_KW_IN_COL:
+                if _HAS_FIXED_KW:
                     sku_kwargs["fixed"] = True
                 col_cfg["sku"] = cc.TextColumn(**sku_kwargs)
             if "name" in df_base.columns:
                 name_kwargs = {"label": "Name", "disabled": False, "width": "medium"}
-                if _HAS_FIXED_KW_IN_COL:
+                if _HAS_FIXED_KW:
                     name_kwargs["fixed"] = True
                 col_cfg["name"] = cc.TextColumn(**name_kwargs)
             if "price" in df_base.columns:
@@ -1944,7 +1946,7 @@ if df_original_key in st.session_state:
                     "width": "small",
                     "step": 1,
                 }
-                if _HAS_FIXED_KW_IN_COL:
+                if _HAS_FIXED_KW:
                     price_kwargs["fixed"] = True
                 col_cfg["price"] = cc.NumberColumn(**price_kwargs)
             disabled_cols = [col for col in disabled_cols if col != "name"]
@@ -1976,10 +1978,15 @@ if df_original_key in st.session_state:
                 if c not in ("sku", "name", "price")
             ]
             editor_kwargs: dict[str, object] = {}
-            if _HAS_FIXED_COLUMNS_IN_EDITOR:
+            if _HAS_FIXED_COLUMNS_ARG:
+                # Pin/"fixed" works best when we only lock the first two columns
+                # (SKU, Name). Adjust here if Price should be pinned too.
                 editor_kwargs["fixed_columns"] = {"left": 2}
+            # Another known quirk: pinning can break with hide_index=False, so we
+            # always hide the index in the editor.
+            editor_kwargs["hide_index"] = True
             edited_df = st.data_editor(
-                df_base,
+                df_view,
                 column_config=col_cfg,
                 disabled=disabled_cols,
                 column_order=column_order,
@@ -2668,7 +2675,7 @@ if df_original_key in st.session_state:
                                                     disabled=True,
                                                     width="small",
                                                 )
-                                                if _HAS_FIXED_KW_IN_COL:
+                                                if _HAS_FIXED_KW:
                                                     column_config_final[
                                                         "sku"
                                                     ] = cc.TextColumn(
@@ -2685,7 +2692,7 @@ if df_original_key in st.session_state:
                                                     disabled=False,
                                                     width="medium",
                                                 )
-                                                if _HAS_FIXED_KW_IN_COL:
+                                                if _HAS_FIXED_KW:
                                                     column_config_final[
                                                         "name"
                                                     ] = cc.TextColumn(
@@ -2703,7 +2710,7 @@ if df_original_key in st.session_state:
                                                     width="small",
                                                     step=1,
                                                 )
-                                                if _HAS_FIXED_KW_IN_COL:
+                                                if _HAS_FIXED_KW:
                                                     column_config_final[
                                                         "price"
                                                     ] = cc.NumberColumn(
@@ -2736,7 +2743,7 @@ if df_original_key in st.session_state:
                                                 num_rows="fixed",
                                                 **(
                                                     {"fixed_columns": {"left": 2}}
-                                                    if _HAS_FIXED_COLUMNS_IN_EDITOR
+                                                    if _HAS_FIXED_COLUMNS_ARG
                                                     else {}
                                                 ),
                                             )
