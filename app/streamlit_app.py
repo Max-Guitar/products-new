@@ -925,6 +925,9 @@ def _apply_ai_suggestions_to_wide(
     wide_df: pd.DataFrame,
     suggestions: dict[str, dict[str, dict]],
     meta_map: dict[str, dict],
+    meta_cache=None,
+    session=None,
+    api_base: str | None = None,
 ) -> tuple[pd.DataFrame, list[dict[str, object]]]:
     if not isinstance(wide_df, pd.DataFrame) or wide_df.empty:
         return wide_df, []
@@ -933,6 +936,76 @@ def _apply_ai_suggestions_to_wide(
 
     updated = wide_df.copy(deep=True)
     filled: dict[tuple[str, str], dict[str, object]] = {}
+
+    category_options_map: dict[str, int] | None = None
+
+    def _normalize_multiselect_list(value: object) -> list[str]:
+        if isinstance(value, (list, tuple, set)):
+            iterable = value
+        elif value in (None, ""):
+            return []
+        else:
+            return _split_multiselect_input(value)
+
+        normalized: list[str] = []
+        for item in iterable:
+            if item in (None, ""):
+                continue
+            if isinstance(item, float) and pd.isna(item):
+                continue
+            text = str(item).strip()
+            if text:
+                normalized.append(text)
+        return normalized
+
+    def _get_category_options_map(current_meta: dict) -> dict[str, int]:
+        nonlocal category_options_map
+        if category_options_map is not None:
+            return category_options_map
+
+        options_map = (
+            current_meta.get("options_map") if isinstance(current_meta, dict) else {}
+        )
+        categories_meta = None
+
+        if not isinstance(options_map, dict) or not options_map:
+            source_meta = None
+            if hasattr(meta_cache, "get"):
+                try:
+                    source_meta = meta_cache.get("categories")
+                except Exception:
+                    source_meta = None
+            elif isinstance(meta_cache, dict):
+                source_meta = meta_cache.get("categories")
+            if isinstance(source_meta, dict):
+                options_map = source_meta.get("options_map") or {}
+            if (not isinstance(options_map, dict) or not options_map) and session and api_base:
+                try:
+                    categories_meta = ensure_categories_meta(
+                        meta_cache, session, api_base, store_id=0
+                    )
+                except Exception:
+                    categories_meta = None
+                if isinstance(categories_meta, dict):
+                    options_map = categories_meta.get("options_map") or {}
+
+        normalized_map: dict[str, int] = {}
+        if isinstance(options_map, dict):
+            for key, value in options_map.items():
+                if key is None:
+                    continue
+                key_str = str(key)
+                try:
+                    int_value = int(value)
+                except (TypeError, ValueError):
+                    continue
+                normalized_map[key_str] = int_value
+                if key_str:
+                    normalized_map[key_str.casefold()] = int_value
+                normalized_map[str(int_value)] = int_value
+
+        category_options_map = normalized_map
+        return category_options_map
 
     sku_col = "sku" if "sku" in updated.columns else None
     if not sku_col:
@@ -955,17 +1028,68 @@ def _apply_ai_suggestions_to_wide(
                 continue
             meta = meta_map.get(code_key, {}) if isinstance(meta_map, dict) else {}
             converted = _coerce_ai_value(value, meta)
+            input_type = str(
+                meta.get("frontend_input")
+                or meta.get("backend_type")
+                or ""
+            ).lower()
+            normalized_ai_values: list[str] | None = None
+            ai_category_ids: list[int] | None = None
+            if input_type == "multiselect":
+                normalized_ai_values = _normalize_multiselect_list(converted)
+                if code_key == "categories":
+                    options_map = _get_category_options_map(meta)
+                    ai_category_ids = _labels_to_ids(
+                        normalized_ai_values or [], options_map
+                    )
+                    if not ai_category_ids and normalized_ai_values:
+                        ai_category_ids = _cat_to_ids(normalized_ai_values)
             for idx in row_indices:
                 existing = updated.at[idx, code_key]
                 if not _is_blank_value(existing):
+                    if input_type != "multiselect":
+                        continue
+                    if code_key == "categories":
+                        existing_ids = _cat_to_ids(existing)
+                        new_ids = [
+                            cid for cid in (ai_category_ids or []) if cid not in existing_ids
+                        ]
+                        if not new_ids:
+                            continue
+                        combined_value = existing_ids + new_ids
+                    else:
+                        existing_list = _normalize_multiselect_list(existing)
+                        new_items = [
+                            item
+                            for item in (normalized_ai_values or [])
+                            if item not in existing_list
+                        ]
+                        if not new_items:
+                            continue
+                        combined_value = existing_list + new_items
+                    updated.at[idx, code_key] = combined_value
+                    key = (sku_value, code_key)
+                    if key not in filled:
+                        filled[key] = {
+                            "sku": sku_value,
+                            "code": code_key,
+                            "value": combined_value,
+                        }
                     continue
-                updated.at[idx, code_key] = converted
+                if input_type == "multiselect":
+                    if code_key == "categories":
+                        value_to_assign: object = ai_category_ids or []
+                    else:
+                        value_to_assign = normalized_ai_values or []
+                else:
+                    value_to_assign = converted
+                updated.at[idx, code_key] = value_to_assign
                 key = (sku_value, code_key)
                 if key not in filled:
                     filled[key] = {
                         "sku": sku_value,
                         "code": code_key,
-                        "value": converted,
+                        "value": value_to_assign,
                     }
 
     return updated, list(filled.values())
@@ -2810,6 +2934,9 @@ if df_original_key in st.session_state:
                                                     step2_state["wide"].get(set_id),
                                                     suggestions_for_set,
                                                     meta_map,
+                                                    meta_cache=meta_cache,
+                                                    session=session,
+                                                    api_base=api_base,
                                                 )
                                             )
                                             if isinstance(updated_df, pd.DataFrame):
@@ -2994,6 +3121,9 @@ if df_original_key in st.session_state:
                                                     step2_state["wide"].get(set_id),
                                                     suggestions_for_set,
                                                     meta_map,
+                                                    meta_cache=meta_cache,
+                                                    session=session,
+                                                    api_base=api_base,
                                                 )
                                             )
                                             if isinstance(updated_df, pd.DataFrame):
