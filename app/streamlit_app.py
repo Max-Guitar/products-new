@@ -6,6 +6,7 @@ import math
 import sys
 from pathlib import Path
 import os
+from string import Template
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -968,8 +969,6 @@ def _render_ai_highlight(
     column_order: list[str],
     ai_cells: Iterable[tuple[str, str]],
 ) -> None:
-    if not ai_cells:
-        return
     if not isinstance(df_view, pd.DataFrame) or df_view.empty:
         return
     if "sku" not in df_view.columns:
@@ -989,7 +988,7 @@ def _render_ai_highlight(
         return
 
     targets: list[dict[str, object]] = []
-    for raw_sku, code in ai_cells:
+    for raw_sku, code in ai_cells or []:
         sku_value = str(raw_sku)
         row_idx = row_positions.get(sku_value)
         col_idx = column_positions.get(code)
@@ -997,60 +996,165 @@ def _render_ai_highlight(
             continue
         targets.append({"row": row_idx, "col": col_idx, "sku": sku_value})
 
-    if not targets:
-        return
-
     payload = json.dumps({"targets": targets, "sku_index": sku_index})
-    st.markdown(
-        f"""
+    _inject_ai_highlight_script(payload)
+
+
+def _inject_ai_highlight_script(payload: str) -> None:
+    script_template = Template(
+        """
+        <style id="ai-highlight-style">[data-ai-filled="true"] {
+            background-color: #fff7ae !important;
+        }</style>
         <script>
-        (function() {{
-            const payload = {payload};
-            function highlightTable(table) {{
-                let touched = false;
-                payload.targets.forEach((target) => {{
-                    const rowEl = table.querySelector('tbody tr:nth-child(' + target.row + ')');
-                    if (!rowEl) {{
-                        return;
-                    }}
-                    const skuCell = rowEl.querySelector('td:nth-child(' + payload.sku_index + ')');
-                    if (!skuCell) {{
-                        return;
-                    }}
-                    if ((skuCell.textContent || '').trim() !== target.sku) {{
-                        return;
-                    }}
-                    const cell = rowEl.querySelector('td:nth-child(' + target.col + ')');
-                    if (!cell) {{
-                        return;
-                    }}
-                    cell.style.backgroundColor = '#fff7cc';
-                    touched = true;
-                }});
-                return touched;
-            }}
-            function apply(attempt) {{
-                const editors = window.parent.document.querySelectorAll('div[data-testid="stDataEditor"]');
+        (function() {
+            const payload = $payload;
+            const parentWin = window.parent;
+            if (!parentWin || !parentWin.document) {
+                return;
+            }
+            const parentDoc = parentWin.document;
+            if (!parentDoc.getElementById('ai-highlight-style')) {
+                const styleTag = parentDoc.createElement('style');
+                styleTag.id = 'ai-highlight-style';
+                styleTag.textContent = '[data-ai-filled="true"] { background-color: #fff7ae !important; }';
+                parentDoc.head.appendChild(styleTag);
+            }
+
+            parentWin.__aiHighlightPayload = payload;
+
+            function runHighlight() {
+                const config = parentWin.__aiHighlightPayload;
+                const targets = (config && config.targets) || [];
+                if (!targets.length) {
+                    parentDoc.querySelectorAll('[data-ai-filled]')
+                        .forEach((cell) => cell.removeAttribute('data-ai-filled'));
+                    return true;
+                }
+                const editors = parentDoc.querySelectorAll('div[data-testid="stDataEditor"]');
                 let applied = false;
-                editors.forEach((editor) => {{
+                editors.forEach((editor) => {
                     const table = editor.querySelector('table');
-                    if (!table) {{
+                    if (!table) {
                         return;
-                    }}
-                    if (highlightTable(table)) {{
+                    }
+                    const body = table.querySelector('tbody');
+                    if (!body) {
+                        return;
+                    }
+                    const rows = body.querySelectorAll('tr');
+                    if (!rows.length) {
+                        return;
+                    }
+                    table
+                        .querySelectorAll('[data-ai-filled]')
+                        .forEach((cell) => cell.removeAttribute('data-ai-filled'));
+                    targets.forEach((target) => {
+                        const rowEl = body.querySelector('tr:nth-child(' + target.row + ')');
+                        if (!rowEl) {
+                            return;
+                        }
+                        const skuCell = rowEl.querySelector('td:nth-child(' + config.sku_index + ')');
+                        if (!skuCell) {
+                            return;
+                        }
+                        if ((skuCell.textContent || '').trim() !== target.sku) {
+                            return;
+                        }
+                        const cell = rowEl.querySelector('td:nth-child(' + target.col + ')');
+                        if (!cell) {
+                            return;
+                        }
+                        cell.setAttribute('data-ai-filled', 'true');
                         applied = true;
-                    }}
-                }});
-                if (!applied && attempt < 12) {{
-                    window.requestAnimationFrame(() => apply(attempt + 1));
-                }}
-            }}
-            apply(0);
-        }})();
+                    });
+                });
+                return applied;
+            }
+
+            function scheduleHighlight(attempt) {
+                if (runHighlight()) {
+                    return;
+                }
+                if (attempt >= 20) {
+                    return;
+                }
+                window.requestAnimationFrame(() => scheduleHighlight(attempt + 1));
+            }
+
+            if (!parentWin.__aiHighlightObserver) {
+                parentWin.__aiHighlightObserver = new MutationObserver(() => {
+                    scheduleHighlight(0);
+                });
+                parentWin.__aiHighlightObserver.observe(parentDoc.body, {
+                    childList: true,
+                    subtree: true,
+                });
+            }
+
+            scheduleHighlight(0);
+        })();
         </script>
-        """,
+        """
+    )
+    st.markdown(
+        script_template.substitute(payload=payload),
         unsafe_allow_html=True,
     )
+
+
+def _collect_ai_suggestions_log(
+    ai_suggestions: dict | None,
+    ai_cells: dict | None,
+) -> dict[str, dict[str, object]]:
+    if not isinstance(ai_suggestions, dict):
+        return {}
+
+    valid_cells: set[tuple[str, str, str]] = set()
+    if isinstance(ai_cells, dict):
+        for set_id, cells in ai_cells.items():
+            if not isinstance(cells, Iterable):
+                continue
+            for cell in cells:
+                if not isinstance(cell, Iterable):
+                    continue
+                try:
+                    sku_value, code_value = cell
+                except ValueError:
+                    continue
+                valid_cells.add((str(set_id), str(sku_value), str(code_value)))
+
+    log: dict[str, dict[str, object]] = {}
+    for set_id, per_sku in ai_suggestions.items():
+        if not isinstance(per_sku, dict):
+            continue
+        for raw_sku, attrs in per_sku.items():
+            sku_key = str(raw_sku)
+            if valid_cells and all(
+                (str(set_id), sku_key, str(code)) not in valid_cells
+                for code in (attrs or {}).keys()
+            ):
+                continue
+            if not isinstance(attrs, dict):
+                continue
+            for code, payload in attrs.items():
+                normalized_key = str(code)
+                if valid_cells and (
+                    str(set_id), sku_key, normalized_key
+                ) not in valid_cells:
+                    continue
+                value = (
+                    payload.get("value")
+                    if isinstance(payload, dict)
+                    else payload
+                )
+                if value in (None, ""):
+                    continue
+                if isinstance(value, (list, tuple, set)) and not value:
+                    continue
+                log.setdefault(sku_key, {})[normalized_key] = value
+
+    return dict(sorted(log.items(), key=lambda item: item[0]))
 
 
 def _to_list_str(value: object) -> list[str]:
@@ -3118,6 +3222,18 @@ if df_original_key in st.session_state:
                                     )
 
                                 if st.session_state.get("show_attrs"):
+                                    ai_log_payload = _collect_ai_suggestions_log(
+                                        step2_state.get("ai_suggestions"),
+                                        step2_state.get("ai_cells"),
+                                    )
+                                    with st.expander("🧠 AI suggestions log"):
+                                        if ai_log_payload:
+                                            st.json(ai_log_payload)
+                                        else:
+                                            st.caption(
+                                                "AI не вносил подсказки в этой сессии."
+                                            )
+
                                     st.markdown("---")
                                     c1, c2 = st.columns([1, 1])
                                     btn_save = c1.button(
