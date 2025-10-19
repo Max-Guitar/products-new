@@ -925,14 +925,14 @@ def _apply_ai_suggestions_to_wide(
     wide_df: pd.DataFrame,
     suggestions: dict[str, dict[str, dict]],
     meta_map: dict[str, dict],
-) -> tuple[pd.DataFrame, list[tuple[str, str]]]:
+) -> tuple[pd.DataFrame, list[dict[str, object]]]:
     if not isinstance(wide_df, pd.DataFrame) or wide_df.empty:
         return wide_df, []
     if not isinstance(suggestions, dict):
         return wide_df, []
 
     updated = wide_df.copy(deep=True)
-    filled: list[tuple[str, str]] = []
+    filled: dict[tuple[str, str], dict[str, object]] = {}
 
     sku_col = "sku" if "sku" in updated.columns else None
     if not sku_col:
@@ -947,27 +947,34 @@ def _apply_ai_suggestions_to_wide(
             continue
         row_indices = updated.index[row_mask]
         for code, payload in attrs.items():
-            if code not in updated.columns:
+            code_key = str(code)
+            if code_key not in updated.columns:
                 continue
             value = payload.get("value") if isinstance(payload, dict) else payload
             if value in (None, ""):
                 continue
-            meta = meta_map.get(code, {}) if isinstance(meta_map, dict) else {}
+            meta = meta_map.get(code_key, {}) if isinstance(meta_map, dict) else {}
             converted = _coerce_ai_value(value, meta)
             for idx in row_indices:
-                existing = updated.at[idx, code]
+                existing = updated.at[idx, code_key]
                 if not _is_blank_value(existing):
                     continue
-                updated.at[idx, code] = converted
-                filled.append((sku_value, code))
+                updated.at[idx, code_key] = converted
+                key = (sku_value, code_key)
+                if key not in filled:
+                    filled[key] = {
+                        "sku": sku_value,
+                        "code": code_key,
+                        "value": converted,
+                    }
 
-    return updated, filled
+    return updated, list(filled.values())
 
 
 def _render_ai_highlight(
     df_view: pd.DataFrame,
     column_order: list[str],
-    ai_cells: Iterable[tuple[str, str]],
+    ai_cells: Iterable | None,
 ) -> None:
     if not isinstance(df_view, pd.DataFrame) or df_view.empty:
         return
@@ -988,12 +995,33 @@ def _render_ai_highlight(
         return
 
     targets: list[dict[str, object]] = []
-    for raw_sku, code in ai_cells or []:
+    seen_targets: set[tuple[str, str]] = set()
+
+    def _iter_cells():
+        if isinstance(ai_cells, dict):
+            yield from ai_cells.values()
+            return
+        for item in ai_cells or []:
+            yield item
+
+    for cell in _iter_cells():
+        if isinstance(cell, dict):
+            raw_sku = cell.get("sku")
+            code_value = cell.get("code")
+        elif isinstance(cell, (list, tuple)) and len(cell) >= 2:
+            raw_sku, code_value = cell[0], cell[1]
+        else:
+            continue
         sku_value = str(raw_sku)
+        code_key = str(code_value)
         row_idx = row_positions.get(sku_value)
-        col_idx = column_positions.get(code)
+        col_idx = column_positions.get(code_key)
         if not row_idx or not col_idx:
             continue
+        key = (sku_value, code_key)
+        if key in seen_targets:
+            continue
+        seen_targets.add(key)
         targets.append({"row": row_idx, "col": col_idx, "sku": sku_value})
 
     payload = json.dumps({"targets": targets, "sku_index": sku_index})
@@ -1007,31 +1035,56 @@ def _inject_ai_highlight_script(payload: str) -> None:
             background-color: #fff7ae !important;
         }</style>
         <script>
-        (function() {
-            const payload = $payload;
-            const parentWin = window.parent;
-            if (!parentWin || !parentWin.document) {
-                return;
-            }
-            const parentDoc = parentWin.document;
-            if (!parentDoc.getElementById('ai-highlight-style')) {
-                const styleTag = parentDoc.createElement('style');
-                styleTag.id = 'ai-highlight-style';
-                styleTag.textContent = '[data-ai-filled="true"] { background-color: #fff7ae !important; }';
-                parentDoc.head.appendChild(styleTag);
-            }
-
-            parentWin.__aiHighlightPayload = payload;
-
-            function runHighlight() {
-                const config = parentWin.__aiHighlightPayload;
-                const targets = (config && config.targets) || [];
-                if (!targets.length) {
-                    parentDoc.querySelectorAll('[data-ai-filled]')
-                        .forEach((cell) => cell.removeAttribute('data-ai-filled'));
-                    return true;
-                }
-                const editors = parentDoc.querySelectorAll('div[data-testid="stDataEditor"]');
+        (function() {{
+            const payload = {payload};
+            const targetKeys = new Set(
+                payload.targets.map(
+                    (target) => `${{target.row}}:${{target.col}}:${{target.sku}}`
+                )
+            );
+            function clearHighlight(table) {{
+                table
+                    .querySelectorAll('td[data-ai-highlighted="1"]')
+                    .forEach((cell) => {{
+                        const key = cell.getAttribute('data-ai-key');
+                        if (!key || !targetKeys.has(key)) {{
+                            cell.style.backgroundColor = '';
+                            cell.removeAttribute('data-ai-highlighted');
+                            cell.removeAttribute('data-ai-key');
+                        }}
+                    }});
+            }}
+            function highlightTable(table) {{
+                let touched = false;
+                clearHighlight(table);
+                payload.targets.forEach((target) => {{
+                    const rowEl = table.querySelector('tbody tr:nth-child(' + target.row + ')');
+                    if (!rowEl) {{
+                        return;
+                    }}
+                    const skuCell = rowEl.querySelector('td:nth-child(' + payload.sku_index + ')');
+                    if (!skuCell) {{
+                        return;
+                    }}
+                    if ((skuCell.textContent || '').trim() !== target.sku) {{
+                        return;
+                    }}
+                    const cell = rowEl.querySelector('td:nth-child(' + target.col + ')');
+                    if (!cell) {{
+                        return;
+                    }}
+                    cell.style.backgroundColor = '#fff7cc';
+                    cell.setAttribute('data-ai-highlighted', '1');
+                    cell.setAttribute(
+                        'data-ai-key',
+                        `${{target.row}}:${{target.col}}:${{target.sku}}`
+                    );
+                    touched = true;
+                }});
+                return touched;
+            }}
+            function apply(attempt) {{
+                const editors = window.parent.document.querySelectorAll('div[data-testid="stDataEditor"]');
                 let applied = false;
                 editors.forEach((editor) => {
                     const table = editor.querySelector('table');
@@ -1659,6 +1712,75 @@ def _values_equal(left: object, right: object) -> bool:
     if isinstance(left, (list, tuple, set)) or isinstance(right, (list, tuple, set)):
         return _normalize_seq_for_compare(left) == _normalize_seq_for_compare(right)
     return left == right
+
+
+def _sync_ai_highlight_state(
+    step2_state: dict,
+    set_id: int,
+    editor_df: pd.DataFrame | None,
+) -> None:
+    if not isinstance(step2_state, dict):
+        return
+    if not isinstance(editor_df, pd.DataFrame) or editor_df.empty:
+        return
+    ai_cells_map = step2_state.get("ai_cells")
+    if not isinstance(ai_cells_map, dict):
+        return
+    existing_cells = ai_cells_map.get(set_id)
+    if not existing_cells:
+        return
+    if "sku" not in editor_df.columns:
+        return
+
+    normalized = editor_df.copy(deep=True)
+    normalized["sku"] = normalized["sku"].astype(str)
+
+    keep: list[dict[str, object]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for cell in existing_cells:
+        if isinstance(cell, dict):
+            raw_sku = cell.get("sku")
+            code_value = cell.get("code")
+            suggested_value = cell.get("value")
+        elif isinstance(cell, (list, tuple)) and len(cell) >= 2:
+            raw_sku, code_value = cell[0], cell[1]
+            suggested_value = cell[2] if len(cell) > 2 else None
+        else:
+            continue
+
+        sku_value = str(raw_sku or "")
+        code_key = str(code_value or "")
+
+        if not sku_value or not code_key:
+            continue
+        if code_key not in normalized.columns:
+            continue
+
+        matches = normalized[normalized["sku"] == sku_value]
+        if matches.empty:
+            continue
+
+        current_value = matches.iloc[0][code_key]
+        if suggested_value is not None and not _values_equal(current_value, suggested_value):
+            continue
+
+        key = (sku_value, code_key)
+        if key in seen:
+            continue
+        seen.add(key)
+        keep.append(
+            {
+                "sku": sku_value,
+                "code": code_key,
+                "value": suggested_value,
+            }
+        )
+
+    if keep:
+        ai_cells_map[set_id] = keep
+    else:
+        ai_cells_map.pop(set_id, None)
 
 
 def _df_differs(a: pd.DataFrame | None, b: pd.DataFrame | None) -> bool:
@@ -2674,9 +2796,8 @@ if df_original_key in st.session_state:
                                             )
                                             if isinstance(updated_df, pd.DataFrame):
                                                 step2_state["wide"][set_id] = updated_df
-                                                ai_cells_map[set_id] = (
-                                                    filled_cells or []
-                                                )
+                                                if filled_cells:
+                                                    ai_cells_map[set_id] = filled_cells
                                         _ensure_wide_meta_options(
                                             meta_map,
                                             step2_state["wide"].get(set_id),
@@ -2850,9 +2971,8 @@ if df_original_key in st.session_state:
                                             )
                                             if isinstance(updated_df, pd.DataFrame):
                                                 step2_state["wide"][set_id] = updated_df
-                                                ai_cells_map[set_id] = (
-                                                    filled_cells or []
-                                                )
+                                                if filled_cells:
+                                                    ai_cells_map[set_id] = filled_cells
                                         _ensure_wide_meta_options(
                                             meta_map,
                                             step2_state["wide"].get(set_id),
@@ -3166,23 +3286,16 @@ if df_original_key in st.session_state:
                                                 num_rows="fixed",
                                             )
 
-                                            ai_cells_for_set = (
-                                                step2_state.get("ai_cells", {}).get(
-                                                    current_set_id
-                                                )
-                                                or []
-                                            )
-                                            _render_ai_highlight(
-                                                df_view,
-                                                column_order,
-                                                ai_cells_for_set,
-                                            )
-
                                             if isinstance(editor_df, pd.DataFrame):
                                                 for column in editor_df.columns:
                                                     editor_df[column] = editor_df[
                                                         column
                                                     ].astype(object)
+                                                _sync_ai_highlight_state(
+                                                    step2_state,
+                                                    current_set_id,
+                                                    editor_df,
+                                                )
                                                 base_synced = (
                                                     step2_state.get("wide_synced", {})
                                                     .get(current_set_id)
@@ -3209,6 +3322,18 @@ if df_original_key in st.session_state:
                                                     step2_state["staged"].pop(
                                                         current_set_id, None
                                                     )
+
+                                            ai_cells_for_set = (
+                                                step2_state.get("ai_cells", {}).get(
+                                                    current_set_id
+                                                )
+                                                or []
+                                            )
+                                            _render_ai_highlight(
+                                                df_view,
+                                                column_order,
+                                                ai_cells_for_set,
+                                            )
 
                                     _pupdate(100, "Attributes ready")
                                     status2.update(
