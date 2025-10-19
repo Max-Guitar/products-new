@@ -5,6 +5,7 @@ import json
 import math
 import sys
 from pathlib import Path
+import os
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -36,6 +37,7 @@ from services.ai_fill import (
     compute_allowed_attrs,
     get_attribute_sets_map,
     get_product_by_sku,
+    infer_missing,
     probe_api_base,
 )
 from services.inventory import (
@@ -1468,7 +1470,9 @@ def build_attributes_df(
                         model=ai_model_name,
                     )
                 except Exception as exc:  # pragma: no cover - network error handling
-                    ai_errors.append(f"{sku_value}: {exc}")
+                    error_message = f"AI suggestion failed for {sku_value}: {exc}"
+                    st.warning(error_message)
+                    ai_errors.append(error_message)
                     continue
 
                 if not isinstance(ai_df, pd.DataFrame) or ai_df.empty:
@@ -2028,6 +2032,8 @@ st.session_state["mg_session"] = magento_session
 st.session_state["mg_base_url"] = magento_base_url
 
 ai_api_key_secret = st.secrets.get("OPENAI_API_KEY", "")
+if not ai_api_key_secret:
+    ai_api_key_secret = os.getenv("OPENAI_API_KEY", "")
 ai_model_secret = st.secrets.get("OPENAI_MODEL", "gpt-3.5-turbo")
 if isinstance(ai_model_secret, str):
     ai_model_secret = ai_model_secret.strip() or "gpt-3.5-turbo"
