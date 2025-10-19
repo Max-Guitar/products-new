@@ -235,6 +235,7 @@ def get_attribute_sets_map(session: requests.Session, api_base: str) -> Dict[int
 
 
 _meta_cache: MutableMapping[str, dict] = {}
+_CATEGORIES_CACHE: Optional[List[str]] = None
 
 
 def get_attribute_meta(session: requests.Session, api_base: str, code: str) -> dict:
@@ -423,11 +424,45 @@ def infer_missing(
             pass
     missing: List[dict] = []
     known: Dict[str, str] = {}
+    allowed_set: Set[str] = set()
+    for item in allowed:
+        if isinstance(item, str):
+            allowed_set.add(item)
+    global _CATEGORIES_CACHE
+
     for code, row in df_full.iterrows():
         if code == "categories":
+            current_value = row["label"] or row["raw_value"]
+            is_blank = False
+            if current_value in (None, ""):
+                is_blank = True
+            elif isinstance(current_value, str):
+                is_blank = not current_value.strip()
+            elif isinstance(current_value, (list, tuple, set)):
+                is_blank = len(current_value) == 0
+            if code in allowed_set and is_blank:
+                if _CATEGORIES_CACHE is None:
+                    cats = list_categories(session, api_base)
+                    if cats:
+                        _CATEGORIES_CACHE = [
+                            cat.get("name")
+                            for cat in cats
+                            if isinstance(cat, dict)
+                            and isinstance(cat.get("name"), str)
+                            and cat.get("name").strip()
+                        ]
+                    else:
+                        _CATEGORIES_CACHE = []
+                missing.append(
+                    {
+                        "code": "categories",
+                        "type": "multiselect",
+                        "options": list(_CATEGORIES_CACHE or []),
+                    }
+                )
             continue
         current_value = row["label"] or row["raw_value"]
-        if code in allowed and (current_value is None or str(current_value).strip() == ""):
+        if code in allowed_set and (current_value is None or str(current_value).strip() == ""):
             meta = get_attribute_meta(session, api_base, code)
             missing.append(
                 {
