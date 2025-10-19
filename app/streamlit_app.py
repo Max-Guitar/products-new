@@ -1160,9 +1160,12 @@ def _inject_ai_highlight_script(payload: object) -> None:
         }</style>
         <script>
         (function() {{
-            const payload = $payload;
+            const payload = $payload || {};
+            const parentWin = window.parent;
+            const parentDoc = parentWin.document;
+            const targets = Array.isArray(payload.targets) ? payload.targets : [];
             const targetKeys = new Set(
-                payload.targets.map(
+                targets.map(
                     (target) => target.row + ':' + target.col + ':' + target.sku
                 )
             );
@@ -1181,7 +1184,7 @@ def _inject_ai_highlight_script(payload: object) -> None:
             function highlightTable(table) {{
                 let touched = false;
                 clearHighlight(table);
-                payload.targets.forEach((target) => {{
+                targets.forEach((target) => {{
                     const rowEl = table.querySelector('tbody tr:nth-child(' + target.row + ')');
                     if (!rowEl) {{
                         return;
@@ -1208,7 +1211,7 @@ def _inject_ai_highlight_script(payload: object) -> None:
                 return touched;
             }}
             function apply(attempt) {{
-                const editors = window.parent.document.querySelectorAll('div[data-testid="stDataEditor"]');
+                const editors = parentDoc.querySelectorAll('div[data-testid="stDataEditor"]');
                 let applied = false;
                 editors.forEach((editor) => {
                     const table = editor.querySelector('table');
@@ -1231,7 +1234,7 @@ def _inject_ai_highlight_script(payload: object) -> None:
                         if (!rowEl) {
                             return;
                         }
-                        const skuCell = rowEl.querySelector('td:nth-child(' + config.sku_index + ')');
+                        const skuCell = rowEl.querySelector('td:nth-child(' + payload.sku_index + ')');
                         if (!skuCell) {
                             return;
                         }
@@ -1250,7 +1253,7 @@ def _inject_ai_highlight_script(payload: object) -> None:
             }
 
             function scheduleHighlight(attempt) {
-                if (runHighlight()) {
+                if (apply(0)) {
                     return;
                 }
                 if (attempt >= 20) {
