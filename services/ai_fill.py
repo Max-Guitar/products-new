@@ -411,9 +411,21 @@ def infer_missing(
     api_key: str,
     model: str = "gpt-5-mini",
 ) -> pd.DataFrame:
+    if isinstance(df_full, pd.DataFrame):
+        try:
+            print("✅ INPUT DF", df_full.columns.tolist())
+            if "categories" in df_full.index:
+                print(
+                    "✅ CATEGORIES before",
+                    df_full.loc["categories"].to_dict(),
+                )
+        except Exception:
+            pass
     missing: List[dict] = []
     known: Dict[str, str] = {}
     for code, row in df_full.iterrows():
+        if code == "categories":
+            continue
         current_value = row["label"] or row["raw_value"]
         if code in allowed and (current_value is None or str(current_value).strip() == ""):
             meta = get_attribute_meta(session, api_base, code)
@@ -451,6 +463,15 @@ def infer_missing(
     completion = _openai_complete(
         system_message, json.dumps(user_payload, ensure_ascii=False), api_key, model=model
     )
+    if isinstance(df_full, pd.DataFrame):
+        try:
+            if "categories" in df_full.index:
+                print(
+                    "✅ AFTER AI, CATEGORIES",
+                    df_full.loc["categories"].to_dict(),
+                )
+        except Exception:
+            pass
     return pd.DataFrame(completion.get("attributes", []))
 
 

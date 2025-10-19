@@ -950,6 +950,8 @@ def _apply_ai_suggestions_to_wide(
             code_key = str(code)
             if code_key not in updated.columns:
                 continue
+            if code_key == "categories":
+                continue
             value = payload.get("value") if isinstance(payload, dict) else payload
             if value in (None, ""):
                 continue
@@ -1586,7 +1588,7 @@ def build_attributes_df(
                 "sku": sku_value,
                 "name": base_name,
                 "attribute_code": "categories",
-                "value": category_labels,
+                "value": categories_ids,
             }
         )
 
@@ -2684,6 +2686,10 @@ if df_original_key in st.session_state:
                                             set_id, str(set_id)
                                         )
                                         wide_df = make_wide(stored_df)
+                                        if "categories" in wide_df.columns:
+                                            wide_df["categories"] = wide_df["categories"].apply(
+                                                _cat_to_ids
+                                            )
                                         if "attribute_set_id" in wide_df.columns:
                                             wide_df["attribute_set_id"] = set_id
                                         else:
@@ -2791,6 +2797,15 @@ if df_original_key in st.session_state:
                                                 step2_state["wide"].get(set_id), pd.DataFrame
                                             )
                                         ):
+                                            df_before_ai = step2_state["wide"].get(set_id)
+                                            if (
+                                                isinstance(df_before_ai, pd.DataFrame)
+                                                and "categories" in df_before_ai.columns
+                                            ):
+                                                st.write(
+                                                    "✅ DF BEFORE AI",
+                                                    df_before_ai[["sku", "categories"]].head(5),
+                                                )
                                             updated_df, filled_cells = (
                                                 _apply_ai_suggestions_to_wide(
                                                     step2_state["wide"].get(set_id),
@@ -2800,6 +2815,11 @@ if df_original_key in st.session_state:
                                             )
                                             if isinstance(updated_df, pd.DataFrame):
                                                 step2_state["wide"][set_id] = updated_df
+                                                if "categories" in updated_df.columns:
+                                                    st.write(
+                                                        "✅ DF AFTER AI",
+                                                        updated_df[["sku", "categories"]].head(5),
+                                                    )
                                                 if filled_cells:
                                                     ai_cells_map[set_id] = filled_cells
                                         _ensure_wide_meta_options(
@@ -2858,6 +2878,10 @@ if df_original_key in st.session_state:
                                         if not isinstance(df_existing, pd.DataFrame):
                                             continue
                                         wide_df = make_wide(df_existing)
+                                        if "categories" in wide_df.columns:
+                                            wide_df["categories"] = wide_df["categories"].apply(
+                                                _cat_to_ids
+                                            )
                                         if "attribute_set_id" in wide_df.columns:
                                             wide_df["attribute_set_id"] = set_id
                                         else:
@@ -3110,6 +3134,14 @@ if df_original_key in st.session_state:
 
                                         _apply_categories_fallback(meta_map)
                                         df_ref = _coerce_for_ui(wide_df, meta_map)
+                                        if (
+                                            isinstance(df_ref, pd.DataFrame)
+                                            and "categories" in df_ref.columns
+                                        ):
+                                            st.write(
+                                                "✅ DF BEFORE UI",
+                                                df_ref[["sku", "categories"]].head(5),
+                                            )
                                         _ensure_wide_meta_options(meta_map, df_ref)
 
                                         if (
