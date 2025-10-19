@@ -1007,6 +1007,74 @@ def _apply_ai_suggestions_to_wide(
         category_options_map = normalized_map
         return category_options_map
 
+    def _ensure_multiselect_sequence(value: object) -> list[object]:
+        if isinstance(value, list):
+            return value.copy()
+        if isinstance(value, (tuple, set)):
+            return list(value)
+        if value in (None, ""):
+            return []
+        return _split_multiselect_input(value)
+
+    def _existing_category_state(
+        value: object, options_map: dict[str, int]
+    ) -> tuple[list[object], set[int], set[str]]:
+        values = _ensure_multiselect_sequence(value)
+        ids: set[int] = set()
+        label_keys: set[str] = set()
+        for item in values:
+            cid = _parse_category_token(item)
+            text_key: str | None = None
+            if isinstance(item, str):
+                stripped = item.strip()
+                if stripped:
+                    text_key = stripped.casefold()
+            elif item not in (None, "") and not isinstance(item, (int, float)):
+                stripped = str(item).strip()
+                if stripped:
+                    text_key = stripped.casefold()
+            if cid is None and text_key:
+                cid = options_map.get(text_key)
+            if cid is None and isinstance(item, str):
+                raw_text = item.strip()
+                if raw_text and raw_text in options_map:
+                    cid = options_map[raw_text]
+            if cid is not None:
+                ids.add(cid)
+            if text_key:
+                label_keys.add(text_key)
+        return values, ids, label_keys
+
+    def _partition_ai_categories(
+        values: list[str] | None, options_map: dict[str, int]
+    ) -> tuple[list[int], list[str]]:
+        known_ids: list[int] = []
+        unknown_labels: list[str] = []
+        seen_ids: set[int] = set()
+        seen_labels: set[str] = set()
+        for item in values or []:
+            if item in (None, ""):
+                continue
+            text = str(item).strip()
+            if not text:
+                continue
+            cid = _parse_category_token(item)
+            if cid is None:
+                if text in options_map:
+                    cid = options_map[text]
+                else:
+                    cid = options_map.get(text.casefold())
+            if cid is not None:
+                if cid not in seen_ids:
+                    known_ids.append(cid)
+                    seen_ids.add(cid)
+                continue
+            label_key = text.casefold()
+            if label_key not in seen_labels:
+                unknown_labels.append(text)
+                seen_labels.add(label_key)
+        return known_ids, unknown_labels
+
     sku_col = "sku" if "sku" in updated.columns else None
     if not sku_col:
         return updated, []
@@ -1035,28 +1103,42 @@ def _apply_ai_suggestions_to_wide(
             ).lower()
             normalized_ai_values: list[str] | None = None
             ai_category_ids: list[int] | None = None
+            ai_category_labels: list[str] | None = None
             if input_type == "multiselect":
                 normalized_ai_values = _normalize_multiselect_list(converted)
                 if code_key == "categories":
                     options_map = _get_category_options_map(meta)
-                    ai_category_ids = _labels_to_ids(
-                        normalized_ai_values or [], options_map
-                    )
-                    if not ai_category_ids and normalized_ai_values:
-                        ai_category_ids = _cat_to_ids(normalized_ai_values)
+                    (
+                        ai_category_ids,
+                        ai_category_labels,
+                    ) = _partition_ai_categories(normalized_ai_values, options_map)
             for idx in row_indices:
                 existing = updated.at[idx, code_key]
                 if not _is_blank_value(existing):
                     if input_type != "multiselect":
                         continue
                     if code_key == "categories":
-                        existing_ids = _cat_to_ids(existing)
-                        new_ids = [
-                            cid for cid in (ai_category_ids or []) if cid not in existing_ids
-                        ]
-                        if not new_ids:
+                        options_map = _get_category_options_map(meta)
+                        (
+                            existing_values,
+                            existing_ids,
+                            existing_label_keys,
+                        ) = _existing_category_state(existing, options_map)
+                        combined_value = existing_values.copy()
+                        changed = False
+                        for cid in ai_category_ids or []:
+                            if cid not in existing_ids:
+                                combined_value.append(cid)
+                                existing_ids.add(cid)
+                                changed = True
+                        for label in ai_category_labels or []:
+                            key = label.casefold()
+                            if key not in existing_label_keys:
+                                combined_value.append(label)
+                                existing_label_keys.add(key)
+                                changed = True
+                        if not changed:
                             continue
-                        combined_value = existing_ids + new_ids
                     else:
                         existing_list = _normalize_multiselect_list(existing)
                         new_items = [
@@ -1078,7 +1160,14 @@ def _apply_ai_suggestions_to_wide(
                     continue
                 if input_type == "multiselect":
                     if code_key == "categories":
-                        value_to_assign: object = ai_category_ids or []
+                        combined_value: list[object] = []
+                        for cid in ai_category_ids or []:
+                            combined_value.append(cid)
+                        for label in ai_category_labels or []:
+                            combined_value.append(label)
+                        if not combined_value:
+                            continue
+                        value_to_assign = combined_value
                     else:
                         value_to_assign = normalized_ai_values or []
                 else:
@@ -1155,7 +1244,7 @@ def _render_ai_highlight(
 def _inject_ai_highlight_script(payload: object) -> None:
     script_template = Template(
         """
-        <style id="ai-highlight-style">[data-ai-filled="true"] {
+        <style id="ai-highlight-style">[data-ai-filled="true"], [data-ai-filled="true"] * {
             background-color: #fff7ae !important;
         }</style>
         <script>
@@ -1256,7 +1345,7 @@ def _inject_ai_highlight_script(payload: object) -> None:
                 if (apply(0)) {
                     return;
                 }
-                if (attempt >= 20) {
+                if (attempt >= 60) {
                     return;
                 }
                 window.requestAnimationFrame(() => scheduleHighlight(attempt + 1));
@@ -2187,6 +2276,9 @@ def save_step2_to_magento():
 
     if errors:
         import pandas as _pd
+
+        if any(err.get("attribute") == "categories" for err in errors):
+            st.warning("Some categories are not saved because they do not exist in Magento.")
 
         st.warning("Some rows failed; review and fix:")
         st.dataframe(
