@@ -950,8 +950,6 @@ def _apply_ai_suggestions_to_wide(
             code_key = str(code)
             if code_key not in updated.columns:
                 continue
-            if code_key == "categories":
-                continue
             value = payload.get("value") if isinstance(payload, dict) else payload
             if value in (None, ""):
                 continue
@@ -1464,6 +1462,7 @@ def build_attributes_df(
             attr_sets_map or {},
             ALWAYS_ATTRS,
         )
+        allowed.add("categories")
 
         editor_codes: list[str] = []
         for code in core_codes:
@@ -3131,6 +3130,12 @@ if df_original_key in st.session_state:
                                         if not isinstance(meta_map, dict):
                                             meta_map = {}
                                             wide_meta[set_id] = meta_map
+
+                                        if (
+                                            isinstance(categories_meta, dict)
+                                            and categories_meta.get("options")
+                                        ):
+                                            meta_map["categories"] = dict(categories_meta)
 
                                         _apply_categories_fallback(meta_map)
                                         df_ref = _coerce_for_ui(wide_df, meta_map)
