@@ -65,7 +65,7 @@ _ATTRIBUTE_SET_ICONS = {
 _DEFAULT_ATTRIBUTE_ICON = "🧩"
 
 
-BASE_ORDER = [
+BASE_FIRST = [
     "sku",
     "name",
     "price",
@@ -75,112 +75,170 @@ BASE_ORDER = [
 ]
 
 
-def build_column_order_for_set(
-    df_cols: list[str], set_id: int, set_name: str | None = None
-) -> list[str]:
-    alias = {
-        "cases covers": "cases_covers",
-        "guitarstylemultiplechoice": "guitarstylemultiplechoice",
-        "short description": "short_description",
-        "attribute set": "attribute_set_id",
-        "product type (attribute set)": "attribute_set_id",
-    }
+ORDER_PRESETS = {
+    # ELECTRIC GUITAR
+    "electric guitar": [
+        "series",
+        "model",
+        "guitarstylemultiplechoice",  # rendered as "Guitar style"
+        "body_material",
+        "top_material",
+        "finish",
+        "bridge_type",
+        "bridge",
+        "pickup_config",
+        "bridge_pickup",
+        "middle_pickup",
+        "neck_pickup",
+        "controls",
+        "neck_profile",
+        "neck_material",
+        "neck_radius",
+        "neck_nutwidth",
+        "fretboard_material",
+        "tuning_machines",
+        "scale_mensur",
+        "amount_of_frets",
+        "no_strings",
+        "orientation",
+        "semi_hollow_body",
+        "kids_size",
+        "vintage",
+        "cases_covers",
+        "categories",
+        "short_description",
+    ],
 
-    def norm(cols: Iterable[str | None]) -> list[str]:
-        out: list[str] = []
-        for c in cols:
-            k = (c or "").strip()
-            lowered = k.lower()
-            mapped = alias.get(lowered, k)
-            out.append(mapped)
-        return out
+    # ACOUSTIC GUITAR
+    "acoustic guitar": [
+        "series",
+        "acoustic_guitar_style",
+        "acoustic_body_shape",
+        "body_material",
+        "top_material",
+        "finish",
+        "bridge",
+        "controls",
+        "acoustic_pickup",
+        "neck_profile",
+        "neck_material",
+        "neck_radius",
+        "neck_nutwidth",
+        "fretboard_material",
+        "tuning_machines",
+        "scale_mensur",
+        "amount_of_frets",
+        "no_strings",
+        "orientation",
+        "acoustic_cutaway",
+        "electro_acoustic",
+        "kids_size",
+        "vintage",
+        "cases_covers",
+        "categories",
+        "short_description",
+    ],
 
-    order = norm(BASE_ORDER)
+    # BASS GUITAR
+    "bass guitar": [
+        "series",
+        "model",
+        "body_material",
+        "top_material",
+        "finish",
+        "bridge_type",
+        "bridge",
+        "pickup_config",
+        "bridge_pickup",
+        "middle_pickup",
+        "neck_pickup",
+        "controls",
+        "scale_mensur",
+        "no_strings",
+        "orientation",
+        "vintage",
+        "cases_covers",
+        "categories",
+        "short_description",
+    ],
 
-    per_set: list[str]
-    name_lc = (set_name or "").strip().lower()
-    if name_lc == "acoustic guitar":
-        per_set = norm(
-            [
-                "series",
-                "acoustic_guitar_style",
-                "acoustic_body_shape",
-                "body_material",
-                "top_material",
-                "finish",
-                "bridge",
-                "controls",
-                "acoustic_pickup",
-                "neck_profile",
-                "neck_material",
-                "neck_radius",
-                "neck_nutwidth",
-                "fretboard_material",
-                "tuning_machines",
-                "scale_mensur",
-                "amount_of_frets",
-                "no_strings",
-                "orientation",
-                "acoustic_cutaway",
-                "electro_acoustic",
-                "kids_size",
-                "vintage",
-                "cases_covers",
-                "categories",
-                "short_description",
-            ]
-        )
-    elif name_lc == "electric guitars":
-        per_set = norm(
-            [
-                "series",
-                "model",
-                "guitarstylemultiplechoice",
-                "body_material",
-                "top_material",
-                "finish",
-                "bridge_type",
-                "bridge",
-                "pickup_config",
-                "bridge_pickup",
-                "middle_pickup",
-                "neck_pickup",
-                "controls",
-                "neck_profile",
-                "neck_material",
-                "neck_radius",
-                "neck_nutwidth",
-                "fretboard_material",
-                "tuning_machines",
-                "scale_mensur",
-                "amount_of_frets",
-                "no_strings",
-                "orientation",
-                "semi_hollow_body",
-                "kids_size",
-                "vintage",
-                "cases_covers",
-                "categories",
-                "short_description",
-            ]
-        )
-    else:
-        per_set = []
+    # AMPS
+    "amps": [
+        "amp_style",
+        "amp_type",
+        "effect_type",
+        "controls",
+        "built_in_fx",
+        "battery",
+        "power",
+        "power_polarity",
+        "vintage",
+        "categories",
+        "short_description",
+    ],
 
-    seen: dict[str, None] = {}
+    # EFFECTS
+    "effects": [
+        "effect_type",
+        "controls",
+        "battery",
+        "power",
+        "power_polarity",
+        "vintage",
+        "categories",
+        "short_description",
+    ],
 
-    def add_seq(seq: Iterable[str]) -> None:
-        for c in seq:
-            if c in df_cols and c not in seen:
-                seen[c] = None
+    # ACCESSORIES
+    "accessories": [
+        "accessory_type",
+        "strings",
+        "cables",
+        "parts",
+        "merchandise",
+        "cases_covers",
+        "categories",
+        "short_description",
+    ],
+}
 
-    add_seq(order)
-    add_seq(per_set)
-    for c in df_cols:
-        if c not in seen:
-            seen[c] = None
 
-    return list(seen.keys())
+def _norm(s: str) -> str:
+    return (s or "").strip().lower()
+
+
+def _norm_code(s: str) -> str:
+    return re.sub(r"[\s_]+", "", _norm(s))
+
+
+def build_column_order(set_name: str, df_cols: list[str]) -> list[str]:
+    cols = list(df_cols)
+    norm_to_actual: dict[str, str] = {}
+    for col in cols:
+        if not isinstance(col, str):
+            continue
+        key = _norm_code(col)
+        if key and key not in norm_to_actual:
+            norm_to_actual[key] = col
+
+    def _resolve(codes: Iterable[str]) -> list[str]:
+        resolved: list[str] = []
+        for code in codes:
+            key = _norm_code(code)
+            col = norm_to_actual.get(key)
+            if col and col not in resolved:
+                resolved.append(col)
+        return resolved
+
+    first = _resolve(BASE_FIRST)
+
+    preset_codes = ORDER_PRESETS.get(_norm(set_name), [])
+    middle = [col for col in _resolve(preset_codes) if col not in first]
+
+    used = set(first) | set(middle)
+    tail = sorted((col for col in cols if col not in used), key=lambda c: _norm(c))
+
+    return first + middle + tail
 
 
 ID_RX = re.compile(r"#(\d+)\)?$")
@@ -1839,12 +1897,12 @@ if df_original_key in st.session_state:
         if "hint" not in df_base.columns:
             df_base["hint"] = ""
 
-        cols_order = ["sku", "name", "attribute set", "hint", "created_at"]
-        column_order = [col for col in cols_order if col in df_base.columns]
-        lead_cols = [c for c in ("sku", "name") if c in column_order]
-        tail_cols = [c for c in column_order if c not in ("sku", "name")]
-        column_order = lead_cols + tail_cols
-        df_base = df_base[column_order]
+        df_view = df_base.copy()
+        if "attribute_set_id" in df_view.columns:
+            df_view = df_view.drop(columns=["attribute_set_id"])
+
+        column_order = build_column_order("", df_view.columns.tolist())
+        df_view = df_view[column_order]
         options = list(attribute_sets.keys())
         options.extend(
             name
@@ -1886,15 +1944,19 @@ if df_original_key in st.session_state:
                 "created_at",
             ]
             col_cfg, disabled_cols = _build_column_config_for_step1_like(step="step1")
-            if "sku" in df_base.columns:
+            if "sku" in df_view.columns:
                 col_cfg["sku"] = st.column_config.Column(
                     label="SKU", disabled=True, width="small"
                 )
-            if "name" in df_base.columns:
+            if "name" in df_view.columns:
                 col_cfg["name"] = st.column_config.TextColumn(
                     label="Name", disabled=False, width="medium"
                 )
-            disabled_cols = [col for col in disabled_cols if col != "name"]
+            disabled_cols = [
+                col
+                for col in disabled_cols
+                if col != "name" and col in df_view.columns
+            ]
             if "attribute set" in col_cfg:
                 cfg = col_cfg["attribute set"]
                 if hasattr(cfg, "label"):
@@ -1907,15 +1969,18 @@ if df_original_key in st.session_state:
                     cfg.label = "Product Type (attribute set)"
                 elif hasattr(cfg, "_label"):
                     cfg._label = "Product Type (attribute set)"
-            if "attribute_set_id" in df_base.columns:
-                col_cfg["attribute_set_id"] = st.column_config.NumberColumn(
-                    label="Product Type (attribute set)",
-                    disabled=False,
+            if "attribute_set_id" in col_cfg:
+                col_cfg.pop("attribute_set_id", None)
+            if "price" in df_view.columns:
+                col_cfg["price"] = st.column_config.NumberColumn(
+                    label="Price", disabled=True
                 )
-            column_order = _pin_sku_name(column_order, list(df_base.columns))
+            column_config_view = {
+                key: value for key, value in col_cfg.items() if key in df_view.columns
+            }
             edited_df = st.data_editor(
-                df_base,
-                column_config=col_cfg,
+                df_view,
+                column_config=column_config_view,
                 disabled=disabled_cols,
                 column_order=column_order,
                 use_container_width=True,
@@ -1929,7 +1994,10 @@ if df_original_key in st.session_state:
                 help="Build attribute editor for selected items",
             )
             if isinstance(edited_df, pd.DataFrame) and go_attrs:
-                st.session_state[df_edited_key] = edited_df.copy()
+                updated_df = df_base.copy()
+                for column in edited_df.columns:
+                    updated_df[column] = edited_df[column]
+                st.session_state[df_edited_key] = updated_df
                 st.session_state["show_attributes_trigger"] = True
                 st.session_state["_go_step2_requested"] = True
                 _reset_step2_state()
@@ -2568,24 +2636,20 @@ if df_original_key in st.session_state:
                                             )
 
                                             group = group.reset_index(drop=True)
-                                            if "attribute_set_id" in group.columns:
-                                                group = group.drop(
+                                            df_view = group.copy()
+                                            if "attribute_set_id" in df_view.columns:
+                                                df_view = df_view.drop(
                                                     columns=["attribute_set_id"]
                                                 )
 
-                                            ordered_columns = build_column_order_for_set(
-                                                df_cols=list(group.columns),
-                                                set_id=current_set_id,
-                                                set_name=attribute_set_names.get(
-                                                    current_set_id, ""
-                                                ),
+                                            column_order = build_column_order(
+                                                set_name,
+                                                df_view.columns.tolist(),
                                             )
-                                            ordered_columns = _pin_sku_name(
-                                                ordered_columns, list(group.columns)
-                                            )
+                                            df_view = df_view[column_order]
 
                                             column_config_final = dict(column_config or {})
-                                            if "sku" in group.columns:
+                                            if "sku" in df_view.columns:
                                                 column_config_final[
                                                     "sku"
                                                 ] = st.column_config.Column(
@@ -2593,7 +2657,7 @@ if df_original_key in st.session_state:
                                                     disabled=True,
                                                     width="small",
                                                 )
-                                            if "name" in group.columns:
+                                            if "name" in df_view.columns:
                                                 column_config_final[
                                                     "name"
                                                 ] = st.column_config.TextColumn(
@@ -2601,7 +2665,7 @@ if df_original_key in st.session_state:
                                                     disabled=False,
                                                     width="medium",
                                                 )
-                                            if "price" in group.columns:
+                                            if "price" in df_view.columns:
                                                 column_config_final[
                                                     "price"
                                                 ] = st.column_config.NumberColumn(
@@ -2617,14 +2681,14 @@ if df_original_key in st.session_state:
                                                     cfg._label = "Guitar style"
 
                                             editor_df = st.data_editor(
-                                                group,
+                                                df_view,
                                                 key=f"editor_set_{current_set_id}",
                                                 column_config={
                                                     key: value
                                                     for key, value in column_config_final.items()
-                                                    if key in group.columns
+                                                    if key in df_view.columns
                                                 },
-                                                column_order=ordered_columns,
+                                                column_order=column_order,
                                                 use_container_width=True,
                                                 hide_index=True,
                                                 num_rows="fixed",
