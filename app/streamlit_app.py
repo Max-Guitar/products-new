@@ -1024,11 +1024,11 @@ def _render_ai_highlight(
         seen_targets.add(key)
         targets.append({"row": row_idx, "col": col_idx, "sku": sku_value})
 
-    payload = json.dumps({"targets": targets, "sku_index": sku_index})
+    payload = {"targets": targets, "sku_index": sku_index}
     _inject_ai_highlight_script(payload)
 
 
-def _inject_ai_highlight_script(payload: str) -> None:
+def _inject_ai_highlight_script(payload: object) -> None:
     script_template = Template(
         """
         <style id="ai-highlight-style">[data-ai-filled="true"] {
@@ -1036,10 +1036,10 @@ def _inject_ai_highlight_script(payload: str) -> None:
         }</style>
         <script>
         (function() {{
-            const payload = {payload};
+            const payload = $payload;
             const targetKeys = new Set(
                 payload.targets.map(
-                    (target) => `${{target.row}}:${{target.col}}:${{target.sku}}`
+                    (target) => target.row + ':' + target.col + ':' + target.sku
                 )
             );
             function clearHighlight(table) {{
@@ -1077,7 +1077,7 @@ def _inject_ai_highlight_script(payload: str) -> None:
                     cell.setAttribute('data-ai-highlighted', '1');
                     cell.setAttribute(
                         'data-ai-key',
-                        `${{target.row}}:${{target.col}}:${{target.sku}}`
+                        target.row + ':' + target.col + ':' + target.sku
                     );
                     touched = true;
                 }});
@@ -1150,10 +1150,14 @@ def _inject_ai_highlight_script(payload: str) -> None:
         </script>
         """
     )
-    st.markdown(
-        script_template.substitute(payload=payload),
-        unsafe_allow_html=True,
-    )
+    st.write("DEBUG AI highlight payload (truncated)", str(payload)[:300])
+    try:
+        json_payload = json.dumps(payload)
+        script = script_template.substitute(payload=json_payload)
+    except ValueError as exc:
+        st.error(f"Script injection failed: {exc}")
+        return
+    st.markdown(script, unsafe_allow_html=True)
 
 
 def _collect_ai_suggestions_log(
