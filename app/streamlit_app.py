@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import sys
 from pathlib import Path
@@ -651,6 +652,9 @@ def _reset_step2_state():
         "staged",
         "wide_meta",
         "current_set_id",
+        "ai_suggestions",
+        "ai_cells",
+        "ai_errors",
     ):
         step2_state.pop(key, None)
 
@@ -669,6 +673,9 @@ def _ensure_step2_state() -> dict:
     state.setdefault("wide_colcfg", {})
     state.setdefault("wide_synced", {})
     state.setdefault("staged", {})
+    state.setdefault("ai_suggestions", {})
+    state.setdefault("ai_cells", {})
+    state.setdefault("ai_errors", [])
     return state
 
 
@@ -853,6 +860,197 @@ def _coerce_for_ui(df: pd.DataFrame, meta_map: dict[str, dict]) -> pd.DataFrame:
     return out
 
 
+def _coerce_ai_value(value: object, meta: dict | None) -> object:
+    meta = meta or {}
+    input_type = (
+        meta.get("frontend_input")
+        or meta.get("backend_type")
+        or "text"
+    )
+    input_type = str(input_type).lower()
+
+    if isinstance(value, dict) and "value" in value:
+        value = value.get("value")
+
+    if input_type == "boolean":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"1", "true", "yes", "y", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "n", "off"}:
+                return False
+        return None
+
+    if input_type in {"int", "integer"}:
+        try:
+            return int(value)
+        except Exception:
+            try:
+                return int(float(value))
+            except Exception:
+                return value
+
+    if input_type in {"decimal", "price", "float"}:
+        try:
+            return float(value)
+        except Exception:
+            return value
+
+    if input_type == "multiselect":
+        if isinstance(value, (list, tuple, set)):
+            normalized = [
+                str(item).strip()
+                for item in value
+                if item not in (None, "") and str(item).strip()
+            ]
+            return normalized
+        if isinstance(value, str):
+            return [part.strip() for part in value.split(",") if part.strip()]
+        return []
+
+    if value is None:
+        return ""
+
+    return value
+
+
+def _apply_ai_suggestions_to_wide(
+    wide_df: pd.DataFrame,
+    suggestions: dict[str, dict[str, dict]],
+    meta_map: dict[str, dict],
+) -> tuple[pd.DataFrame, list[tuple[str, str]]]:
+    if not isinstance(wide_df, pd.DataFrame) or wide_df.empty:
+        return wide_df, []
+    if not isinstance(suggestions, dict):
+        return wide_df, []
+
+    updated = wide_df.copy(deep=True)
+    filled: list[tuple[str, str]] = []
+
+    sku_col = "sku" if "sku" in updated.columns else None
+    if not sku_col:
+        return updated, []
+
+    for raw_sku, attrs in suggestions.items():
+        if not isinstance(attrs, dict):
+            continue
+        sku_value = str(raw_sku)
+        row_mask = updated[sku_col].astype(str) == sku_value
+        if not row_mask.any():
+            continue
+        row_indices = updated.index[row_mask]
+        for code, payload in attrs.items():
+            if code not in updated.columns:
+                continue
+            value = payload.get("value") if isinstance(payload, dict) else payload
+            if value in (None, ""):
+                continue
+            meta = meta_map.get(code, {}) if isinstance(meta_map, dict) else {}
+            converted = _coerce_ai_value(value, meta)
+            for idx in row_indices:
+                existing = updated.at[idx, code]
+                if not _is_blank_value(existing):
+                    continue
+                updated.at[idx, code] = converted
+                filled.append((sku_value, code))
+
+    return updated, filled
+
+
+def _render_ai_highlight(
+    df_view: pd.DataFrame,
+    column_order: list[str],
+    ai_cells: Iterable[tuple[str, str]],
+) -> None:
+    if not ai_cells:
+        return
+    if not isinstance(df_view, pd.DataFrame) or df_view.empty:
+        return
+    if "sku" not in df_view.columns:
+        return
+
+    df_reset = df_view.reset_index(drop=True)
+    row_positions = {
+        str(df_reset.at[idx, "sku"]): idx + 1 for idx in df_reset.index
+    }
+    column_positions = {
+        col: idx + 1
+        for idx, col in enumerate(column_order)
+        if col in df_view.columns
+    }
+    sku_index = column_positions.get("sku")
+    if not sku_index:
+        return
+
+    targets: list[dict[str, object]] = []
+    for raw_sku, code in ai_cells:
+        sku_value = str(raw_sku)
+        row_idx = row_positions.get(sku_value)
+        col_idx = column_positions.get(code)
+        if not row_idx or not col_idx:
+            continue
+        targets.append({"row": row_idx, "col": col_idx, "sku": sku_value})
+
+    if not targets:
+        return
+
+    payload = json.dumps({"targets": targets, "sku_index": sku_index})
+    st.markdown(
+        f"""
+        <script>
+        (function() {{
+            const payload = {payload};
+            function highlightTable(table) {{
+                let touched = false;
+                payload.targets.forEach((target) => {{
+                    const rowEl = table.querySelector('tbody tr:nth-child(' + target.row + ')');
+                    if (!rowEl) {{
+                        return;
+                    }}
+                    const skuCell = rowEl.querySelector('td:nth-child(' + payload.sku_index + ')');
+                    if (!skuCell) {{
+                        return;
+                    }}
+                    if ((skuCell.textContent || '').trim() !== target.sku) {{
+                        return;
+                    }}
+                    const cell = rowEl.querySelector('td:nth-child(' + target.col + ')');
+                    if (!cell) {{
+                        return;
+                    }}
+                    cell.style.backgroundColor = '#fff7cc';
+                    touched = true;
+                }});
+                return touched;
+            }}
+            function apply(attempt) {{
+                const editors = window.parent.document.querySelectorAll('div[data-testid="stDataEditor"]');
+                let applied = false;
+                editors.forEach((editor) => {{
+                    const table = editor.querySelector('table');
+                    if (!table) {{
+                        return;
+                    }}
+                    if (highlightTable(table)) {{
+                        applied = true;
+                    }}
+                }});
+                if (!applied && attempt < 12) {{
+                    window.requestAnimationFrame(() => apply(attempt + 1));
+                }}
+            }}
+            apply(0);
+        }})();
+        </script>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def _to_list_str(value: object) -> list[str]:
     if value is None:
         return []
@@ -1027,6 +1225,9 @@ def build_attributes_df(
     attribute_sets: dict,
     attr_sets_map: dict,
     meta_cache: AttributeMetaCache,
+    *,
+    ai_api_key: str | None = None,
+    ai_model: str | None = None,
 ):
     core_codes = ["brand", "condition"]
     rows_by_set: dict[int, list[dict]] = defaultdict(list)
@@ -1053,6 +1254,14 @@ def build_attributes_df(
         for opt in (cats_meta.get("options") or [])
         if isinstance(opt, dict) and opt.get("label")
     ]
+
+    ai_enabled = bool(ai_api_key)
+    ai_requests: list[
+        tuple[int, str, dict, pd.DataFrame, list[str]]
+    ] = []
+    ai_results: dict[int, dict[str, dict[str, dict[str, object]]]] = defaultdict(dict)
+    ai_errors: list[str] = []
+    ai_model_name = ai_model or "gpt-5-mini"
 
     for _, row in df_changed.iterrows():
         sku_value = str(row.get("sku", "")).strip()
@@ -1106,6 +1315,27 @@ def build_attributes_df(
             api_base,
         )
         attr_rows = df_full.to_dict(orient="index") if not df_full.empty else {}
+
+        needs_ai = False
+        if ai_enabled:
+            for code in editor_codes:
+                if code in {"sku", "name", "attribute set"}:
+                    continue
+                values = attr_rows.get(code, {})
+                current_value = values.get("label") or values.get("raw_value")
+                if _is_blank_value(current_value):
+                    needs_ai = True
+                    break
+        if ai_enabled and needs_ai:
+            ai_requests.append(
+                (
+                    attr_set_id_int,
+                    sku_value,
+                    product,
+                    df_full.copy(deep=True),
+                    list(editor_codes),
+                )
+            )
 
         loadable_codes = [
             code
@@ -1198,7 +1428,7 @@ def build_attributes_df(
         )
 
     if not rows_by_set:
-        return {}, {}, {}, meta_cache, {}, {}
+        return {}, {}, {}, meta_cache, {}, {}, {}, []
 
     dfs: dict[int, pd.DataFrame] = {}
     column_configs: dict[int, dict] = {}
@@ -1224,7 +1454,54 @@ def build_attributes_df(
         }
         disabled[set_id] = ["sku", "name", "attribute_code"]
 
-    return dfs, column_configs, disabled, meta_cache, row_meta_by_set, set_names
+    if ai_enabled and ai_requests:
+        with st.spinner("🤖 Generating AI suggestions…"):
+            for set_id, sku_value, product_data, df_full, editor_codes in ai_requests:
+                try:
+                    ai_df = infer_missing(
+                        product_data,
+                        df_full,
+                        session,
+                        api_base,
+                        editor_codes,
+                        ai_api_key,
+                        model=ai_model_name,
+                    )
+                except Exception as exc:  # pragma: no cover - network error handling
+                    ai_errors.append(f"{sku_value}: {exc}")
+                    continue
+
+                if not isinstance(ai_df, pd.DataFrame) or ai_df.empty:
+                    continue
+
+                sku_key = str(sku_value)
+                for _, suggestion in ai_df.iterrows():
+                    code = suggestion.get("code")
+                    if not code:
+                        continue
+                    value = suggestion.get("value")
+                    if value is None:
+                        continue
+                    if isinstance(value, str) and not value.strip():
+                        continue
+                    reason = suggestion.get("reason")
+                    ai_results.setdefault(set_id, {}).setdefault(sku_key, {})[
+                        str(code)
+                    ] = {
+                        "value": value,
+                        "reason": reason,
+                    }
+
+    return (
+        dfs,
+        column_configs,
+        disabled,
+        meta_cache,
+        row_meta_by_set,
+        set_names,
+        {key: value for key, value in ai_results.items()},
+        ai_errors,
+    )
 
 def _is_blank_value(value) -> bool:
     if value is None:
@@ -1750,6 +2027,15 @@ magento_session = get_session(auth_token=magento_token)
 st.session_state["mg_session"] = magento_session
 st.session_state["mg_base_url"] = magento_base_url
 
+ai_api_key_secret = st.secrets.get("OPENAI_API_KEY", "")
+ai_model_secret = st.secrets.get("OPENAI_MODEL", "gpt-3.5-turbo")
+if isinstance(ai_model_secret, str):
+    ai_model_secret = ai_model_secret.strip() or "gpt-3.5-turbo"
+else:
+    ai_model_secret = "gpt-3.5-turbo"
+st.session_state["ai_api_key"] = ai_api_key_secret
+st.session_state["ai_model"] = ai_model_secret
+
 if not st.session_state.get("_mg_auth_logged"):
     st.write(
         "Auth header:",
@@ -2101,6 +2387,8 @@ if df_original_key in st.session_state:
                                         meta_cache,
                                         row_meta_map,
                                         set_names,
+                                        ai_suggestions_map,
+                                        ai_errors,
                                     ) = build_attributes_df(
                                         df_changed,
                                         session,
@@ -2108,7 +2396,25 @@ if df_original_key in st.session_state:
                                         attribute_sets,
                                         attr_sets_map,
                                         meta_cache,
+                                        ai_api_key=st.session_state.get("ai_api_key", ""),
+                                        ai_model=st.session_state.get("ai_model"),
                                     )
+                                    step2_state["ai_suggestions"] = (
+                                        ai_suggestions_map or {}
+                                    )
+                                    step2_state["ai_errors"] = ai_errors
+                                    if ai_errors:
+                                        preview = "\n".join(
+                                            f"- {msg}" for msg in ai_errors[:5]
+                                        )
+                                        if len(ai_errors) > 5:
+                                            preview += (
+                                                f"\n… {len(ai_errors) - 5} more items"
+                                            )
+                                        st.warning(
+                                            "AI suggestions failed for some products:\n"
+                                            + preview
+                                        )
                                     selected_set_ids = sorted(dfs_by_set.keys())
                                     total_sets = len(selected_set_ids) or 1
 
@@ -2148,11 +2454,14 @@ if df_original_key in st.session_state:
                                             wide_df.insert(1, "attribute_set_id", set_id)
                                         for column in wide_df.columns:
                                             wide_df[column] = wide_df[column].astype(object)
-                                        step2_state["wide"][set_id] = wide_df
-                                        step2_state["wide_orig"][set_id] = wide_df.copy(
+                                        baseline_df = wide_df.copy(deep=True)
+                                        step2_state["wide"][set_id] = baseline_df.copy(
                                             deep=True
                                         )
-                                        step2_state["wide_synced"][set_id] = wide_df.copy(
+                                        step2_state["wide_orig"][set_id] = baseline_df.copy(
+                                            deep=True
+                                        )
+                                        step2_state["wide_synced"][set_id] = baseline_df.copy(
                                             deep=True
                                         )
                                         attr_cols = [
@@ -2233,6 +2542,31 @@ if df_original_key in st.session_state:
                                         )
                                         resolved_storage[set_id] = resolved_map
                                         _apply_categories_fallback(meta_map)
+                                        ai_cells_map = step2_state.setdefault(
+                                            "ai_cells", {}
+                                        )
+                                        suggestions_for_set = (
+                                            step2_state.get("ai_suggestions") or {}
+                                        ).get(set_id)
+                                        if (
+                                            suggestions_for_set
+                                            and set_id not in ai_cells_map
+                                            and isinstance(
+                                                step2_state["wide"].get(set_id), pd.DataFrame
+                                            )
+                                        ):
+                                            updated_df, filled_cells = (
+                                                _apply_ai_suggestions_to_wide(
+                                                    step2_state["wide"].get(set_id),
+                                                    suggestions_for_set,
+                                                    meta_map,
+                                                )
+                                            )
+                                            if isinstance(updated_df, pd.DataFrame):
+                                                step2_state["wide"][set_id] = updated_df
+                                                ai_cells_map[set_id] = (
+                                                    filled_cells or []
+                                                )
                                         _ensure_wide_meta_options(
                                             meta_map,
                                             step2_state["wide"].get(set_id),
@@ -2295,13 +2629,16 @@ if df_original_key in st.session_state:
                                             wide_df.insert(1, "attribute_set_id", set_id)
                                         for column in wide_df.columns:
                                             wide_df[column] = wide_df[column].astype(object)
-                                        step2_state["wide"][set_id] = wide_df
-                                        step2_state["wide_orig"][set_id] = wide_df.copy(
+                                        baseline_df = wide_df.copy(deep=True)
+                                        step2_state["wide"][set_id] = baseline_df.copy(
+                                            deep=True
+                                        )
+                                        step2_state["wide_orig"][set_id] = baseline_df.copy(
                                             deep=True
                                         )
                                         if set_id not in step2_state["wide_synced"]:
-                                            step2_state["wide_synced"][set_id] = wide_df.copy(
-                                                deep=True
+                                            step2_state["wide_synced"][set_id] = (
+                                                baseline_df.copy(deep=True)
                                             )
                                         attr_cols = [
                                             col
@@ -2381,6 +2718,31 @@ if df_original_key in st.session_state:
                                         )
                                         resolved_storage[set_id] = resolved_map
                                         _apply_categories_fallback(meta_map)
+                                        ai_cells_map = step2_state.setdefault(
+                                            "ai_cells", {}
+                                        )
+                                        suggestions_for_set = (
+                                            step2_state.get("ai_suggestions") or {}
+                                        ).get(set_id)
+                                        if (
+                                            suggestions_for_set
+                                            and set_id not in ai_cells_map
+                                            and isinstance(
+                                                step2_state["wide"].get(set_id), pd.DataFrame
+                                            )
+                                        ):
+                                            updated_df, filled_cells = (
+                                                _apply_ai_suggestions_to_wide(
+                                                    step2_state["wide"].get(set_id),
+                                                    suggestions_for_set,
+                                                    meta_map,
+                                                )
+                                            )
+                                            if isinstance(updated_df, pd.DataFrame):
+                                                step2_state["wide"][set_id] = updated_df
+                                                ai_cells_map[set_id] = (
+                                                    filled_cells or []
+                                                )
                                         _ensure_wide_meta_options(
                                             meta_map,
                                             step2_state["wide"].get(set_id),
@@ -2692,6 +3054,18 @@ if df_original_key in st.session_state:
                                                 use_container_width=True,
                                                 hide_index=True,
                                                 num_rows="fixed",
+                                            )
+
+                                            ai_cells_for_set = (
+                                                step2_state.get("ai_cells", {}).get(
+                                                    current_set_id
+                                                )
+                                                or []
+                                            )
+                                            _render_ai_highlight(
+                                                df_view,
+                                                column_order,
+                                                ai_cells_for_set,
                                             )
 
                                             if isinstance(editor_df, pd.DataFrame):

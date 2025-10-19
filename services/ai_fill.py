@@ -7,6 +7,7 @@ import re
 from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 from urllib.parse import quote
 
+import openai
 import pandas as pd
 import requests
 import streamlit as st
@@ -371,25 +372,32 @@ def _openai_complete(
     model: str = "gpt-5-mini",
     timeout: int = 60,
 ) -> dict:
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": model,
-        "temperature": 0,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_msg},
-        ],
-    }
-    resp = requests.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers=headers,
-        json=payload,
-        timeout=timeout,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    return json.loads(data["choices"][0]["message"]["content"])
+    if not api_key:
+        raise RuntimeError("OpenAI API key is not configured.")
+
+    openai.api_key = api_key
+    try:
+        response = openai.ChatCompletion.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0,
+            request_timeout=timeout,
+        )
+    except Exception as exc:  # pragma: no cover - network error handling
+        raise RuntimeError(f"OpenAI request failed: {exc}") from exc
+
+    try:
+        content = response["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError("OpenAI response missing message content") from exc
+
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("OpenAI response was not valid JSON") from exc
 
 
 def infer_missing(
