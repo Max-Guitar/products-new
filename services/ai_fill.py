@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 from urllib.parse import quote
@@ -372,26 +373,27 @@ def _openai_complete(
     model: str = "gpt-5-mini",
     timeout: int = 60,
 ) -> dict:
+    api_key = api_key or os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OpenAI API key is not configured.")
 
-    openai.api_key = api_key
     try:
-        response = openai.ChatCompletion.create(
+        client = openai.OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_msg},
             ],
             temperature=0,
-            request_timeout=timeout,
+            timeout=timeout,
         )
     except Exception as exc:  # pragma: no cover - network error handling
         raise RuntimeError(f"OpenAI request failed: {exc}") from exc
 
     try:
-        content = response["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as exc:
+        content = response.choices[0].message.content
+    except (AttributeError, IndexError, TypeError) as exc:
         raise RuntimeError("OpenAI response missing message content") from exc
 
     try:
