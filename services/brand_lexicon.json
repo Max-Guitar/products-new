@@ -1,0 +1,86 @@
+{
+  "Fender": {
+    "series": ["Player", "American Professional II", "Vintera II"],
+    "models": {
+      "Player Stratocaster": {
+        "scale_mensur": "25.5\"",
+        "neck_radius": "9.5\"",
+        "pickup_config": "SSS",
+        "pickups": {
+          "bridge_pickup": ["Fender Player Series Alnico 5 Strat Single-Coil"],
+          "middle_pickup": ["Fender Player Series Alnico 5 Strat Single-Coil"],
+          "neck_pickup": ["Fender Player Series Alnico 5 Strat Single-Coil"]
+        }
+      },
+      "Player Telecaster": {
+        "scale_mensur": "25.5\"",
+        "neck_radius": "9.5\"",
+        "pickup_config": "SS",
+        "pickups": {
+          "bridge_pickup": ["Fender Player Series Alnico 5 Tele Single-Coil"],
+          "neck_pickup": ["Fender Player Series Alnico 5 Tele Single-Coil"]
+        }
+      },
+      "American Professional II Stratocaster": {
+        "scale_mensur": "25.5\"",
+        "neck_radius": "9.5\"",
+        "pickup_config": "SSS",
+        "pickups": {
+          "bridge_pickup": ["Fender V-Mod II Single-Coil Strat"],
+          "middle_pickup": ["Fender V-Mod II Single-Coil Strat"],
+          "neck_pickup": ["Fender V-Mod II Single-Coil Strat"]
+        }
+      }
+    }
+  },
+  "Gibson": {
+    "series": ["Les Paul", "SG Standard", "ES-335"],
+    "models": {
+      "Les Paul Standard": {
+        "scale_mensur": "24.75\"",
+        "neck_radius": "12\"",
+        "pickup_config": "HH",
+        "top_material": ["Maple"],
+        "pickups": {
+          "bridge_pickup": ["Gibson Burstbucker 61T"],
+          "neck_pickup": ["Gibson Burstbucker 61R"]
+        }
+      },
+      "SG Standard": {
+        "scale_mensur": "24.75\"",
+        "neck_radius": "12\"",
+        "pickup_config": "HH",
+        "pickups": {
+          "bridge_pickup": ["Gibson 61T Humbucker"],
+          "neck_pickup": ["Gibson 61R Humbucker"]
+        }
+      }
+    }
+  },
+  "Ibanez": {
+    "series": ["RG", "AZ"],
+    "models": {
+      "RG550": {
+        "scale_mensur": "25.5\"",
+        "neck_radius": "16\"",
+        "pickup_config": "HSH",
+        "bridge": ["Edge Tremolo"],
+        "pickups": {
+          "bridge_pickup": ["Ibanez V8 Humbucker"],
+          "middle_pickup": ["Ibanez S1 Single Coil"],
+          "neck_pickup": ["Ibanez V7 Humbucker"]
+        }
+      },
+      "AZ2204": {
+        "scale_mensur": "25.5\"",
+        "neck_radius": "12\"",
+        "pickup_config": "SSS",
+        "pickups": {
+          "bridge_pickup": ["Seymour Duncan Hyperion Bridge"],
+          "middle_pickup": ["Seymour Duncan Hyperion Middle"],
+          "neck_pickup": ["Seymour Duncan Hyperion Neck"]
+        }
+      }
+    }
+  }
+}
