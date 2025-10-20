@@ -2855,7 +2855,7 @@ step1_state = st.session_state.setdefault("step1", {})
 
 c1, c2, c3 = st.columns(3)
 btn_all = c1.button("📦 Load All", key="btn_load_all")
-btn_50 = c2.button("⚡ Load 50 (fast)", key="btn_load_50_fast")
+btn_50 = c2.button("⚡ New arrivals", key="btn_load_50_fast")
 btn_test = c3.button("🧪 Test ART-22895", key="btn_test_art_22895")
 
 if btn_all:
@@ -3050,6 +3050,13 @@ if requested_run_mode:
         limit = 50 if run_mode == "fast50" else None
         enabled_only = True if run_mode == "fast50" else None
         minimal_fields = run_mode == "fast50"
+        extra_params: dict[str, str] = {}
+        if run_mode == "fast50":
+            extra_params = {
+                "searchCriteria[sortOrders][0][field]": "created_at",
+                "searchCriteria[sortOrders][0][direction]": "DESC",
+                "searchCriteria[pageSize]": "50",
+            }
 
         status = st.status("Loading default products…", expanded=True)
         pbar = st.progress(0)
@@ -3066,6 +3073,7 @@ if requested_run_mode:
                 limit=limit,
                 minimal_fields=minimal_fields,
                 enabled_only=enabled_only,
+                **extra_params,
             )
             st.session_state[cache_key] = data
             pbar.progress(60)
