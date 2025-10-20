@@ -3258,8 +3258,11 @@ if df_original_key in st.session_state:
                         df_new_common = df_new_idx.loc[common_skus]
                         new_sets = df_new_common["attribute set"].fillna("")
                         old_sets = df_old_idx.loc[common_skus, "attribute set"].fillna("")
-                        diff_mask = new_sets != old_sets
-                        df_changed = df_new_common.loc[diff_mask].reset_index()
+                        df_changed = (
+                            df_new_common.loc[
+                                df_new_common["attribute_set_id"] != 4
+                            ].reset_index()
+                        )
 
                         if df_changed.empty:
                             st.warning("No updated products.")
