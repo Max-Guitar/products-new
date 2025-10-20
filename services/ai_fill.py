@@ -156,7 +156,10 @@ SPEC_FORCE_CODES: Set[str] = {
     "controls",
     "finish",
     "top_material",
+    "body_material",
 }
+
+MEASUREMENT_CODES: Set[str] = {"scale_mensur", "neck_radius", "neck_nutwidth"}
 
 SPEC_CODE_QUESTIONS: Mapping[str, str] = {
     "bridge": "Extract the bridge hardware name if mentioned; otherwise leave it empty.",
@@ -176,40 +179,121 @@ SPEC_CODE_QUESTIONS: Mapping[str, str] = {
     "top_material": "Extract the top wood/material if present; otherwise leave empty.",
 }
 
+
+def _normalize_pickup_config(value: str) -> str:
+    cleaned = re.sub(r"[^HPJMS]", "", value.upper())
+    replacements = {
+        "HSS": "HSS",
+        "HSH": "HSH",
+    }
+    if not cleaned:
+        cleaned = value.upper()
+    if cleaned in replacements:
+        return replacements[cleaned]
+    return cleaned
+
+
+def _format_scale_match(match: re.Match) -> str:
+    if match.groupdict().get("int"):
+        inches = float(match.group("int")) + 0.5
+        value = f"{inches:.2f}".rstrip("0").rstrip(".")
+        return f"{value}\""
+    value = match.group("val")
+    unit = match.group("unit") or ""
+    if unit.strip().lower().startswith("mm"):
+        try:
+            inches = float(value) / 25.4
+            rounded = f"{inches:.2f}".rstrip("0").rstrip(".")
+            return f"{rounded}\""
+        except (TypeError, ValueError):
+            return f"{value}mm"
+    trimmed = str(value).rstrip("\"")
+    return f"{trimmed}\""
+
+
+def _format_radius_match(match: re.Match) -> str:
+    value = match.group("val")
+    unit = match.group("unit") or ""
+    if unit.strip().lower().startswith("mm"):
+        try:
+            inches = float(value) / 25.4
+            rounded = f"{inches:.2f}".rstrip("0").rstrip(".")
+            return f"{rounded}\""
+        except (TypeError, ValueError):
+            return f"{value}mm"
+    trimmed = str(value).rstrip("\"")
+    return f"{trimmed}\""
+
+
+def _format_nutwidth_match(match: re.Match) -> str:
+    value = match.group("val")
+    unit = match.group("unit") or ""
+    if unit.strip().lower().startswith("mm"):
+        return f"{value}mm"
+    try:
+        mm_value = float(value) * 25.4
+        return f"{mm_value:.1f}mm"
+    except (TypeError, ValueError):
+        return f"{value}\""
+
+
 REGEX_DETECTION_PATTERNS: Mapping[str, dict] = {
     "scale": {
         "attribute": "scale_mensur",
-        "pattern": re.compile(r"(?<!\\d)(24\\.75|25\\.5|34|30)(?:\"| inch|”)", re.IGNORECASE),
-        "formatter": lambda match: f"{match.group(1)}\"",
+        "pattern": (
+            re.compile(
+                r"(?:scale (?:length|mensur)[^\d]{0,6})?(?P<val>\d+(?:\.\d+)?)(?P<unit>\s*(?:\"|inch(?:es)?|in))",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                r"(?P<val>\d+(?:\.\d+)?)\s*(?P<unit>mm)(?:\b|[^a-z])",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                r"(?P<int>\d+)\s*(?:1/2|½)(?P<unit>\s*(?:\"|inch(?:es)?|in))",
+                re.IGNORECASE,
+            ),
+        ),
+        "formatter": lambda match: _format_scale_match(match),
     },
     "radius": {
         "attribute": "neck_radius",
-        "pattern": re.compile(r"(7\\.25|9\\.5|10|12|14|16)\"?", re.IGNORECASE),
-        "formatter": lambda match: f"{match.group(1)}\"",
+        "pattern": (
+            re.compile(r"(?P<val>7\\.25|9\\.5|10|12|14|16)(?P<unit>\s*(?:\"|inch(?:es)?|in)?)", re.IGNORECASE),
+            re.compile(r"(?P<val>\d+(?:\.\d+)?)\s*(?P<unit>mm)(?:\b|[^a-z])", re.IGNORECASE),
+        ),
+        "formatter": lambda match: _format_radius_match(match),
     },
     "nut": {
         "attribute": "neck_nutwidth",
-        "pattern": re.compile(r"(38|40|42|43|45)\s?mm", re.IGNORECASE),
-        "formatter": lambda match: f"{match.group(1)}mm",
+        "pattern": (
+            re.compile(r"(?P<val>\d+(?:\.\d+)?)\s*(?P<unit>mm)(?:\b|[^a-z])", re.IGNORECASE),
+            re.compile(r"(?P<val>1\.65|1\.6875|1\.75)(?P<unit>\s*(?:\"|inch(?:es)?|in))", re.IGNORECASE),
+        ),
+        "formatter": lambda match: _format_nutwidth_match(match),
     },
     "pickup_config": {
         "attribute": "pickup_config",
-        "pattern": re.compile(r"\b(H/H|HH|HSS|SSS|HS|P|PJ|MM)\b"),
-        "formatter": lambda match: match.group(1),
+        "pattern": re.compile(r"\b(H\s*/?\s*H|H\s*SS|S\s*SS|H\s*S|P\s*/?\s*J|MM)\b", re.IGNORECASE),
+        "formatter": lambda match: _normalize_pickup_config(match.group(0)),
     },
     "pickup_models": {
         "attribute": None,
-        "pattern": re.compile(
-            r"(Seymour Duncan [A-Za-z0-9 \-]+|DiMarzio [A-Za-z0-9 \-]+|Fender [A-Za-z0-9 \-]+|EMG [A-Z0-9\-]+)",
-            re.IGNORECASE,
+        "pattern": (
+            re.compile(
+                r"(Seymour Duncan [A-Za-z0-9 \-]+|DiMarzio [A-Za-z0-9 \-]+|Fender [A-Za-z0-9 \-]+|EMG [A-Z0-9\-]+|Fishman [A-Za-z0-9 \-]+|Bare Knuckle [A-Za-z0-9 \-]+)",
+                re.IGNORECASE,
+            ),
         ),
         "formatter": lambda match: match.group(1),
     },
     "bridges": {
         "attribute": "bridge",
-        "pattern": re.compile(
-            r"(Floyd Rose|Tune-o-matic|Hardtail|6-saddle|2-point|Bigsby)",
-            re.IGNORECASE,
+        "pattern": (
+            re.compile(
+                r"(Floyd Rose|Tune-o-matic|Hardtail|6-saddle|2-point|Bigsby|Hipshot [A-Za-z0-9\-]+|Gotoh [A-Za-z0-9\-]+|Babicz [A-Za-z0-9\-]+)",
+                re.IGNORECASE,
+            ),
         ),
         "formatter": lambda match: match.group(1),
     },
@@ -238,22 +322,39 @@ def _load_brand_lexicon() -> dict[str, object]:
 
 BRAND_LEXICON: Mapping[str, object] = _load_brand_lexicon()
 
+
+def _load_series_lexicon() -> dict[str, object]:
+    path = Path(__file__).with_name("series_lexicon.json")
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as fp:
+            data = json.load(fp)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if isinstance(data, dict):
+        return data
+    return {}
+
+
+SERIES_LEXICON: Mapping[str, object] = _load_series_lexicon()
+
 AI_RULES_TEXT = (
-    "Ты помощник по каталогизации гитар. Используй входные данные, чтобы заполнить "
-    "пропущенные атрибуты товара. Всегда отвечай валидным JSON без комментариев "
-    "в формате {\"attributes\":[{...}]}. Строгая схема элемента массива:\n"
-    "- code — строка с кодом атрибута.\n"
-    "- value — строка, число, булево или массив строк без пустых значений.\n"
-    "- reason — короткое пояснение на русском, почему выбранное значение уместно.\n"
-    "- evidence — дословная выдержка (5–60 символов) из исходного текста, где найдено значение.\n"
-    "Если данных недостаточно, оставляй value пустым (\"\" или []), а reason и evidence поясняй, "
-    "что информации нет.\n"
-    "Используй hints.regex_hits и hints.brand_lexicon как подсказки, но проверяй, что текст "
-    "действительно подтверждает значение.\n"
-    "Соотносить модели Telecaster→T-Style, Stratocaster→S-Style, Les Paul→Single cut, SG→Double cut.\n"
-    "При наличии T-Style добавляй также Single cut; при наличии S-Style добавляй Double cut.\n"
-    "Значения мультиселектов представляй как массив строк без дублей, булевы атрибуты — true/false.\n"
-    "Для категорий используй текстовые лейблы.\n"
+    "Ты помощник по каталогизации гитар. Используй предоставленный контекст, "
+    "чтобы заполнить атрибуты товара и всегда проверяй, что значение подтверждено "
+    "исходным текстом. Отвечай строго валидным JSON-объектом без пояснений: "
+    "{\"attributes\": [...]}\n"
+    "Каждый элемент массива обязан соответствовать схеме:\n"
+    "{\"code\": <string>, \"value\": <string|number|boolean|array<string>>, "
+    "\"reason\": <string>, \"evidence\": <string>}\n"
+    "Поле evidence обязательно и должно содержать дословный фрагмент источника длиной 5–80 символов.\n"
+    "Если данных нет, ставь value как пустую строку или [], а в reason и evidence объясняй, что "
+    "информация отсутствует.\n"
+    "Используй hints.regex_hits, hints.brand_lexicon и hints.series_lexicon только как подсказки; "
+    "подтверждай их прямыми цитатами.\n"
+    "Нормализуй стили: Telecaster→T-Style, Stratocaster→S-Style, Les Paul→Single cut, SG→Double cut; "
+    "для T-Style добавляй Single cut, для S-Style — Double cut.\n"
+    "Мультиселекты возвращай массивом уникальных строк, булевы — true/false. Для категорий используй текстовые лейблы.\n"
     "Пример 1:\n"
     "Вход → name: \"Fender Player Stratocaster\", hints.regex_hits.scale: 25.5\"\n"
     "Ответ → {\"attributes\":[{\"code\":\"scale_mensur\",\"value\":\"25.5\"\",\"reason\":\"Стандартная мензура для Player Stratocaster\",\"evidence\":\"scale length 25.5\"\"}]}\n"
@@ -439,22 +540,29 @@ def _detect_regex_hits(texts: Iterable[str]) -> dict[str, list[dict[str, str]]]:
             continue
         for key, spec in REGEX_DETECTION_PATTERNS.items():
             pattern = spec.get("pattern")
-            if not isinstance(pattern, re.Pattern):
+            if isinstance(pattern, re.Pattern):
+                patterns = [pattern]
+            elif isinstance(pattern, (list, tuple, set)):
+                patterns = [pat for pat in pattern if isinstance(pat, re.Pattern)]
+            else:
+                patterns = []
+            if not patterns:
                 continue
-            for match in pattern.finditer(raw_text):
-                value = match.group(0)
-                formatter = spec.get("formatter")
-                if callable(formatter):
-                    try:
-                        value = formatter(match)
-                    except Exception:
-                        value = match.group(0)
-                evidence = _build_evidence_snippet(raw_text, match.start(), match.end())
-                entry: dict[str, str] = {"value": str(value), "evidence": evidence}
-                attribute = spec.get("attribute")
-                if isinstance(attribute, str) and attribute:
-                    entry["attribute"] = attribute
-                hits.setdefault(key, []).append(entry)
+            for pattern_obj in patterns:
+                for match in pattern_obj.finditer(raw_text):
+                    value = match.group(0)
+                    formatter = spec.get("formatter")
+                    if callable(formatter):
+                        try:
+                            value = formatter(match)
+                        except Exception:
+                            value = match.group(0)
+                    evidence = _build_evidence_snippet(raw_text, match.start(), match.end())
+                    entry: dict[str, str] = {"value": str(value), "evidence": evidence}
+                    attribute = spec.get("attribute")
+                    if isinstance(attribute, str) and attribute:
+                        entry["attribute"] = attribute
+                    hits.setdefault(key, []).append(entry)
     for key, entries in hits.items():
         deduped: list[dict[str, str]] = []
         seen_values: Set[str] = set()
@@ -560,11 +668,97 @@ def _match_brand_lexicon(
     return hint_payload, hits_payload
 
 
+def _match_series_lexicon(
+    attribute_set_name: Optional[str],
+    brand_hint: Optional[str],
+    texts: Iterable[str],
+) -> tuple[dict[str, object], dict[str, object]]:
+    if not attribute_set_name:
+        return {}, {}
+    payload = SERIES_LEXICON.get(str(attribute_set_name))
+    if not isinstance(payload, Mapping):
+        return {}, {}
+    normalized_texts = [str(text).casefold() for text in texts if isinstance(text, str)]
+    brand_candidates = {str(brand_hint).casefold()} if brand_hint else set()
+    matched_series: list[str] = []
+    attribute_candidates: dict[str, list[str]] = {}
+    hits: list[dict[str, object]] = []
+    for brand_name, series_entries in payload.items():
+        if not isinstance(brand_name, str):
+            continue
+        if brand_candidates and brand_name.casefold() not in brand_candidates:
+            continue
+        entries_iter = series_entries if isinstance(series_entries, list) else []
+        for entry in entries_iter:
+            if not isinstance(entry, Mapping):
+                continue
+            series_name = entry.get("series")
+            keywords = entry.get("keywords")
+            attrs = entry.get("attributes")
+            if not isinstance(series_name, str) or not series_name.strip():
+                continue
+            if keywords:
+                keyword_matches = False
+                for keyword in keywords:
+                    if not isinstance(keyword, str) or not keyword.strip():
+                        continue
+                    lowered = keyword.casefold()
+                    if any(lowered in text for text in normalized_texts):
+                        keyword_matches = True
+                        break
+                if not keyword_matches:
+                    continue
+            matched_series.append(series_name)
+            if isinstance(attrs, Mapping):
+                attributes_map: dict[str, list[str]] = {}
+                for attr_code, attr_values in attrs.items():
+                    values_list = _ensure_list_of_strings(attr_values)
+                    if not values_list:
+                        continue
+                    attribute_candidates.setdefault(attr_code, []).extend(values_list)
+                    attributes_map[attr_code] = values_list
+                hits.append({"brand": brand_name, "series": series_name, "attributes": attributes_map})
+            else:
+                hits.append({"brand": brand_name, "series": series_name})
+    if not matched_series and not attribute_candidates:
+        return {}, {}
+    for attr_code, values in list(attribute_candidates.items()):
+        deduped: list[str] = []
+        seen: Set[str] = set()
+        for value in values:
+            normalized = value.casefold()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(value)
+        attribute_candidates[attr_code] = deduped
+    hint_payload: dict[str, object] = {
+        "series": matched_series,
+        "attributes": attribute_candidates,
+    }
+    if brand_hint:
+        hint_payload["brand"] = brand_hint
+    hits_payload: dict[str, object] = {"matches": hits}
+    return hint_payload, hits_payload
+
+
 def _normalize_measurement_string(value: str) -> str:
-    normalized = value.replace("”", '\"').replace("″", '\"').replace("“", '"')
+    normalized = (
+        value.replace("”", '\"')
+        .replace("″", '\"')
+        .replace("“", '"')
+        .replace("’", "'")
+        .replace("½", " 1/2")
+    )
     normalized = re.sub(
         r"(?P<num>\d+(?:\.\d+)?)\s*(?:inch|inches)",
         lambda m: f"{m.group('num')}\"",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(
+        r"(?P<int>\d+)\s*(?:1/2)\s*(?:\"|in|inch|inches)",
+        lambda m: f"{float(m.group('int')) + 0.5}\"",
         normalized,
         flags=re.IGNORECASE,
     )
@@ -588,6 +782,61 @@ def _apply_material_alias(value: str) -> str:
     if alias:
         return alias
     return value
+
+
+def _normalize_value_for_code(code: str, value: str) -> str:
+    text = str(value).strip()
+    if not text:
+        return text
+    lowered_code = code.casefold()
+    if lowered_code == "pickup_config":
+        return _normalize_pickup_config(text)
+    if lowered_code in {"fretboard_material", "neck_material", "top_material", "body_material"}:
+        aliased = _apply_material_alias(text.title())
+        return aliased
+    if lowered_code not in MEASUREMENT_CODES:
+        return text
+    normalized = _normalize_measurement_string(text)
+    mm_match = re.search(r"(?P<val>\d+(?:\.\d+)?)\s*mm\b", normalized, re.IGNORECASE)
+    if lowered_code in {"scale_mensur", "neck_radius"}:
+        if mm_match:
+            try:
+                inches = float(mm_match.group("val")) / 25.4
+                value_str = f"{inches:.2f}".rstrip("0").rstrip(".")
+                return f"{value_str}\""
+            except (TypeError, ValueError):
+                return f"{mm_match.group('val')}mm"
+        inch_match = re.search(
+            r"(?P<val>\d+(?:\.\d+)?)\s*(?:\"|inch|inches|in)\b",
+            normalized,
+            re.IGNORECASE,
+        )
+        if inch_match:
+            value_str = f"{float(inch_match.group('val')):.2f}".rstrip("0").rstrip(".")
+            return f"{value_str}\""
+        return normalized
+    if lowered_code == "neck_nutwidth":
+        if mm_match:
+            try:
+                mm_value = float(mm_match.group("val"))
+            except (TypeError, ValueError):
+                return f"{mm_match.group('val')}mm"
+            formatted = f"{mm_value:.1f}".rstrip("0").rstrip(".")
+            return f"{formatted}mm"
+        inch_match = re.search(
+            r"(?P<val>\d+(?:\.\d+)?)\s*(?:\"|inch|inches|in)\b",
+            normalized,
+            re.IGNORECASE,
+        )
+        if inch_match:
+            try:
+                mm_value = float(inch_match.group("val")) * 25.4
+                formatted = f"{mm_value:.1f}".rstrip("0").rstrip(".")
+                return f"{formatted}mm"
+            except (TypeError, ValueError):
+                return normalized
+        return normalized
+    return normalized
 
 
 def _map_to_meta_option(
@@ -656,8 +905,9 @@ def _postprocess_suggestions(
         updated_value = value
         change_reason: Optional[str] = None
         if isinstance(value, str):
-            normalized = _normalize_measurement_string(value)
-            normalized = _apply_material_alias(normalized)
+            normalized = _normalize_value_for_code(code, value)
+            if code in MEASUREMENT_CODES:
+                normalized = _normalize_measurement_string(normalized)
             mapped_value, mapped_reason = _map_to_meta_option(session, api_base, code, normalized)
             updated_value = mapped_value
             change_reason = mapped_reason
@@ -672,8 +922,9 @@ def _postprocess_suggestions(
                     item_text = str(item)
                 else:
                     item_text = item
-                item_normalized = _normalize_measurement_string(item_text)
-                item_normalized = _apply_material_alias(item_normalized)
+                item_normalized = _normalize_value_for_code(code, item_text)
+                if code in MEASUREMENT_CODES:
+                    item_normalized = _normalize_measurement_string(item_normalized)
                 mapped_value, mapped_reason = _map_to_meta_option(
                     session, api_base, code, item_normalized
                 )
@@ -1654,12 +1905,26 @@ def infer_missing(
     if brand_lexicon_hint:
         sanitized_hints["brand_lexicon"] = brand_lexicon_hint
 
+    brand_for_series: Optional[str] = None
+    if isinstance(brand_lexicon_hint, Mapping):
+        brand_for_series = str(brand_lexicon_hint.get("brand") or "").strip() or None
+    if not brand_for_series:
+        brand_for_series = brand_for_lexicon
+    series_lexicon_hint, series_lexicon_hits = _match_series_lexicon(
+        attribute_set_name,
+        brand_for_series,
+        product_texts,
+    )
+    if series_lexicon_hint:
+        sanitized_hints["series_lexicon"] = series_lexicon_hint
+
     description_payload = long_desc or short_desc
 
     user_payload = {
         "sku": product.get("sku"),
         "name": product.get("name"),
         "short_description": short_desc,
+        "long_description": long_desc,
         "description": description_payload,
         "meta_title": meta_title,
         "vendor_sku": vendor_sku,
@@ -1674,6 +1939,9 @@ def infer_missing(
         "hints": sanitized_hints,
         "known_values": known,
         "missing": missing,
+        "regex_hits": regex_hits,
+        "brand_lexicon": brand_lexicon_hint,
+        "series_lexicon": series_lexicon_hint,
     }
 
     payload_json = json.dumps(user_payload, ensure_ascii=False)
@@ -1730,9 +1998,25 @@ def infer_missing(
         if brand_hint_values and _is_blank(context_already_found.get("brand")):
             context_already_found["brand"] = brand_hint_values[0]
         if regex_hits:
+            for regex_key, entries in regex_hits.items():
+                if not isinstance(entries, list):
+                    continue
+                for entry in entries:
+                    if not isinstance(entry, Mapping):
+                        continue
+                    attr = entry.get("attribute")
+                    val = entry.get("value")
+                    if (
+                        isinstance(attr, str)
+                        and attr not in context_already_found
+                        and not _is_blank(val)
+                    ):
+                        context_already_found[attr] = val
             context_already_found["regex_hits"] = regex_hits
         if brand_lexicon_hint:
             context_already_found["brand_lexicon"] = brand_lexicon_hint
+        if series_lexicon_hint:
+            context_already_found["series_lexicon"] = series_lexicon_hint
         retry_context = context_already_found
         retry_questions = {
             code: SPEC_CODE_QUESTIONS.get(
@@ -1791,6 +2075,15 @@ def infer_missing(
     else:
         result_df = pd.DataFrame(columns=["code", "value", "reason"])
 
+    evidence_log: dict[str, str] = {}
+    for row in final_rows:
+        if not isinstance(row, Mapping):
+            continue
+        code = row.get("code")
+        evidence = row.get("evidence")
+        if isinstance(code, str) and isinstance(evidence, str) and evidence.strip():
+            evidence_log[code] = evidence
+
     previews_for_log: list[str] = []
     if raw_previews:
         if raw_previews[0]:
@@ -1811,8 +2104,14 @@ def infer_missing(
         "retry_context": retry_context,
         "regex_hits": regex_hits,
         "brand_lexicon_hits": brand_lexicon_hits,
+        "series_lexicon_hits": series_lexicon_hits,
+        "lexicon_hits": {
+            "brand": brand_lexicon_hits,
+            "series": series_lexicon_hits,
+        },
         "postprocess_adjustments": postprocess_adjustments,
         "raw_response_preview": "\n".join(previews_for_log),
+        "evidence": evidence_log,
     }
     result_df.attrs["meta"] = metadata
     return result_df
