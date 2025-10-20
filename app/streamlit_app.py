@@ -2394,7 +2394,79 @@ def load_items(
     *,
     attr_set_id: int | None = None,
     products: list[dict] | None = None,
+    skip_filters: bool = False,
 ):
+    def _empty_df() -> pd.DataFrame:
+        return pd.DataFrame(columns=["sku", "name", "attribute set", "created_at"])
+
+    def _attr_set_name(product: dict, fallback_attr_set_id: int | None) -> str:
+        attr_name = product.get("attribute_set_name")
+        if attr_name:
+            return str(attr_name)
+        attr_value = product.get("attribute_set_id")
+        if attr_value not in (None, ""):
+            return str(attr_value)
+        if fallback_attr_set_id not in (None, ""):
+            return str(fallback_attr_set_id)
+        return _DEF_ATTR_SET_NAME
+
+    if skip_filters:
+        rows: list[dict[str, str]] = []
+        prog = st.progress(0.0, text="Loading products…")
+        total_hint = 0
+
+        if products is None:
+            effective_attr_set_id = attr_set_id
+            if effective_attr_set_id is None:
+                effective_attr_set_id = get_attr_set_id(
+                    session, base_url, name=_DEF_ATTR_SET_NAME
+                )
+            iterator = iter_products_by_attr_set(
+                session, base_url, effective_attr_set_id
+            )
+            for product, total in iterator:
+                total_hint = total or total_hint
+                rows.append(
+                    {
+                        "sku": product.get("sku", ""),
+                        "name": product.get("name", ""),
+                        "attribute set": _attr_set_name(
+                            product, effective_attr_set_id
+                        ),
+                        "created_at": product.get("created_at", ""),
+                    }
+                )
+                if total_hint:
+                    done = len(rows) / max(total_hint, 1)
+                    done = min(done, 1.0)
+                    prog.progress(
+                        done, text=f"Loading products… {int(done * 100)}%"
+                    )
+        else:
+            total_hint = len(products)
+            for idx, product in enumerate(products, start=1):
+                rows.append(
+                    {
+                        "sku": product.get("sku", ""),
+                        "name": product.get("name", ""),
+                        "attribute set": _attr_set_name(product, attr_set_id),
+                        "created_at": product.get("created_at", ""),
+                    }
+                )
+                if total_hint:
+                    done = idx / max(total_hint, 1)
+                    done = min(done, 1.0)
+                    prog.progress(
+                        done, text=f"Loading products… {int(done * 100)}%"
+                    )
+
+        prog.progress(1.0, text="Products loaded")
+
+        df_skip = pd.DataFrame(rows)
+        if df_skip.empty:
+            return _empty_df()
+        return df_skip.reindex(columns=["sku", "name", "attribute set", "created_at"])
+
     if attr_set_id is None:
         attr_set_id = get_attr_set_id(session, base_url, name=_DEF_ATTR_SET_NAME)
 
@@ -2477,7 +2549,7 @@ def load_items(
 
     df = pd.DataFrame(rows)
     if df.empty:
-        return pd.DataFrame(columns=["sku", "name", "attribute set", "created_at"])
+        return _empty_df()
 
     if DEBUG and "status" in df.columns:
         st.write("STATUS COUNTS:", df["status"].value_counts(dropna=False))
@@ -2508,6 +2580,7 @@ def load_items(
     prog3 = st.progress(0.0, text=f"Checking backorders… 0/{total_backorder_tasks}")
 
     if total_backorder_tasks:
+
         def _progress_cb(completed: int):
             if completed % 50 == 0 or completed == total_backorder_tasks:
                 ratio = completed / max(total_backorder_tasks, 1)
@@ -2536,7 +2609,7 @@ def load_items(
     st.success(f"STEP F — final rows (qty>0 OR bo=2): {len(out)}")
 
     if out.empty:
-        return pd.DataFrame(columns=["sku", "name", "attribute set", "created_at"])
+        return _empty_df()
 
     out["attribute set"] = _DEF_ATTR_SET_NAME
     return out[["sku", "name", "attribute set", "created_at"]]
@@ -2680,31 +2753,26 @@ if requested_run_mode:
             }
             step1_state["set_choices"] = set_choices
 
-            st.session_state[cache_key] = [product]
+            product["attribute_set_name"] = attr_name
+            data = [product]
+            st.session_state[cache_key] = data
 
-            pbar.progress(70)
-            status.update(label="Preparing table…")
-
-            df_items = pd.DataFrame(
-                [
-                    {
-                        "sku": product.get("sku", ""),
-                        "name": product.get("name", ""),
-                        "attribute set": attr_name,
-                        "attribute_set_id": product.get("attribute_set_id"),
-                        "created_at": product.get("created_at"),
-                    }
-                ]
+            pbar.progress(60)
+            status.update(label="Parsing response…")
+            df_items = load_items(
+                session,
+                base_url,
+                attr_set_id=None,
+                products=data,
+                skip_filters=True,
             )
-            df_items["attribute_set_id"] = pd.Series(
-                [attr_set_id_int], dtype="Int64"
-            )
-
+            pbar.progress(90)
+            status.update(label="Building table…")
             if df_items.empty:
-                status.update(state="error", label="No products to display")
-                st.warning(f"SKU {sku} not found.")
+                st.warning("No items match the Default set filter criteria.")
                 st.session_state.pop(df_original_key, None)
                 st.session_state.pop(df_edited_key, None)
+                st.session_state.pop(attribute_sets_key, None)
                 _reset_step2_state()
             else:
                 df_ui = df_items.copy()
@@ -2715,14 +2783,12 @@ if requested_run_mode:
                     drop=True
                 )
                 st.session_state[df_original_key] = df_ui.copy()
-
-                attr_sets_map = {}
-                if attr_name and attr_set_id_int is not None:
-                    attr_sets_map[attr_name] = attr_set_id_int
-                elif attr_name:
-                    attr_sets_map[attr_name] = attr_name
-                st.session_state[attribute_sets_key] = attr_sets_map
-
+                try:
+                    attribute_sets = list_attribute_sets(session, base_url)
+                except Exception as exc:  # pragma: no cover - UI error handling
+                    st.error(f"Failed to fetch attribute sets: {exc}")
+                    attribute_sets = {}
+                st.session_state[attribute_sets_key] = attribute_sets
                 df_for_edit = df_ui.copy()
                 if "hint" not in df_for_edit.columns:
                     df_for_edit["hint"] = ""
@@ -2743,9 +2809,11 @@ if requested_run_mode:
                 df_for_edit = df_for_edit[column_order]
                 st.session_state[df_edited_key] = df_for_edit.copy()
                 _reset_step2_state()
-
-                pbar.progress(100)
-                status.update(state="complete", label="Loaded 1 item")
+            pbar.progress(100)
+            status.update(
+                state="complete",
+                label=f"Loaded {len(data or [])} items",
+            )
 
     else:
         limit = 50 if run_mode == "fast50" else None
