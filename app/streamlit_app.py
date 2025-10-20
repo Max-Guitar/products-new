@@ -969,6 +969,7 @@ def _apply_ai_suggestions_to_wide(
         col_key: str,
         sku_value: str,
         value: object,
+        value_ui: list[str] | None = None,
         log_entry: dict[str, object] | None = None,
     ) -> None:
         key = (sku_value, col_key)
@@ -979,6 +980,8 @@ def _apply_ai_suggestions_to_wide(
             except Exception:
                 pass
         entry["value"] = value
+        if value_ui is not None:
+            entry["value_ui"] = value_ui
         if isinstance(log_entry, dict):
             for log_key, log_value in log_entry.items():
                 if log_value in (None, [], {}):
@@ -1038,6 +1041,8 @@ def _apply_ai_suggestions_to_wide(
                 row_position: int | None = None
                 if len(row_position_arr) == 1 and row_position_arr[0] >= 0:
                     row_position = int(row_position_arr[0])
+
+                value_ui_payload: list[str] | None = None
 
                 if code_key == "categories":
                     meta_categories = meta_map.get("categories") or {}
@@ -1143,6 +1148,23 @@ def _apply_ai_suggestions_to_wide(
                         cid for cid in found_ids if cid not in existing_ids
                     ]
 
+                    if values_to_labels:
+                        labels_payload: list[str] = []
+                        for cid in combined_ids:
+                            lookup_key = str(cid)
+                            label_text = values_to_labels.get(lookup_key)
+                            if label_text is None and isinstance(cid, str):
+                                label_text = values_to_labels.get(cid.strip())
+                            if label_text is None and lookup_key.isdigit():
+                                label_text = values_to_labels.get(str(int(lookup_key)))
+                            if label_text is None:
+                                continue
+                            label_clean = str(label_text).strip()
+                            if label_clean and label_clean not in labels_payload:
+                                labels_payload.append(label_clean)
+                        if labels_payload:
+                            value_ui_payload = labels_payload
+
                     if combined_ids != existing_ids:
                         updated.at[idx, code_key] = combined_ids
                         log_entry = {
@@ -1156,6 +1178,7 @@ def _apply_ai_suggestions_to_wide(
                             col_key=code_key,
                             sku_value=sku_value,
                             value=combined_ids,
+                            value_ui=value_ui_payload,
                             log_entry=log_entry,
                         )
                         ai_log.append(
@@ -1204,6 +1227,7 @@ def _apply_ai_suggestions_to_wide(
                             col_key=code_key,
                             sku_value=sku_value,
                             value=combined,
+                            value_ui=value_ui_payload,
                             log_entry=log_entry,
                         )
                         ai_log.append(
@@ -1241,6 +1265,7 @@ def _apply_ai_suggestions_to_wide(
                     col_key=code_key,
                     sku_value=sku_value,
                     value=converted_value,
+                    value_ui=value_ui_payload,
                     log_entry=None,
                 )
 
@@ -1250,20 +1275,29 @@ def _render_ai_highlight(
     df_view: pd.DataFrame,
     column_order: list[str],
     ai_cells: Iterable | None,
+    editor_dom_key: str | None,
 ) -> None:
     if not isinstance(df_view, pd.DataFrame) or df_view.empty:
         return
+    if not editor_dom_key:
+        return
     if "sku" not in df_view.columns:
+        return
+
+    normalized_columns: list[str] = []
+    column_positions: dict[str, int] = {}
+    for idx, col in enumerate(column_order):
+        if col not in df_view.columns:
+            continue
+        col_key = str(col)
+        normalized_columns.append(col_key)
+        column_positions[col_key] = int(idx)
+    if "sku" not in normalized_columns:
         return
 
     df_reset = df_view.reset_index(drop=True)
     row_positions = {
         str(df_reset.at[idx, "sku"]): int(idx) for idx in df_reset.index
-    }
-    column_positions = {
-        col: int(idx)
-        for idx, col in enumerate(column_order)
-        if col in df_view.columns
     }
     sku_index = column_positions.get("sku")
     if sku_index is None:
@@ -1308,11 +1342,22 @@ def _render_ai_highlight(
         seen_targets.add(key)
         targets.append({"row": row_idx, "col": col_idx, "sku": sku_value})
 
-    payload = {"targets": targets, "sku_index": sku_index}
-    _inject_ai_highlight_script(payload)
+    payload = {
+        "targets": targets,
+        "sku_index": sku_index,
+        "column_order": normalized_columns,
+        "editor_dom_key": editor_dom_key,
+    }
+    _inject_ai_highlight_script(payload, editor_dom_key)
 
 
-def _inject_ai_highlight_script(payload: dict) -> None:
+def _inject_ai_highlight_script(
+    payload: dict[str, object], editor_dom_key: str | None
+) -> None:
+    if not editor_dom_key:
+        return
+    payload = dict(payload or {})
+    payload.setdefault("editor_dom_key", editor_dom_key)
     payload_json = json.dumps(payload, ensure_ascii=False)
 
     st.markdown(
@@ -1330,48 +1375,102 @@ def _inject_ai_highlight_script(payload: dict) -> None:
         f"""
 <script>
 (function() {{
-  const cfg = {payload_json};  // {{ targets: [{{row, col, sku}}...], sku_index }}
+  const cfg = {payload_json};  // {{ editor_dom_key, targets: [{{row, col, sku}}], column_order, sku_index }}
   const MAX_TRIES = 80;
+  let observer = null;
 
   function findTableRoot() {{
-    // стараемся найти самый свежий stDataEditor (последний)
-    const editors = Array.from(document.querySelectorAll('div[data-testid="stDataEditor"]'));
-    return editors.length ? editors[editors.length - 1] : null;
+    if (!cfg.editor_dom_key) return null;
+    const container = document.querySelector(`div[data-editor-key="${{cfg.editor_dom_key}}"]`);
+    if (!container) return null;
+    return container.querySelector('div[data-testid="stDataEditor"]');
+  }}
+
+  function buildColumnLookup(root) {{
+    const lookup = new Map();
+    if (!root) return lookup;
+    const headerCells = Array.from(root.querySelectorAll('thead th'));
+    if (!headerCells.length || !Array.isArray(cfg.column_order)) return lookup;
+
+    const textToIndex = new Map();
+    headerCells.forEach((th, idx) => {{
+      const text = (th.innerText || '').trim();
+      if (!text) return;
+      textToIndex.set(text, idx);
+      textToIndex.set(text.toLowerCase(), idx);
+    }});
+
+    cfg.column_order.forEach((colName, idx) => {{
+      const key = String(colName ?? '');
+      let headerIdx = textToIndex.get(key) ?? textToIndex.get(key.toLowerCase());
+      if (headerIdx === undefined && idx < headerCells.length) {{
+        headerIdx = idx;
+      }}
+      if (headerIdx !== undefined) {{
+        lookup.set(idx, headerIdx);
+        lookup.set(key, headerIdx);
+      }}
+    }});
+
+    return lookup;
+  }}
+
+  function ensureObserver(target) {{
+    if (observer || !target) return;
+    const rootContainer = target.closest(`div[data-editor-key="${{cfg.editor_dom_key}}"]`) || target;
+    observer = new MutationObserver(() => scheduleApply(0));
+    observer.observe(rootContainer, {{ childList: true, subtree: true }});
+  }}
+
+  function resolveColumnIndex(target, columnLookup) {{
+    if (!Number.isInteger(target)) return undefined;
+    let resolved = columnLookup.get(target);
+    if (resolved !== undefined) return resolved;
+    if (Array.isArray(cfg.column_order) && target >= 0 && target < cfg.column_order.length) {{
+      resolved = columnLookup.get(String(cfg.column_order[target] ?? ''));
+    }}
+    if (resolved === undefined) {{
+      resolved = target;
+    }}
+    return resolved;
   }}
 
   function applyOnce() {{
     const root = findTableRoot();
     if (!root) return false;
+    const rows = root.querySelectorAll('tbody tr');
+    if (!rows.length) return false;
 
-    // Пытаемся подсветить по row/col индексам
+    const columnLookup = buildColumnLookup(root);
     let changed = false;
+
     (cfg.targets || []).forEach(t => {{
-      // сперва ищем ячейку по data-row-index/data-col-index (если в текущей версии они есть)
-      let cell = root.querySelector(`[data-row-index="${{t.row}}"][data-col-index="${{t.col}}"]`);
-      if (!cell) {{
-        // fallback: ищем по тексту SKU в ряду (если передан sku_index)
-        try {{
-          const rows = root.querySelectorAll('tbody tr');
-          const skuIdx = cfg.sku_index;
-          if (rows && rows.length && Number.isInteger(skuIdx)) {{
-            const tr = rows[t.row];
-            if (tr) {{
-              const cells = tr.querySelectorAll('td');
-              if (cells && cells.length > Math.max(skuIdx, t.col)) {{
-                const skuCell = cells[skuIdx];
-                if (skuCell && (skuCell.innerText || '').trim() === (t.sku || '').trim()) {{
-                  cell = cells[t.col];
-                }}
-              }}
-            }}
-          }}
-        }} catch (e) {{}}
+      if (!t) return;
+      const rowIdx = Number.isInteger(t.row) ? t.row : parseInt(t.row, 10);
+      const colIdxRaw = Number.isInteger(t.col) ? t.col : parseInt(t.col, 10);
+      if (!Number.isInteger(rowIdx) || rowIdx < 0 || !Number.isInteger(colIdxRaw) || colIdxRaw < 0) return;
+      const tr = rows[rowIdx];
+      if (!tr) return;
+      const cells = tr.querySelectorAll('td');
+      if (!cells.length) return;
+
+      const colIdx = resolveColumnIndex(colIdxRaw, columnLookup);
+      const cell = cells[colIdx];
+      if (!cell) return;
+
+      if (Number.isInteger(cfg.sku_index) && cfg.sku_index >= 0 && cfg.sku_index < cells.length) {{
+        const skuCell = cells[cfg.sku_index];
+        const expectedSku = (t.sku || '').trim();
+        if (expectedSku && skuCell && (skuCell.innerText || '').trim() !== expectedSku) {{
+          return;
+        }}
       }}
-      if (cell) {{
-        cell.setAttribute('data-ai-filled', 'true');
-        changed = true;
-      }}
+
+      cell.setAttribute('data-ai-filled', 'true');
+      changed = true;
     }});
+
+    ensureObserver(root);
     return changed;
   }}
 
@@ -1381,12 +1480,7 @@ def _inject_ai_highlight_script(payload: dict) -> None:
     setTimeout(() => scheduleApply(tries + 1), 100);
   }}
 
-  // первая попытка сразу
   scheduleApply(0);
-
-  // пересветка при изменениях DOM (скролл/перерисовка)
-  const obs = new MutationObserver(() => scheduleApply(0));
-  obs.observe(document.body, {{ childList: true, subtree: true }});
 }})();
 </script>
 """,
@@ -1546,6 +1640,11 @@ def _probe_editor_groups(
         }
         sub_disabled = [col for col in disabled if col in columns_chunk]
         try:
+            editor_key = f"{key_prefix}::{suffix}"
+            editor_dom_key = f"editor-{editor_key}"
+            st.markdown(
+                f'<div data-editor-key="{editor_dom_key}">', unsafe_allow_html=True
+            )
             st.data_editor(
                 sub_df,
                 column_config=sub_cfg,
@@ -1553,8 +1652,9 @@ def _probe_editor_groups(
                 use_container_width=True,
                 hide_index=True,
                 num_rows="fixed",
-                key=f"{key_prefix}::{suffix}",
+                key=editor_key,
             )
+            st.markdown("</div>", unsafe_allow_html=True)
         except Exception as exc:
             st.warning(
                 f"Editor failed for columns {columns_chunk}: {exc}")
@@ -1986,20 +2086,138 @@ def _normalize_seq_for_compare(value: object) -> tuple:
         return tuple(normalized)
 
 
-def _values_equal(left: object, right: object) -> bool:
-    if _is_blank_value(left) and _is_blank_value(right):
-        return True
-    if isinstance(left, float) and pd.isna(left):
-        left = None
-    if isinstance(right, float) and pd.isna(right):
-        right = None
-    if isinstance(left, str):
-        left = left.strip()
-    if isinstance(right, str):
-        right = right.strip()
-    if isinstance(left, (list, tuple, set)) or isinstance(right, (list, tuple, set)):
-        return _normalize_seq_for_compare(left) == _normalize_seq_for_compare(right)
-    return left == right
+def normalize_for_compare(
+    code: str | None, value: object, meta: dict | None = None
+) -> object:
+    if isinstance(value, dict) and "value" in value:
+        value = value.get("value")
+    if isinstance(value, float) and pd.isna(value):
+        value = None
+    if _is_blank_value(value):
+        return None
+
+    meta = meta or {}
+    input_type = str(
+        meta.get("frontend_input") or meta.get("backend_type") or ""
+    ).lower()
+    is_categories = (code or "").lower() == "categories"
+
+    values_to_labels_raw = meta.get("values_to_labels")
+    labels_to_values_raw = meta.get("labels_to_values")
+    values_to_labels: dict[str, str] = {}
+    labels_to_values: dict[str, str] = {}
+    if isinstance(values_to_labels_raw, dict):
+        for raw_value, label in values_to_labels_raw.items():
+            label_str = str(label or "").strip()
+            if not label_str:
+                continue
+            values_to_labels[str(raw_value)] = label_str
+    if isinstance(labels_to_values_raw, dict):
+        for raw_label, raw_value in labels_to_values_raw.items():
+            label_str = str(raw_label or "").strip()
+            if not label_str:
+                continue
+            labels_to_values[label_str] = str(raw_value)
+
+    def _coerce_bool(raw: object) -> bool | None:
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, (int, float)) and not (isinstance(raw, float) and pd.isna(raw)):
+            return bool(int(raw))
+        if isinstance(raw, str):
+            lowered = raw.strip().lower()
+            if lowered in {"1", "true", "yes", "y", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "n", "off"}:
+                return False
+        return None
+
+    def _token_to_label(token: object) -> str | None:
+        if _is_blank_value(token):
+            return None
+        text = str(token).strip()
+        if not text:
+            return None
+        if values_to_labels:
+            if text in values_to_labels:
+                return values_to_labels[text]
+            try:
+                normalized_numeric = str(int(float(text)))
+            except (TypeError, ValueError):
+                normalized_numeric = None
+            if normalized_numeric and normalized_numeric in values_to_labels:
+                return values_to_labels[normalized_numeric]
+            for raw_key, label in values_to_labels.items():
+                label_str = str(label).strip()
+                if label_str.lower() == text.lower():
+                    return label_str
+        if labels_to_values:
+            if text in labels_to_values:
+                return text
+            for label, raw_value in labels_to_values.items():
+                label_str = str(label).strip()
+                if label_str.lower() == text.lower():
+                    return label_str
+                raw_key = str(raw_value)
+                if raw_key == text and raw_key in values_to_labels:
+                    return values_to_labels[raw_key]
+        return text
+
+    if input_type == "boolean":
+        coerced = _coerce_bool(value)
+        if coerced is not None:
+            return coerced
+        if isinstance(value, str):
+            return value.strip()
+        return value
+    if isinstance(value, bool):
+        return value
+
+    is_multiselect = input_type == "multiselect" or is_categories
+
+    if is_multiselect:
+        if isinstance(value, (list, tuple, set)):
+            iterable = value
+        elif isinstance(value, str):
+            iterable = [part.strip() for part in value.split(",") if part.strip()]
+        else:
+            iterable = [value]
+        normalized: list[str] = []
+        for item in iterable:
+            label = _token_to_label(item)
+            if label is None:
+                continue
+            normalized.append(label)
+        if not normalized:
+            return ()
+        unique_sorted = sorted(
+            dict.fromkeys(normalized), key=lambda text: text.lower()
+        )
+        return tuple(unique_sorted)
+
+    if isinstance(value, (list, tuple, set)):
+        return _normalize_seq_for_compare(value)
+
+    if values_to_labels or labels_to_values:
+        label_value = _token_to_label(value)
+        return label_value
+
+    if isinstance(value, str):
+        return value.strip()
+
+    return value
+
+
+def _values_equal(
+    left: object,
+    right: object,
+    *,
+    code: str | None = None,
+    meta: dict | None = None,
+) -> bool:
+    return normalize_for_compare(code, left, meta) == normalize_for_compare(
+        code, right, meta
+    )
 
 
 def _sync_ai_highlight_state(
@@ -2023,6 +2241,11 @@ def _sync_ai_highlight_state(
     normalized = editor_df.copy(deep=True)
     normalized["sku"] = normalized["sku"].astype(str)
 
+    wide_meta_map = step2_state.get("wide_meta")
+    meta_for_set: dict[str, dict] = {}
+    if isinstance(wide_meta_map, dict):
+        meta_for_set = wide_meta_map.get(set_id) or {}
+
     keep: list[dict[str, object]] = []
     seen: set[tuple[str, str]] = set()
 
@@ -2031,9 +2254,11 @@ def _sync_ai_highlight_state(
             raw_sku = cell.get("sku")
             code_value = cell.get("code")
             suggested_value = cell.get("value")
+            value_ui = cell.get("value_ui")
         elif isinstance(cell, (list, tuple)) and len(cell) >= 2:
             raw_sku, code_value = cell[0], cell[1]
             suggested_value = cell[2] if len(cell) > 2 else None
+            value_ui = None
         else:
             continue
 
@@ -2050,20 +2275,47 @@ def _sync_ai_highlight_state(
             continue
 
         current_value = matches.iloc[0][code_key]
-        if suggested_value is not None and not _values_equal(current_value, suggested_value):
+        meta_for_code = meta_for_set.get(code_key) if isinstance(meta_for_set, dict) else {}
+
+        should_keep = True
+        if code_key == "categories":
+            meta_dict = meta_for_code if isinstance(meta_for_code, dict) else {}
+            values_to_labels = meta_dict.get("values_to_labels") if isinstance(meta_dict, dict) else None
+            labels_to_values = meta_dict.get("labels_to_values") if isinstance(meta_dict, dict) else None
+            mapping_available = bool(
+                (isinstance(values_to_labels, dict) and values_to_labels)
+                or (isinstance(labels_to_values, dict) and labels_to_values)
+            )
+            if mapping_available:
+                compare_source = value_ui if value_ui is not None else suggested_value
+                current_norm = normalize_for_compare(code_key, current_value, meta_dict)
+                suggested_norm = normalize_for_compare(code_key, compare_source, meta_dict)
+                if current_norm != suggested_norm:
+                    should_keep = False
+        elif suggested_value is not None:
+            if not _values_equal(
+                current_value,
+                suggested_value,
+                code=code_key,
+                meta=meta_for_code if isinstance(meta_for_code, dict) else None,
+            ):
+                should_keep = False
+
+        if not should_keep:
             continue
 
         key = (sku_value, code_key)
         if key in seen:
             continue
         seen.add(key)
-        keep.append(
-            {
-                "sku": sku_value,
-                "code": code_key,
-                "value": suggested_value,
-            }
-        )
+        entry: dict[str, object] = {
+            "sku": sku_value,
+            "code": code_key,
+            "value": suggested_value,
+        }
+        if isinstance(value_ui, (list, tuple, set)):
+            entry["value_ui"] = [str(item) for item in value_ui]
+        keep.append(entry)
 
     if keep:
         ai_cells_map[set_id] = keep
@@ -2249,7 +2501,14 @@ def save_step2_to_magento():
                     else None
                 )
 
-                if _values_equal(new_raw, old_raw):
+                meta_for_code = meta_for_set.get(code) if isinstance(meta_for_set, dict) else None
+
+                if _values_equal(
+                    new_raw,
+                    old_raw,
+                    code=code,
+                    meta=meta_for_code if isinstance(meta_for_code, dict) else None,
+                ):
                     continue
 
                 meta = meta_for_set.get(code) or {}
@@ -2966,6 +3225,10 @@ if df_original_key in st.session_state:
             column_config_view = {
                 key: value for key, value in col_cfg.items() if key in df_view.columns
             }
+            editor_dom_key = f"editor-{editor_key}"
+            st.markdown(
+                f'<div data-editor-key="{editor_dom_key}">', unsafe_allow_html=True
+            )
             edited_df = st.data_editor(
                 df_view,
                 column_config=column_config_view,
@@ -2974,6 +3237,13 @@ if df_original_key in st.session_state:
                 use_container_width=True,
                 num_rows="fixed",
                 key=editor_key,
+            )
+            st.markdown("</div>", unsafe_allow_html=True)
+            _render_ai_highlight(
+                df_view,
+                column_order,
+                None,
+                editor_dom_key,
             )
 
             go_attrs = st.button(
@@ -3942,9 +4212,15 @@ if df_original_key in st.session_state:
                                                 elif hasattr(cfg, "_label"):
                                                     cfg._label = "Guitar style"
 
+                                            editor_key = f"editor_set_{current_set_id}"
+                                            editor_dom_key = f"editor-{editor_key}"
+                                            st.markdown(
+                                                f'<div data-editor-key="{editor_dom_key}">',
+                                                unsafe_allow_html=True,
+                                            )
                                             editor_df = st.data_editor(
                                                 df_view,
-                                                key=f"editor_set_{current_set_id}",
+                                                key=editor_key,
                                                 column_config={
                                                     key: value
                                                     for key, value in column_config_final.items()
@@ -3955,6 +4231,7 @@ if df_original_key in st.session_state:
                                                 hide_index=True,
                                                 num_rows="fixed",
                                             )
+                                            st.markdown("</div>", unsafe_allow_html=True)
 
                                             if isinstance(editor_df, pd.DataFrame):
                                                 for column in editor_df.columns:
@@ -4003,6 +4280,7 @@ if df_original_key in st.session_state:
                                                 df_view,
                                                 column_order,
                                                 ai_cells_for_set,
+                                                editor_dom_key,
                                             )
 
                                     _pupdate(100, "Attributes ready")
