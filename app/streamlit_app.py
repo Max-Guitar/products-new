@@ -2836,77 +2836,105 @@ if requested_run_mode:
     attribute_sets_key = f"attribute_sets_{run_mode}"
 
     if run_mode == "test_art_22895":
-        sku = "ART-22895"
-        status = st.status(f"Loading product {sku}…", expanded=True)
+        test_skus = ["ART-22895", "ARC-22895", "ARB-22895", "ARO-22895"]
+        status = st.status("Loading test products…", expanded=True)
         pbar = st.progress(0)
 
-        product: dict | None = None
+        found_products: list[dict] = []
+        missing_skus: list[str] = []
 
         load_failed = False
         try:
-            pbar.progress(10)
-            status.update(label=f"Fetching product {sku}…")
             api_base = st.session_state.get("ai_api_base")
             if not api_base:
                 api_base = get_api_base(base_url)
                 st.session_state["ai_api_base"] = api_base
-            product = get_product_by_sku(session, api_base, sku)
+
+            status.update(label="Fetching test products…")
+            for idx, sku in enumerate(test_skus, start=1):
+                try:
+                    product = get_product_by_sku(session, api_base, sku)
+                except Exception:
+                    product = None
+
+                if product and product.get("sku"):
+                    found_products.append(product)
+                else:
+                    missing_skus.append(sku)
+
+                progress_value = int(40 * idx / len(test_skus))
+                if progress_value > 0:
+                    pbar.progress(progress_value)
         except Exception as exc:  # pragma: no cover - network/UI error handling
-            status.update(state="error", label="Failed to load product")
-            error_text = str(exc)
-            if "not found" in error_text.lower() or "не найден" in error_text.lower():
-                st.warning(f"SKU {sku} not found.")
-            else:
-                st.error(f"Error: {exc}")
+            status.update(state="error", label="Failed to load test products")
+            st.error(f"Error: {exc}")
             st.session_state.pop(df_original_key, None)
             st.session_state.pop(df_edited_key, None)
             st.session_state.pop(attribute_sets_key, None)
             _reset_step2_state()
+            pbar.progress(100)
             load_failed = True
 
-        if load_failed or not product or not product.get("sku"):
-            status.update(state="error", label="Failed to load product")
-            st.warning(f"SKU {sku} not found.")
+        if load_failed:
+            st.stop()
+
+        if not found_products:
+            status.update(state="error", label="Failed to load test products")
+            st.warning("Ни один из тестовых SKU не найден.")
             st.session_state.pop(df_original_key, None)
             st.session_state.pop(df_edited_key, None)
             st.session_state.pop(attribute_sets_key, None)
             _reset_step2_state()
+            pbar.progress(100)
         else:
-            step1_state["products"] = [product]
-            step1_state["skus"] = [sku]
-            attr_set_id_value = product.get("attribute_set_id")
-            try:
-                attr_set_id_int = int(attr_set_id_value)
-            except (TypeError, ValueError):
-                attr_set_id_int = None
+            if missing_skus:
+                status.write(
+                    "Следующие SKU не найдены и будут пропущены: "
+                    + ", ".join(missing_skus)
+                )
+
+            step1_state["products"] = found_products
+            step1_state["skus"] = [p.get("sku") for p in found_products if p.get("sku")]
 
             attr_sets_existing = st.session_state.get(attribute_sets_key, {})
-            attr_name = None
-            if isinstance(attr_sets_existing, dict) and attr_sets_existing:
-                for name, attr_id in attr_sets_existing.items():
-                    try:
-                        if int(attr_id) == int(attr_set_id_int):
-                            attr_name = name
-                            break
-                    except (TypeError, ValueError):
-                        continue
-            if not attr_name:
-                if attr_set_id_int is None:
-                    attr_name = _DEF_ATTR_SET_NAME
-                else:
-                    attr_name = str(attr_set_id_int)
-
             set_choices = step1_state.get("set_choices")
             if not isinstance(set_choices, dict):
                 set_choices = {}
-            set_choices[sku] = {
-                "attribute_set_id": attr_set_id_int,
-                "attribute_set_name": attr_name,
-            }
+
+            for product in found_products:
+                sku = product.get("sku")
+                attr_set_id_value = product.get("attribute_set_id")
+                try:
+                    attr_set_id_int = int(attr_set_id_value)
+                except (TypeError, ValueError):
+                    attr_set_id_int = None
+
+                attr_name = None
+                if isinstance(attr_sets_existing, dict) and attr_sets_existing:
+                    for name, attr_id in attr_sets_existing.items():
+                        try:
+                            if int(attr_id) == int(attr_set_id_int):
+                                attr_name = name
+                                break
+                        except (TypeError, ValueError):
+                            continue
+
+                if not attr_name:
+                    if attr_set_id_int is None:
+                        attr_name = _DEF_ATTR_SET_NAME
+                    else:
+                        attr_name = str(attr_set_id_int)
+
+                if sku:
+                    set_choices[sku] = {
+                        "attribute_set_id": attr_set_id_int,
+                        "attribute_set_name": attr_name,
+                    }
+                product["attribute_set_name"] = attr_name
+
             step1_state["set_choices"] = set_choices
 
-            product["attribute_set_name"] = attr_name
-            data = [product]
+            data = found_products
             st.session_state[cache_key] = data
 
             pbar.progress(60)
@@ -2961,11 +2989,13 @@ if requested_run_mode:
                 df_for_edit = df_for_edit[column_order]
                 st.session_state[df_edited_key] = df_for_edit.copy()
                 _reset_step2_state()
+
             pbar.progress(100)
             status.update(
                 state="complete",
                 label=f"Loaded {len(data or [])} items",
             )
+            st.success(f"Loaded {len(data or [])} test item(s).")
 
     else:
         limit = 50 if run_mode == "fast50" else None
