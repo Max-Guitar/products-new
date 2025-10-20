@@ -2575,101 +2575,216 @@ st.info("Let’s find items need to be updated.")
 if "step1_editor_mode" not in st.session_state:
     st.session_state["step1_editor_mode"] = "all"
 
-c1, c2 = st.columns(2)
+step1_state = st.session_state.setdefault("step1", {})
+
+c1, c2, c3 = st.columns(3)
 btn_all = c1.button("📦 Load All", key="btn_load_all")
 btn_50 = c2.button("⚡ Load 50 (fast)", key="btn_load_50_fast")
+btn_test = c3.button("🧪 Test ART-22895", key="btn_test_art_22895")
 
 if btn_all:
     requested_run_mode: str | None = "all"
 elif btn_50:
     requested_run_mode = "fast50"
+elif btn_test:
+    requested_run_mode = "test_art_22895"
 else:
     requested_run_mode = None
 
 if requested_run_mode:
     run_mode = requested_run_mode
-    other_mode = "fast50" if run_mode == "all" else "all"
-    limit = 50 if run_mode == "fast50" else None
-    enabled_only = True if run_mode == "fast50" else None
-    minimal_fields = run_mode == "fast50"
     st.session_state["step1_editor_mode"] = run_mode
     st.session_state["show_attributes_trigger"] = False
+    if run_mode != "test_art_22895":
+        step1_state.pop("products", None)
 
+    all_modes = {"all", "fast50", "test_art_22895"}
     for prefix in ("default_products", "df_original", "df_edited", "attribute_sets"):
-        st.session_state.pop(f"{prefix}_{other_mode}", None)
+        for other_mode in all_modes - {run_mode}:
+            st.session_state.pop(f"{prefix}_{other_mode}", None)
 
     cache_key = f"default_products_{run_mode}"
     df_original_key = f"df_original_{run_mode}"
     df_edited_key = f"df_edited_{run_mode}"
     attribute_sets_key = f"attribute_sets_{run_mode}"
 
-    status = st.status("Loading default products…", expanded=True)
-    pbar = st.progress(0)
-    data: list[dict] | None = None
-    try:
-        pbar.progress(5)
-        status.update(label="Preparing request…")
-        attr_set_id = get_attr_set_id(session, base_url, name=_DEF_ATTR_SET_NAME)
-        data = get_default_products(
-            session,
-            base_url,
-            attr_set_id=attr_set_id,
-            qty_min=0,
-            limit=limit,
-            minimal_fields=minimal_fields,
-            enabled_only=enabled_only,
-        )
-        st.session_state[cache_key] = data
-        pbar.progress(60)
-        status.update(label="Parsing response…")
-        df_items = load_items(
-            session,
-            base_url,
-            attr_set_id=attr_set_id,
-            products=data,
-        )
-        pbar.progress(90)
-        status.update(label="Building table…")
-        if df_items.empty:
-            st.warning("No items match the Default set filter criteria.")
-            st.session_state.pop(df_original_key, None)
-            st.session_state.pop(df_edited_key, None)
-            st.session_state.pop(attribute_sets_key, None)
-            _reset_step2_state()
-        else:
-            df_ui = df_items.copy()
-            df_ui["created_at"] = pd.to_datetime(
-                df_ui["created_at"], errors="coerce"
-            )
-            df_ui = df_ui.sort_values("created_at", ascending=False).reset_index(drop=True)
-            st.session_state[df_original_key] = df_ui.copy()
+    if run_mode == "test_art_22895":
+        sku = "ART-22895"
+        status = st.status(f"Loading product {sku}…", expanded=True)
+        pbar = st.progress(0)
+        try:
+            pbar.progress(10)
+            status.update(label="Discovering Magento API…")
+            api_base = st.session_state.get("ai_api_base")
+            if not api_base:
+                api_base = probe_api_base(session, base_url)
+                st.session_state["ai_api_base"] = api_base
+
+            pbar.progress(40)
+            status.update(label=f"Fetching product {sku}…")
+            product = get_product_by_sku(session, api_base, sku)
+            step1_state["products"] = [product]
+            st.session_state[cache_key] = [product]
+
+            pbar.progress(60)
+            status.update(label="Loading attribute sets…")
             try:
                 attribute_sets = list_attribute_sets(session, base_url)
             except Exception as exc:  # pragma: no cover - UI error handling
                 st.error(f"Failed to fetch attribute sets: {exc}")
                 attribute_sets = {}
             st.session_state[attribute_sets_key] = attribute_sets
-            df_for_edit = df_ui.copy()
-            if "hint" not in df_for_edit.columns:
-                df_for_edit["hint"] = ""
-            cols_order = ["sku", "name", "attribute set", "hint", "created_at"]
-            column_order = [
-                col for col in cols_order if col in df_for_edit.columns
+
+            attr_set_id_value = product.get("attribute_set_id")
+            try:
+                attr_set_id_int = int(attr_set_id_value)
+            except (TypeError, ValueError):
+                attr_set_id_int = None
+
+            attr_name = None
+            if attribute_sets:
+                for name, attr_id in attribute_sets.items():
+                    try:
+                        if int(attr_id) == int(attr_set_id_int):
+                            attr_name = name
+                            break
+                    except (TypeError, ValueError):
+                        continue
+            if not attr_name:
+                if attr_set_id_int is None:
+                    attr_name = _DEF_ATTR_SET_NAME
+                else:
+                    attr_name = str(attr_set_id_int)
+
+            pbar.progress(85)
+            status.update(label="Preparing table…")
+            df_items = pd.DataFrame(
+                [
+                    {
+                        "sku": product.get("sku", ""),
+                        "name": product.get("name", ""),
+                        "attribute set": attr_name,
+                        "attribute_set_id": attr_set_id_int,
+                        "created_at": product.get("created_at", ""),
+                    }
+                ]
+            )
+            df_items["attribute_set_id"] = pd.Series(
+                [
+                    attr_set_id_int if attr_set_id_int is not None else pd.NA,
+                ],
+                dtype="Int64",
+            )
+            df_items["created_at"] = pd.to_datetime(
+                df_items["created_at"], errors="coerce"
+            )
+            df_ui = df_items.sort_values("created_at", ascending=False).reset_index(
+                drop=True
+            )
+            st.session_state[df_original_key] = df_ui.copy()
+            if "hint" not in df_ui.columns:
+                df_ui["hint"] = ""
+            cols_order = [
+                "sku",
+                "name",
+                "attribute set",
+                "attribute_set_id",
+                "hint",
+                "created_at",
             ]
+            column_order = [col for col in cols_order if col in df_ui.columns]
             lead_cols = [c for c in ("sku", "name") if c in column_order]
             tail_cols = [c for c in column_order if c not in ("sku", "name")]
             column_order = lead_cols + tail_cols
-            df_for_edit = df_for_edit[column_order]
-            st.session_state[df_edited_key] = df_for_edit.copy()
+            st.session_state[df_edited_key] = df_ui[column_order].copy()
             _reset_step2_state()
-        pbar.progress(100)
-        status.update(
-            state="complete",
-            label=f"Loaded {len(data or [])} items",
-        )
-    except Exception as exc:  # pragma: no cover - UI error handling
-        status.update(state="error", label="Failed to load products")
-        st.error(f"Error: {exc}")
+
+            pbar.progress(100)
+            status.update(state="complete", label="Loaded 1 item")
+        except Exception as exc:  # pragma: no cover - UI error handling
+            status.update(state="error", label="Failed to load product")
+            st.error(f"Error: {exc}")
+    else:
+        limit = 50 if run_mode == "fast50" else None
+        enabled_only = True if run_mode == "fast50" else None
+        minimal_fields = run_mode == "fast50"
+
+        status = st.status("Loading default products…", expanded=True)
+        pbar = st.progress(0)
+        data: list[dict] | None = None
+        try:
+            pbar.progress(5)
+            status.update(label="Preparing request…")
+            attr_set_id = get_attr_set_id(session, base_url, name=_DEF_ATTR_SET_NAME)
+            data = get_default_products(
+                session,
+                base_url,
+                attr_set_id=attr_set_id,
+                qty_min=0,
+                limit=limit,
+                minimal_fields=minimal_fields,
+                enabled_only=enabled_only,
+            )
+            st.session_state[cache_key] = data
+            pbar.progress(60)
+            status.update(label="Parsing response…")
+            df_items = load_items(
+                session,
+                base_url,
+                attr_set_id=attr_set_id,
+                products=data,
+            )
+            pbar.progress(90)
+            status.update(label="Building table…")
+            if df_items.empty:
+                st.warning("No items match the Default set filter criteria.")
+                st.session_state.pop(df_original_key, None)
+                st.session_state.pop(df_edited_key, None)
+                st.session_state.pop(attribute_sets_key, None)
+                _reset_step2_state()
+            else:
+                df_ui = df_items.copy()
+                df_ui["created_at"] = pd.to_datetime(
+                    df_ui["created_at"], errors="coerce"
+                )
+                df_ui = df_ui.sort_values("created_at", ascending=False).reset_index(
+                    drop=True
+                )
+                st.session_state[df_original_key] = df_ui.copy()
+                try:
+                    attribute_sets = list_attribute_sets(session, base_url)
+                except Exception as exc:  # pragma: no cover - UI error handling
+                    st.error(f"Failed to fetch attribute sets: {exc}")
+                    attribute_sets = {}
+                st.session_state[attribute_sets_key] = attribute_sets
+                df_for_edit = df_ui.copy()
+                if "hint" not in df_for_edit.columns:
+                    df_for_edit["hint"] = ""
+                cols_order = [
+                    "sku",
+                    "name",
+                    "attribute set",
+                    "attribute_set_id",
+                    "hint",
+                    "created_at",
+                ]
+                column_order = [
+                    col for col in cols_order if col in df_for_edit.columns
+                ]
+                lead_cols = [c for c in ("sku", "name") if c in column_order]
+                tail_cols = [c for c in column_order if c not in ("sku", "name")]
+                column_order = lead_cols + tail_cols
+                df_for_edit = df_for_edit[column_order]
+                st.session_state[df_edited_key] = df_for_edit.copy()
+                _reset_step2_state()
+            pbar.progress(100)
+            status.update(
+                state="complete",
+                label=f"Loaded {len(data or [])} items",
+            )
+        except Exception as exc:  # pragma: no cover - UI error handling
+            status.update(state="error", label="Failed to load products")
+            st.error(f"Error: {exc}")
 
 current_run_mode = st.session_state.get("step1_editor_mode", "all")
 df_original_key = f"df_original_{current_run_mode}"
@@ -2691,7 +2806,14 @@ if df_original_key in st.session_state:
             df_init = df_ui.copy()
             if "hint" not in df_init.columns:
                 df_init["hint"] = ""
-            cols_order = ["sku", "name", "attribute set", "hint", "created_at"]
+            cols_order = [
+                "sku",
+                "name",
+                "attribute set",
+                "attribute_set_id",
+                "hint",
+                "created_at",
+            ]
             column_order = [col for col in cols_order if col in df_init.columns]
             lead_cols = [c for c in ("sku", "name") if c in column_order]
             tail_cols = [c for c in column_order if c not in ("sku", "name")]
@@ -2705,10 +2827,17 @@ if df_original_key in st.session_state:
             df_base["hint"] = ""
 
         df_view = df_base.copy()
-        if "attribute_set_id" in df_view.columns:
-            df_view = df_view.drop(columns=["attribute_set_id"])
 
         column_order = build_column_order("", df_view.columns.tolist())
+        if "attribute_set_id" in df_view.columns:
+            if "attribute_set_id" not in column_order:
+                column_order.append("attribute_set_id")
+            if "attribute set" in column_order:
+                column_order = [
+                    col for col in column_order if col != "attribute_set_id"
+                ]
+                insert_idx = column_order.index("attribute set") + 1
+                column_order.insert(insert_idx, "attribute_set_id")
         df_view = df_view[column_order]
         options = list(attribute_sets.keys())
         options.extend(
@@ -2742,6 +2871,11 @@ if df_original_key in st.session_state:
                     options=options,
                     required=True,
                 ),
+                "attribute_set_id": st.column_config.NumberColumn(
+                    label="Attribute Set ID",
+                    help="Change attribute set identifier",
+                    step=1,
+                ),
                 "hint": st.column_config.TextColumn("Hint"),
                 "created_at": st.column_config.DatetimeColumn("Created At", disabled=True),
             }
@@ -2758,6 +2892,12 @@ if df_original_key in st.session_state:
             if "name" in df_view.columns:
                 col_cfg["name"] = st.column_config.TextColumn(
                     label="Name", disabled=False, width="medium"
+                )
+            if "attribute_set_id" in df_view.columns:
+                col_cfg["attribute_set_id"] = st.column_config.NumberColumn(
+                    label="Attribute Set ID",
+                    help="Change attribute set identifier",
+                    step=1,
                 )
             disabled_cols = [
                 col
@@ -2776,8 +2916,6 @@ if df_original_key in st.session_state:
                     cfg.label = "Product Type (attribute set)"
                 elif hasattr(cfg, "_label"):
                     cfg._label = "Product Type (attribute set)"
-            if "attribute_set_id" in col_cfg:
-                col_cfg.pop("attribute_set_id", None)
             if "price" in df_view.columns:
                 col_cfg["price"] = st.column_config.NumberColumn(
                     label="Price", disabled=True
@@ -2804,6 +2942,42 @@ if df_original_key in st.session_state:
                 updated_df = df_base.copy()
                 for column in edited_df.columns:
                     updated_df[column] = edited_df[column]
+                if "attribute_set_id" in edited_df.columns and "attribute set" in updated_df.columns:
+                    id_lookup: dict[int, str] = {}
+                    for name, attr_id in attribute_sets.items():
+                        try:
+                            id_lookup[int(attr_id)] = name
+                        except (TypeError, ValueError):
+                            continue
+
+                    def _coerce_attr_id(value):
+                        if value is None:
+                            return None
+                        if pd.isna(value):
+                            return None
+                        if isinstance(value, str):
+                            if not value.strip():
+                                return None
+                            try:
+                                return int(float(value))
+                            except (TypeError, ValueError):
+                                return value.strip()
+                        try:
+                            return int(value)
+                        except (TypeError, ValueError):
+                            return value
+
+                    for idx, raw_value in edited_df["attribute_set_id"].items():
+                        coerced = _coerce_attr_id(raw_value)
+                        if coerced is None:
+                            continue
+                        if isinstance(coerced, int):
+                            name = id_lookup.get(coerced)
+                            updated_df.loc[idx, "attribute set"] = (
+                                name if name else str(coerced)
+                            )
+                        else:
+                            updated_df.loc[idx, "attribute set"] = str(coerced)
                 st.session_state[df_edited_key] = updated_df
                 st.session_state["show_attributes_trigger"] = True
                 st.session_state["_go_step2_requested"] = True
