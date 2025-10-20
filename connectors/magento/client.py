@@ -118,7 +118,7 @@ def get_default_products(
     base_params: Dict[str, Any] = {}
 
     filter_index = 0
-    if enabled_only is True:
+    if enabled_only:
         base_params[
             f"searchCriteria[filter_groups][{filter_index}][filters][0][field]"
         ] = "status"
