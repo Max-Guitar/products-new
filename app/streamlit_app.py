@@ -1767,6 +1767,17 @@ def build_attributes_df(
         )
         attr_rows = df_full.to_dict(orient="index") if not df_full.empty else {}
 
+        name_text = str(product.get("name", "")).lower()
+        curr_orient = (attr_rows.get("orientation", {}) or {}).get("label") or (
+            (attr_rows.get("orientation", {}) or {}).get("raw_value")
+        )
+        if _is_blank_value(curr_orient) or str(curr_orient).strip().lower() in {
+            "right",
+            "right-handed",
+        }:
+            if any(k in name_text for k in ["left", "left-handed", "lefty", "lh "]):
+                attr_rows["orientation"] = {"label": "Left", "raw_value": "Left"}
+
         def _infer_condition_from_sku(sku: str) -> str | None:
             s = (sku or "").upper()
             if "ART" in s:
@@ -1785,11 +1796,26 @@ def build_attributes_df(
             if inferred:
                 attr_rows["condition"] = {"label": inferred, "raw_value": inferred}
 
+        force_codes = {"categories", "guitarstylemultiplechoice"}
+        bool_codes = {
+            c
+            for c in editor_codes
+            if (meta_cache.get(c) or {}).get("frontend_input") == "boolean"
+        }
+        missing_codes = {
+            c
+            for c in editor_codes
+            if c not in {"sku", "name", "attribute set", "price"}
+            and _is_blank_value(
+                (attr_rows.get(c, {}) or {}).get("label")
+                or (attr_rows.get(c, {}) or {}).get("raw_value")
+            )
+        }
+        ai_codes = sorted(force_codes | bool_codes | missing_codes)
+
         needs_ai = False
         if ai_enabled:
-            for code in editor_codes:
-                if code in {"sku", "name", "attribute set"}:
-                    continue
+            for code in ai_codes:
                 values = attr_rows.get(code, {})
                 current_value = values.get("label") or values.get("raw_value")
                 if _is_blank_value(current_value):
@@ -1802,7 +1828,7 @@ def build_attributes_df(
                     sku_value,
                     product,
                     df_full.copy(deep=True),
-                    list(editor_codes),
+                    list(ai_codes),
                 )
             )
 
