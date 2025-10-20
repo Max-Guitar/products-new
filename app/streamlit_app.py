@@ -1226,6 +1226,12 @@ def _apply_ai_suggestions_to_wide(
             ).lower()
             labels_lookup, values_lookup = _collect_meta_option_lookups(meta)
             pass_through_attr = code_key in TEXT_PASS_THROUGH
+            if input_type in {"select", "dropdown"} and not (
+                labels_lookup or values_lookup
+            ):
+                # опций нет — показываем пользователю как текст, чтобы он увидел/отредактировал
+                input_type = "text"
+                pass_through_attr = True
             if pass_through_attr:
                 input_type = "text"
             converted_value = _coerce_ai_value(ai_value, meta)
@@ -1834,11 +1840,6 @@ def _collect_ai_suggestions_log(
             continue
         for raw_sku, attrs in per_sku.items():
             sku_key = str(raw_sku)
-            if valid_cells and all(
-                (str(set_id), sku_key, str(code)) not in valid_cells
-                for code in (attrs or {}).keys()
-            ):
-                continue
             if not isinstance(attrs, dict):
                 continue
             meta_payload = attrs.get("__meta__")
@@ -1855,16 +1856,18 @@ def _collect_ai_suggestions_log(
                 if code == "__meta__":
                     continue
                 normalized_key = str(code)
-                if valid_cells and (
-                    str(set_id), sku_key, normalized_key
-                ) not in valid_cells:
-                    continue
                 value = payload.get("value") if isinstance(payload, dict) else payload
                 if value in (None, ""):
                     continue
                 if isinstance(value, (list, tuple, set)) and not value:
                     continue
-                entry: dict[str, object] = {"value": value}
+                entry: dict[str, object] = {
+                    "value": value,
+                    "applied": (
+                        str(set_id), sku_key, normalized_key
+                    )
+                    in valid_cells,
+                }
                 if isinstance(payload, dict):
                     reason = payload.get("reason")
                     if reason not in (None, ""):
@@ -4566,6 +4569,14 @@ if df_original_key in st.session_state:
                                                 st.write(
                                                     "✅ DF BEFORE AI",
                                                     df_before_ai[["sku", "categories"]].head(5),
+                                                )
+                                            if isinstance(meta_cache, AttributeMetaCache):
+                                                meta_cache.build_and_set_static_for(
+                                                    [
+                                                        "brand",
+                                                        "country_of_manufacture",
+                                                    ],
+                                                    store_id=0,
                                                 )
                                             (
                                                 updated_df,
