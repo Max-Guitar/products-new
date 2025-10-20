@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlencode
 
 import requests
@@ -86,9 +86,6 @@ def get_default_products(
     limit: Optional[int] = None,
     minimal_fields: bool = False,
     enabled_only: bool | None = None,
-    type_ids: Iterable[str] | None = None,
-    created_at_from: str | None = None,
-    created_at_to: str | None = None,
     **kwargs: Any,
 ) -> List[dict]:
     """Return products for the default attribute set with optional limit.
@@ -111,16 +108,6 @@ def get_default_products(
         When ``True`` adds a status filter restricting results to enabled
         products. When ``False`` or ``None`` (default) no status filter is
         applied.
-    type_ids:
-        Optional iterable of product ``type_id`` values to filter server-side.
-        When provided the values are joined with ``OR`` within the same filter
-        group.
-    created_at_from:
-        Optional timestamp string (``YYYY-MM-DD HH:MM:SS``) passed as a
-        ``from`` filter for the ``created_at`` field.
-    created_at_to:
-        Optional timestamp string (``YYYY-MM-DD HH:MM:SS``) passed as a ``to``
-        filter for the ``created_at`` field.
     kwargs:
         Extra query parameters merged into the Magento search criteria.
     """
@@ -158,64 +145,15 @@ def get_default_products(
     if kwargs:
         base_params.update(kwargs)
 
-    if type_ids:
-        values = [str(v) for v in type_ids if v not in (None, "")]
-        if values:
-            for idx, type_value in enumerate(values):
-                base_params[
-                    f"searchCriteria[filter_groups][{filter_index}][filters][{idx}][field]"
-                ] = "type_id"
-                base_params[
-                    f"searchCriteria[filter_groups][{filter_index}][filters][{idx}][value]"
-                ] = type_value
-                base_params[
-                    f"searchCriteria[filter_groups][{filter_index}][filters][{idx}][condition_type]"
-                ] = "eq"
-            filter_index += 1
-
-    if created_at_from or created_at_to:
-        filter_pos = 0
-        if created_at_from:
-            base_params[
-                f"searchCriteria[filter_groups][{filter_index}][filters][{filter_pos}][field]"
-            ] = "created_at"
-            base_params[
-                f"searchCriteria[filter_groups][{filter_index}][filters][{filter_pos}][value]"
-            ] = created_at_from
-            base_params[
-                f"searchCriteria[filter_groups][{filter_index}][filters][{filter_pos}][condition_type]"
-            ] = "from"
-            filter_pos += 1
-        if created_at_to:
-            base_params[
-                f"searchCriteria[filter_groups][{filter_index}][filters][{filter_pos}][field]"
-            ] = "created_at"
-            base_params[
-                f"searchCriteria[filter_groups][{filter_index}][filters][{filter_pos}][value]"
-            ] = created_at_to
-            base_params[
-                f"searchCriteria[filter_groups][{filter_index}][filters][{filter_pos}][condition_type]"
-            ] = "to"
-            filter_pos += 1
-        if filter_pos:
-            filter_index += 1
-
     if minimal_fields:
         base_params[
             "fields"
         ] = "items[sku,name,attribute_set_id,created_at,type_id,custom_attributes],total_count"
 
-    sort_field_key = "searchCriteria[sortOrders][0][field]"
-    sort_direction_key = "searchCriteria[sortOrders][0][direction]"
-    if sort_field_key not in base_params:
-        base_params[sort_field_key] = "created_at"
-    if sort_direction_key not in base_params:
-        base_params[sort_direction_key] = "DESC"
-
     collected: List[dict] = []
     remaining = limit
     page = 1
-    default_page_size = None if limit is None else min(limit, 1000)
+    default_page_size = 1000 if limit is None else min(limit, 1000)
 
     while True:
         page_size = default_page_size
@@ -224,8 +162,7 @@ def get_default_products(
 
         params = dict(base_params)
         params["searchCriteria[currentPage]"] = page
-        if page_size is not None:
-            params["searchCriteria[pageSize]"] = page_size
+        params["searchCriteria[pageSize]"] = page_size
 
         path = _with_query("/products", params)
         final_url = build_magento_url(base_url, path)
@@ -254,12 +191,8 @@ def get_default_products(
             if remaining <= 0:
                 break
 
-        if page_size is None:
-            if not items:
-                break
-        else:
-            if len(items) < page_size:
-                break
+        if len(items) < page_size:
+            break
 
         page += 1
 
