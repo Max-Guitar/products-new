@@ -3053,9 +3053,12 @@ if requested_run_mode:
         minimal_fields = run_mode == "new_arrivals"
         type_ids_filter: list[str] | None = None
         created_at_from: str | None = None
+        created_at_to: str | None = None
         if run_mode == "new_arrivals":
             type_ids_filter = sorted(_ALLOWED_TYPES)
-            cutoff_dt = datetime.now(timezone.utc) - timedelta(days=30)
+            now_utc = datetime.now(timezone.utc)
+            created_at_to = now_utc.strftime("%Y-%m-%d %H:%M:%S")
+            cutoff_dt = now_utc - timedelta(days=30)
             created_at_from = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
 
         status = st.status("Loading default products…", expanded=True)
@@ -3075,6 +3078,7 @@ if requested_run_mode:
                 enabled_only=enabled_only,
                 type_ids=type_ids_filter,
                 created_at_from=created_at_from,
+                created_at_to=created_at_to,
             )
             st.session_state[cache_key] = data
             pbar.progress(60)
