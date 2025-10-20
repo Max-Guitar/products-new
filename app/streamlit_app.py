@@ -774,6 +774,9 @@ def apply_wide_edits_to_long(
     wide_indexed = df_wide.set_index("sku")
     updated = df_long.copy(deep=True)
 
+    if "value" in updated.columns:
+        updated["value"] = updated["value"].astype(object)
+
     for row_idx, row in updated.iterrows():
         sku = row.get("sku")
         code = row.get("attribute_code")
