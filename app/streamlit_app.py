@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import sys
 from pathlib import Path
@@ -53,6 +54,9 @@ from services.inventory import (
 )
 from services.normalizers import normalize_for_magento
 from utils.http import build_magento_headers, get_session
+
+
+logger = logging.getLogger(__name__)
 
 
 _DEF_ATTR_SET_NAME = "Default"
@@ -2125,6 +2129,10 @@ def apply_product_update(session, api_base: str, sku: str, attributes: dict):
             ]
             extension_attributes["category_links"] = category_links
         else:
+            if isinstance(value, (list, tuple, set)):
+                value = ",".join(
+                    str(item).strip() for item in value if item not in (None, "")
+                )
             custom_attributes.append({"attribute_code": code, "value": value})
 
     if custom_attributes:
@@ -2133,6 +2141,19 @@ def apply_product_update(session, api_base: str, sku: str, attributes: dict):
         payload["extension_attributes"] = extension_attributes
 
     url = f"{api_base.rstrip('/')}/products/{quote(sku, safe='')}"
+    if logger.isEnabledFor(logging.INFO):
+        attr_codes = [
+            item.get("attribute_code")
+            for item in custom_attributes
+            if isinstance(item, dict)
+        ]
+        payload_preview = json.dumps({"product": payload}, ensure_ascii=False)[:200]
+        logger.info(
+            "Magento PUT %s attrs=%s payload=%s",
+            sku,
+            ",".join(code for code in attr_codes if code),
+            payload_preview,
+        )
     resp = session.put(
         url,
         json={"product": payload},
@@ -2255,8 +2276,121 @@ def save_step2_to_magento():
                 meta = meta_for_set.get(code) or {}
                 attr_code = meta.get("attribute_code") or code
 
+                meta_info: dict[str, object] = {}
+                if isinstance(meta_cache, AttributeMetaCache):
+                    cached_meta = meta_cache.get(attr_code)
+                    if isinstance(cached_meta, dict):
+                        meta_info = cached_meta
+                elif isinstance(meta_cache, dict):  # pragma: no cover - safety fallback
+                    cached_meta = meta_cache.get(attr_code)
+                    if isinstance(cached_meta, dict):
+                        meta_info = cached_meta
+                if not meta_info and isinstance(meta, dict):
+                    meta_info = meta
+
+                input_type = (
+                    meta_info.get("frontend_input")
+                    or meta.get("frontend_input")
+                    or meta_info.get("backend_type")
+                    or meta.get("backend_type")
+                    or ""
+                )
+                input_type = str(input_type).lower()
+
+                prepared_value = new_raw
+                if (
+                    attr_code != "categories"
+                    and input_type == "multiselect"
+                ):
+                    labels = _split_multiselect_input(new_raw)
+                    label_to_value: dict[str, object] = {}
+
+                    options_map = meta_info.get("options_map") if isinstance(meta_info, dict) else {}
+                    if isinstance(options_map, dict):
+                        for key, target in options_map.items():
+                            if isinstance(key, str):
+                                cleaned_key = key.strip()
+                                if not cleaned_key:
+                                    continue
+                                label_to_value.setdefault(cleaned_key, target)
+                                label_to_value.setdefault(cleaned_key.casefold(), target)
+                            else:
+                                key_str = str(key).strip()
+                                if not key_str:
+                                    continue
+                                label_to_value.setdefault(key_str, target)
+
+                    labels_to_values = meta_info.get("labels_to_values") if isinstance(meta_info, dict) else {}
+                    if not isinstance(labels_to_values, dict):
+                        labels_to_values = {}
+
+                    if not labels_to_values:
+                        values_to_labels = meta_info.get("values_to_labels") if isinstance(meta_info, dict) else {}
+                        if isinstance(values_to_labels, dict):
+                            for value_key, label in values_to_labels.items():
+                                if not isinstance(label, str):
+                                    continue
+                                cleaned_label = label.strip()
+                                if not cleaned_label:
+                                    continue
+                                labels_to_values.setdefault(cleaned_label, value_key)
+                                labels_to_values.setdefault(cleaned_label.casefold(), value_key)
+                    else:
+                        normalized_labels_to_values: dict[str, object] = {}
+                        for label_key, mapped_value in labels_to_values.items():
+                            if not isinstance(label_key, str):
+                                continue
+                            cleaned_label = label_key.strip()
+                            if not cleaned_label:
+                                continue
+                            normalized_labels_to_values.setdefault(cleaned_label, mapped_value)
+                            normalized_labels_to_values.setdefault(cleaned_label.casefold(), mapped_value)
+                        labels_to_values = normalized_labels_to_values
+
+                    for label_key, mapped_value in labels_to_values.items():
+                        label_to_value.setdefault(label_key, mapped_value)
+
+                    mapped_ids: list[object] = []
+                    for label in labels:
+                        if not isinstance(label, str):
+                            text_label = str(label).strip()
+                        else:
+                            text_label = label.strip()
+                        if not text_label:
+                            continue
+
+                        candidate = label_to_value.get(text_label)
+                        if candidate is None:
+                            candidate = label_to_value.get(text_label.casefold())
+                        if candidate is None:
+                            candidate = label_to_value.get(text_label.lower())
+                        if candidate is None:
+                            try:
+                                candidate = int(text_label)
+                            except (TypeError, ValueError):
+                                candidate = text_label
+
+                        if candidate in (None, ""):
+                            continue
+
+                        if isinstance(candidate, str):
+                            candidate_str = candidate.strip()
+                            if not candidate_str:
+                                continue
+                            try:
+                                candidate_val: object = int(candidate_str)
+                            except (TypeError, ValueError):
+                                candidate_val = candidate_str
+                        else:
+                            candidate_val = candidate
+
+                        if candidate_val not in mapped_ids:
+                            mapped_ids.append(candidate_val)
+
+                    prepared_value = mapped_ids
+
                 try:
-                    normalized = normalize_for_magento(attr_code, new_raw, meta_cache)
+                    normalized = normalize_for_magento(attr_code, prepared_value, meta_cache)
                 except Exception as exc:  # pragma: no cover - safety guard
                     errors.append(
                         {
