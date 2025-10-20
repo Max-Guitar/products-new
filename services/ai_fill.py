@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import hashlib
+from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 from urllib.parse import quote
 
@@ -134,6 +136,266 @@ SET_ATTRS: Mapping[str, Set[str]] = {
         "cases_covers",
     },
 }
+
+AI_RULES_TEXT = (
+    "Ты помощник по каталогизации гитар. Используй входные данные, чтобы заполнить "
+    "пропущенные атрибуты товара. Всегда отвечай JSON вида "
+    "{\"attributes\":[{\"code\":...,\"value\":...,\"reason\":...}]}. Правила:\n"
+    "- Бренд и название набора атрибутов помогают подобрать категории по совпадению "
+    "названий; если нет уверенности — оставляй поле пустым.\n"
+    "- Ищи упоминания серии и модели в названии, используй их в подсказках.\n"
+    "- Соотносить модели Telecaster→T-Style, Stratocaster→S-Style, Les Paul→Single cut, "
+    "SG→Double cut.\n"
+    "- При наличии T-Style добавляй также Single cut; при наличии S-Style добавляй "
+    "Double cut.\n"
+    "- Значения мультиселектов представляй как массив строк, без дублей.\n"
+    "- Булевы значения задавай как true/false.\n"
+    "- Для категорий используй текстовые лейблы.\n"
+    "- Если данных недостаточно — возвращай пустое значение."
+)
+
+AI_RULES_HASH = hashlib.sha256(AI_RULES_TEXT.encode("utf-8")).hexdigest()
+
+STYLE_KEYWORDS: Tuple[Tuple[str, str], ...] = (
+    ("telecaster", "T-Style"),
+    ("stratocaster", "S-Style"),
+    ("les paul", "Single cut"),
+    ("sg", "Double cut"),
+)
+
+STYLE_CASCADE: Mapping[str, str] = {
+    "T-Style": "Single cut",
+    "S-Style": "Double cut",
+}
+
+
+@dataclass
+class AiConversation:
+    """Stateful conversation wrapper stored in ``st.session_state``."""
+
+    conversation_id: Optional[str] = None
+    rules_hash: Optional[str] = None
+    system_messages: list[dict[str, str]] = field(default_factory=list)
+    model: Optional[str] = None
+
+
+def get_ai_conversation(model: str | None = None) -> AiConversation:
+    """Return a global AI conversation, resetting when rules/model change."""
+
+    stored = st.session_state.get("ai_conv")
+    if isinstance(stored, AiConversation):
+        conv = stored
+    elif isinstance(stored, dict):
+        conv = AiConversation(
+            conversation_id=stored.get("conversation_id"),
+            rules_hash=stored.get("rules_hash"),
+            system_messages=list(stored.get("system_messages") or []),
+            model=stored.get("model"),
+        )
+    else:
+        conv = AiConversation()
+
+    model_changed = bool(model) and conv.model not in (None, model)
+    rules_changed = conv.rules_hash != AI_RULES_HASH
+    if model_changed or rules_changed:
+        conv = AiConversation(
+            conversation_id=None,
+            rules_hash=AI_RULES_HASH,
+            system_messages=[{"role": "system", "content": AI_RULES_TEXT}],
+            model=model,
+        )
+    else:
+        conv.rules_hash = AI_RULES_HASH
+        if model is not None:
+            conv.model = model
+        if not conv.system_messages:
+            conv.system_messages = [{"role": "system", "content": AI_RULES_TEXT}]
+        if conv.model is None:
+            conv.model = model
+
+    st.session_state["ai_conv"] = conv
+    return conv
+
+
+def derive_styles_from_texts(texts: Iterable[object] | None) -> list[str]:
+    """Detect guitar styles from textual hints (model/series/product name)."""
+
+    if not texts:
+        return []
+
+    styles: list[str] = []
+    seen: Set[str] = set()
+    for text in texts:
+        if text is None:
+            continue
+        lowered = str(text).casefold()
+        if not lowered.strip():
+            continue
+        for keyword, style in STYLE_KEYWORDS:
+            if keyword == "sg":
+                if re.search(r"\bsg\b", lowered):
+                    if style not in seen:
+                        seen.add(style)
+                        styles.append(style)
+                continue
+            if keyword in lowered and style not in seen:
+                seen.add(style)
+                styles.append(style)
+    return styles
+
+
+def _ensure_list_of_strings(value: object) -> list[str]:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return []
+    if isinstance(value, bool):
+        return ["true" if value else "false"]
+    if isinstance(value, (list, tuple, set)):
+        result: list[str] = []
+        for item in value:
+            if item is None or (isinstance(item, float) and pd.isna(item)):
+                continue
+            text = str(item).strip()
+            if text:
+                result.append(text)
+        return result
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def _merge_unique(*iterables: Iterable[str]) -> list[str]:
+    merged: list[str] = []
+    seen: Set[str] = set()
+    for iterable in iterables:
+        for item in iterable or []:
+            if not isinstance(item, str):
+                candidate = str(item)
+            else:
+                candidate = item
+            normalized = candidate.strip()
+            if not normalized:
+                continue
+            key = normalized.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(normalized)
+    return merged
+
+
+def _is_blank(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, float) and pd.isna(value):
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, Mapping):
+        return all(_is_blank(item) for item in value.values())
+    if isinstance(value, Iterable) and not isinstance(value, (str, bytes)):
+        return all(_is_blank(item) for item in value)
+    return False
+
+
+def _truncate_preview(text: str | None, limit: int = 200) -> str:
+    if not text:
+        return ""
+    snippet = str(text).strip()
+    if len(snippet) <= limit:
+        return snippet
+    return snippet[:limit] + "…"
+
+
+def _sanitize_hints(hints: Mapping[str, object] | None) -> dict[str, object]:
+    if not isinstance(hints, Mapping):
+        return {}
+    sanitized: dict[str, object] = {}
+    for key, value in hints.items():
+        if not isinstance(key, str):
+            continue
+        if isinstance(value, (list, tuple, set)):
+            normalized = _ensure_list_of_strings(list(value))
+            if normalized:
+                sanitized[key] = normalized
+            continue
+        if _is_blank(value):
+            continue
+        if isinstance(value, (str, bool, int, float)):
+            sanitized[key] = value
+        else:
+            sanitized[key] = str(value)
+    return sanitized
+
+
+def _normalize_boolean(value: object) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().casefold()
+        if lowered in {"true", "yes", "1", "y"}:
+            return True
+        if lowered in {"false", "no", "0", "n"}:
+            return False
+    return None
+
+
+def _extract_response_text(response: object) -> str:
+    if response is None:
+        return ""
+
+    if hasattr(response, "output_text"):
+        output_text = getattr(response, "output_text")
+        if output_text:
+            return str(output_text)
+
+    text_parts: list[str] = []
+    output = getattr(response, "output", None)
+    if output:
+        for item in output:
+            content = getattr(item, "content", None)
+            if not content:
+                continue
+            for part in content:
+                text = getattr(part, "text", None)
+                if text:
+                    text_parts.append(str(text))
+                elif isinstance(part, Mapping):
+                    raw = part.get("text")
+                    if raw:
+                        text_parts.append(str(raw))
+    if text_parts:
+        return "\n".join(text_parts).strip()
+
+    for attr in ("model_dump", "dict", "to_dict"):
+        if hasattr(response, attr):
+            try:
+                data = getattr(response, attr)()
+            except TypeError:
+                continue
+            if isinstance(data, Mapping):
+                maybe_text = data.get("output_text")
+                if maybe_text:
+                    return str(maybe_text)
+                output_data = data.get("output")
+                if isinstance(output_data, list):
+                    collected: list[str] = []
+                    for entry in output_data:
+                        content = entry.get("content") if isinstance(entry, Mapping) else None
+                        if isinstance(content, list):
+                            for part in content:
+                                text = part.get("text") if isinstance(part, Mapping) else None
+                                if text:
+                                    collected.append(str(text))
+                    if collected:
+                        return "\n".join(collected).strip()
+    if isinstance(response, Mapping):
+        maybe_text = response.get("output_text")
+        if maybe_text:
+            return str(maybe_text)
+    return ""
 
 
 class HTMLResponseError(RuntimeError):
@@ -368,39 +630,217 @@ def _strip_html(value: Optional[object]) -> str:
 
 
 def _openai_complete(
-    system_msg: str,
+    conv: AiConversation | None,
     user_msg: str,
     api_key: str,
     model: str = "gpt-5-mini",
     timeout: int = 60,
-) -> dict:
+) -> tuple[dict, str]:
     api_key = api_key or os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OpenAI API key is not configured.")
 
+    if isinstance(conv, AiConversation) and conv.system_messages:
+        system_messages = list(conv.system_messages)
+    else:
+        system_messages = [{"role": "system", "content": AI_RULES_TEXT}]
+
+    messages_payload: list[dict[str, str]] = []
+    for message in system_messages:
+        role = str(message.get("role") or "system")
+        content = message.get("content")
+        if content is None:
+            continue
+        messages_payload.append({"role": role, "content": str(content)})
+    messages_payload.append({"role": "user", "content": user_msg})
+
     try:
         client = openai.OpenAI(api_key=api_key)
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=0,
-            timeout=timeout,
-        )
+    except Exception as exc:  # pragma: no cover - client init safety
+        raise RuntimeError(f"OpenAI request failed: {exc}") from exc
+
+    kwargs = {
+        "model": model,
+        "input": messages_payload,
+        "temperature": 0,
+        "timeout": timeout,
+    }
+    if isinstance(conv, AiConversation) and conv.conversation_id:
+        kwargs["conversation"] = {"id": conv.conversation_id}
+
+    try:
+        response = client.responses.create(**kwargs)
+    except TypeError:
+        # Fallback for environments without the Responses API.
+        try:
+            chat_response = client.chat.completions.create(
+                model=model,
+                messages=messages_payload,
+                temperature=0,
+                timeout=timeout,
+            )
+        except Exception as exc:  # pragma: no cover - network error handling
+            raise RuntimeError(f"OpenAI request failed: {exc}") from exc
+
+        try:
+            content = chat_response.choices[0].message.content
+        except (AttributeError, IndexError, TypeError) as exc:
+            raise RuntimeError("OpenAI response missing message content") from exc
+
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("OpenAI response was not valid JSON") from exc
+
+        if isinstance(conv, AiConversation):
+            conv.conversation_id = None
+            conv.rules_hash = AI_RULES_HASH
+            conv.model = model
+            conv.system_messages = system_messages
+
+        return parsed, content
     except Exception as exc:  # pragma: no cover - network error handling
         raise RuntimeError(f"OpenAI request failed: {exc}") from exc
 
-    try:
-        content = response.choices[0].message.content
-    except (AttributeError, IndexError, TypeError) as exc:
-        raise RuntimeError("OpenAI response missing message content") from exc
+    raw_content = _extract_response_text(response)
+    if not raw_content:
+        raise RuntimeError("OpenAI response missing message content")
 
     try:
-        return json.loads(content)
+        parsed = json.loads(raw_content)
     except json.JSONDecodeError as exc:
         raise RuntimeError("OpenAI response was not valid JSON") from exc
+
+    if isinstance(conv, AiConversation):
+        conversation_info = getattr(response, "conversation", None)
+        new_id = getattr(conversation_info, "id", None)
+        if new_id is None and isinstance(conversation_info, Mapping):
+            new_id = conversation_info.get("id")
+        if new_id:
+            conv.conversation_id = new_id
+        conv.rules_hash = AI_RULES_HASH
+        conv.model = model
+        conv.system_messages = system_messages
+
+    return parsed, raw_content
+
+
+def enrich_ai_suggestions(
+    ai_df: pd.DataFrame,
+    hints: Mapping[str, object] | None,
+    set_name: str | None,
+) -> pd.DataFrame:
+    """Post-process AI suggestions with deterministic hints and cascades."""
+
+    if not isinstance(ai_df, pd.DataFrame):
+        ai_df = pd.DataFrame()
+
+    hints = hints or {}
+    normalized_hints = _sanitize_hints(hints)
+
+    records = ai_df.to_dict(orient="records")
+    order: list[str] = []
+    by_code: dict[str, dict[str, object]] = {}
+
+    for record in records:
+        code = record.get("code")
+        if not code:
+            continue
+        code_key = str(code)
+        order.append(code_key)
+        cleaned: dict[str, object] = {"code": code_key}
+        for key, value in record.items():
+            if key == "code":
+                continue
+            if isinstance(value, float) and pd.isna(value):
+                value = None
+            cleaned[key] = value
+        by_code[code_key] = cleaned
+
+    # Categories enrichment with brand/set hints
+    existing_categories = _ensure_list_of_strings(
+        (by_code.get("categories") or {}).get("value")
+    )
+    category_hints: list[str] = []
+    category_hints.extend(_ensure_list_of_strings(normalized_hints.get("brand_hint")))
+    category_hints.extend(_ensure_list_of_strings(normalized_hints.get("set_hint")))
+    if set_name and not _is_blank(set_name):
+        category_hints.append(str(set_name).strip())
+    merged_categories = _merge_unique(existing_categories, category_hints)
+    if merged_categories:
+        category_entry = by_code.setdefault(
+            "categories",
+            {"code": "categories", "reason": "enriched_from_hints"},
+        )
+        category_entry["value"] = merged_categories
+        if _is_blank(category_entry.get("reason")):
+            category_entry["reason"] = "enriched_from_hints"
+        if "categories" not in order:
+            order.append("categories")
+
+    # Style enrichment using hints and detected model/series
+    existing_styles = _ensure_list_of_strings(
+        (by_code.get("guitarstylemultiplechoice") or {}).get("value")
+    )
+    style_hint_values = _ensure_list_of_strings(normalized_hints.get("style_hint"))
+    model_series_candidates = _ensure_list_of_strings(
+        normalized_hints.get("model_series_candidates")
+    )
+    candidate_texts: list[str] = list(model_series_candidates)
+    for attr_code in ("model", "series"):
+        entry = by_code.get(attr_code)
+        if not isinstance(entry, Mapping):
+            continue
+        value = entry.get("value")
+        if isinstance(value, (list, tuple, set)):
+            candidate_texts.extend([str(item) for item in value if not _is_blank(item)])
+        elif not _is_blank(value):
+            candidate_texts.append(str(value))
+
+    derived_styles = derive_styles_from_texts(candidate_texts)
+    merged_styles = _merge_unique(existing_styles, style_hint_values, derived_styles)
+    if merged_styles:
+        cascade_styles = [
+            STYLE_CASCADE.get(style)
+            for style in merged_styles
+            if STYLE_CASCADE.get(style)
+        ]
+        merged_styles = _merge_unique(merged_styles, cascade_styles)
+        style_entry = by_code.setdefault(
+            "guitarstylemultiplechoice",
+            {"code": "guitarstylemultiplechoice", "reason": "enriched_from_hints"},
+        )
+        style_entry["value"] = merged_styles
+        if _is_blank(style_entry.get("reason")):
+            style_entry["reason"] = "enriched_from_hints"
+        if "guitarstylemultiplechoice" not in order:
+            order.append("guitarstylemultiplechoice")
+
+    # Normalize multi-select payloads to lists of strings
+    for code_key, payload in by_code.items():
+        if not isinstance(payload, dict):
+            continue
+        value = payload.get("value")
+        if isinstance(value, (list, tuple, set)):
+            payload["value"] = _ensure_list_of_strings(value)
+
+    enriched_records: list[dict[str, object]] = []
+    seen_codes: Set[str] = set()
+    for code_key in order:
+        if code_key in seen_codes:
+            continue
+        payload = by_code.get(code_key)
+        if isinstance(payload, dict):
+            enriched_records.append(payload)
+            seen_codes.add(code_key)
+    for code_key, payload in by_code.items():
+        if code_key in seen_codes or not isinstance(payload, dict):
+            continue
+        enriched_records.append(payload)
+
+    result_df = pd.DataFrame(enriched_records)
+    result_df.attrs = dict(getattr(ai_df, "attrs", {}))
+    return result_df
 
 
 def infer_missing(
@@ -410,37 +850,31 @@ def infer_missing(
     api_base: str,
     allowed: Sequence[str],
     api_key: str,
+    *,
+    conv: AiConversation | None = None,
+    hints: Mapping[str, object] | None = None,
     model: str = "gpt-5-mini",
 ) -> pd.DataFrame:
-    if isinstance(df_full, pd.DataFrame):
-        try:
-            print("✅ INPUT DF", df_full.columns.tolist())
-            if "categories" in df_full.index:
-                print(
-                    "✅ CATEGORIES before",
-                    df_full.loc["categories"].to_dict(),
-                )
-        except Exception:
-            pass
+    allowed_set: Set[str] = {str(item) for item in allowed if isinstance(item, str)}
     missing: List[dict] = []
     known: Dict[str, str] = {}
-    allowed_set: Set[str] = set()
-    for item in allowed:
-        if isinstance(item, str):
-            allowed_set.add(item)
+    current_attributes: Dict[str, object] = {}
+    bool_codes: Set[str] = set()
+    missing_codes: Set[str] = set()
+    force_codes: Set[str] = {"categories", "guitarstylemultiplechoice"}
     global _CATEGORIES_CACHE
 
-    for code, row in df_full.iterrows():
+    for raw_code, row in df_full.iterrows():
+        code = str(raw_code)
+        row_type = str(row.get("type") or "").lower()
+        label = row.get("label")
+        raw_value = row.get("raw_value")
+        value_for_payload = label if not _is_blank(label) else raw_value
+
         if code == "categories":
-            current_value = row["label"] or row["raw_value"]
-            is_blank = False
-            if current_value in (None, ""):
-                is_blank = True
-            elif isinstance(current_value, str):
-                is_blank = not current_value.strip()
-            elif isinstance(current_value, (list, tuple, set)):
-                is_blank = len(current_value) == 0
-            if code in allowed_set and is_blank:
+            normalized_value = _ensure_list_of_strings(value_for_payload)
+            current_attributes[code] = normalized_value
+            if code in allowed_set and _is_blank(normalized_value):
                 if _CATEGORIES_CACHE is None:
                     cats = list_categories(session, api_base)
                     if cats:
@@ -460,9 +894,26 @@ def infer_missing(
                         "options": list(_CATEGORIES_CACHE or []),
                     }
                 )
+                missing_codes.add(code)
             continue
-        current_value = row["label"] or row["raw_value"]
-        if code in allowed_set and (current_value is None or str(current_value).strip() == ""):
+
+        if code in allowed_set and row_type == "boolean":
+            bool_codes.add(code)
+
+        if row_type == "multiselect":
+            normalized_value = _ensure_list_of_strings(value_for_payload)
+        elif row_type == "boolean":
+            normalized_value = _normalize_boolean(value_for_payload)
+        else:
+            normalized_value = (
+                str(value_for_payload).strip()
+                if isinstance(value_for_payload, str)
+                else value_for_payload
+            )
+        current_attributes[code] = normalized_value
+
+        current_value = label if not _is_blank(label) else raw_value
+        if code in allowed_set and _is_blank(current_value):
             meta = get_attribute_meta(session, api_base, code)
             missing.append(
                 {
@@ -475,39 +926,150 @@ def infer_missing(
                     ],
                 }
             )
-        else:
+            missing_codes.add(code)
+        elif code in allowed_set and not _is_blank(current_value):
             known[code] = str(current_value)
+
+    ai_codes = sorted(
+        {
+            code
+            for code in force_codes
+            if code in allowed_set
+        }
+        | {code for code in bool_codes if code in allowed_set}
+        | {code for code in missing_codes if code in allowed_set}
+    )
+
     short_desc = ""
     for attr in product.get("custom_attributes", []) or []:
         if attr.get("attribute_code") == "short_description":
             short_desc = _strip_html(attr.get("value"))
             break
+
+    sanitized_hints = _sanitize_hints(hints)
+    attribute_set_name = sanitized_hints.get("attribute_set_name") or sanitized_hints.get(
+        "set_hint"
+    )
+
     user_payload = {
-        "product": {
-            "sku": product.get("sku"),
-            "name": product.get("name"),
-            "description": short_desc,
-        },
+        "sku": product.get("sku"),
+        "name": product.get("name"),
+        "description": short_desc,
+        "attribute_set_name": attribute_set_name,
+        "current_attributes": current_attributes,
+        "ai_codes": ai_codes,
+        "hints": sanitized_hints,
         "known_values": known,
         "missing": missing,
     }
-    system_message = (
-        "Ты помощник по каталогизации гитар. Используй данные о товаре, чтобы заполнить "
-        "пустые поля. Ответ JSON {\"attributes\":[{code,value,reason}]}."
-    )
-    completion = _openai_complete(
-        system_message, json.dumps(user_payload, ensure_ascii=False), api_key, model=model
-    )
-    if isinstance(df_full, pd.DataFrame):
-        try:
-            if "categories" in df_full.index:
-                print(
-                    "✅ AFTER AI, CATEGORIES",
-                    df_full.loc["categories"].to_dict(),
-                )
-        except Exception:
-            pass
-    return pd.DataFrame(completion.get("attributes", []))
+
+    payload_json = json.dumps(user_payload, ensure_ascii=False)
+    completion, raw_content = _openai_complete(conv, payload_json, api_key, model=model)
+    attributes = completion.get("attributes") if isinstance(completion, Mapping) else []
+    ai_df = pd.DataFrame(attributes or [])
+    set_name_hint = attribute_set_name or sanitized_hints.get("set_hint")
+    ai_df = enrich_ai_suggestions(ai_df, sanitized_hints, set_name_hint)
+
+    def _df_to_code_map(df: pd.DataFrame) -> dict[str, dict[str, object]]:
+        mapping: dict[str, dict[str, object]] = {}
+        if not isinstance(df, pd.DataFrame):
+            return mapping
+        for _, row in df.iterrows():
+            code_value = row.get("code")
+            if not code_value:
+                continue
+            code_key = str(code_value)
+            payload: dict[str, object] = {"code": code_key}
+            for key, value in row.items():
+                if key == "code":
+                    continue
+                if isinstance(value, float) and pd.isna(value):
+                    value = None
+                payload[key] = value
+            mapping[code_key] = payload
+        return mapping
+
+    suggestions_map = _df_to_code_map(ai_df)
+    order: list[str] = list(ai_codes)
+    for code in suggestions_map.keys():
+        if code not in order:
+            order.append(code)
+
+    raw_previews: list[str] = [_truncate_preview(raw_content)]
+    remaining_before_retry = [
+        code for code in ai_codes if _is_blank(suggestions_map.get(code, {}).get("value"))
+    ]
+    retried = False
+
+    if remaining_before_retry:
+        context_already_found = {
+            code: entry.get("value")
+            for code, entry in suggestions_map.items()
+            if not _is_blank(entry.get("value"))
+        }
+        retry_payload = dict(user_payload)
+        retry_payload["context_already_found"] = context_already_found
+        retry_payload["remaining_codes"] = remaining_before_retry
+        retry_json = json.dumps(retry_payload, ensure_ascii=False)
+        completion_retry, raw_retry = _openai_complete(conv, retry_json, api_key, model=model)
+        retry_attributes = (
+            completion_retry.get("attributes")
+            if isinstance(completion_retry, Mapping)
+            else []
+        )
+        retry_df = pd.DataFrame(retry_attributes or [])
+        retry_df = enrich_ai_suggestions(retry_df, sanitized_hints, set_name_hint)
+        retry_map = _df_to_code_map(retry_df)
+        raw_previews.append(_truncate_preview(raw_retry))
+
+        for code, payload in retry_map.items():
+            if not isinstance(payload, Mapping):
+                continue
+            value = payload.get("value")
+            if _is_blank(value):
+                continue
+            if code in suggestions_map and not _is_blank(suggestions_map[code].get("value")):
+                continue
+            suggestions_map[code] = payload
+            if code not in order:
+                order.append(code)
+        retried = True
+
+    final_rows: list[dict[str, object]] = []
+    for code in order:
+        payload = suggestions_map.get(code)
+        if not isinstance(payload, Mapping):
+            continue
+        value = payload.get("value")
+        if _is_blank(value):
+            continue
+        row_payload = dict(payload)
+        row_payload["code"] = code
+        final_rows.append(row_payload)
+
+    if final_rows:
+        result_df = pd.DataFrame(final_rows)
+    else:
+        result_df = pd.DataFrame(columns=["code", "value", "reason"])
+
+    previews_for_log: list[str] = []
+    if raw_previews:
+        if raw_previews[0]:
+            previews_for_log.append(f"initial: {raw_previews[0]}")
+        if retried and len(raw_previews) > 1 and raw_previews[1]:
+            previews_for_log.append(f"retry: {raw_previews[1]}")
+
+    metadata = {
+        "rules_hash": getattr(conv, "rules_hash", AI_RULES_HASH)
+        if isinstance(conv, AiConversation)
+        else AI_RULES_HASH,
+        "used_hints": sanitized_hints,
+        "retried": retried,
+        "remaining_before_retry": remaining_before_retry,
+        "raw_response_preview": "\n".join(previews_for_log),
+    }
+    result_df.attrs["meta"] = metadata
+    return result_df
 
 
 def _first_sentence(text: Optional[object]) -> str:
