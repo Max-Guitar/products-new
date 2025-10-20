@@ -317,6 +317,71 @@ def normalize_category_label(label: str | None, meta: Mapping[str, object] | Non
     return None
 
 
+def _normalize_category_candidate(
+    candidate: object,
+    categories_meta: Mapping[str, object] | None,
+) -> str | None:
+    """Normalize a category candidate coming from text or numeric identifiers."""
+
+    if candidate is None:
+        return None
+
+    categories_meta = categories_meta if isinstance(categories_meta, Mapping) else {}
+    values_to_labels = categories_meta.get("values_to_labels")
+    if not isinstance(values_to_labels, Mapping):
+        values_to_labels = {}
+
+    text = str(candidate).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        label = values_to_labels.get(text)
+        if isinstance(label, str) and label.strip():
+            normalized = normalize_category_label(label, categories_meta)
+            return normalized or label.strip()
+        return None
+    return normalize_category_label(text, categories_meta)
+
+
+def _guess_brand_from_name(
+    product_name: object,
+    categories_meta: Mapping[str, object] | None,
+) -> str | None:
+    """Heuristically detect a brand hint from the product name using known brands."""
+
+    if not isinstance(product_name, str):
+        return None
+
+    name_text = product_name.strip()
+    if not name_text:
+        return None
+
+    categories_meta = categories_meta if isinstance(categories_meta, Mapping) else {}
+    labels_to_values = categories_meta.get("labels_to_values")
+    if not isinstance(labels_to_values, Mapping) or not labels_to_values:
+        return None
+
+    seen: Set[str] = set()
+    sorted_labels = sorted(
+        (
+            str(label).strip()
+            for label in labels_to_values.keys()
+            if str(label or "").strip()
+        ),
+        key=lambda value: (-len(value), value.casefold()),
+    )
+
+    for label in sorted_labels:
+        if label in seen:
+            continue
+        seen.add(label)
+        pattern = re.compile(rf"(?<!\w){re.escape(label)}(?!\w)", re.IGNORECASE)
+        if pattern.search(name_text):
+            return label
+
+    return None
+
+
 def _is_blank(value: object) -> bool:
     if value is None:
         return True
@@ -796,33 +861,75 @@ def enrich_ai_suggestions(
         by_code[code_key] = cleaned
 
     # Categories enrichment with brand/set hints
+    categories_meta = categories_meta if isinstance(categories_meta, Mapping) else {}
+    labels_to_values_map = categories_meta.get("labels_to_values")
+    if not isinstance(labels_to_values_map, Mapping):
+        labels_to_values_map = {}
+
+    existing_entry = by_code.get("categories")
     existing_categories_raw = _ensure_list_of_strings(
-        (by_code.get("categories") or {}).get("value")
+        (existing_entry or {}).get("value")
     )
     existing_categories_canon: list[str] = []
+    existing_category_ids: list[str] = []
+    unmatched_existing: list[str] = []
     for item in existing_categories_raw:
-        normalized_label = normalize_category_label(item, categories_meta)
-        if normalized_label and normalized_label not in existing_categories_canon:
-            existing_categories_canon.append(normalized_label)
+        normalized_label = _normalize_category_candidate(item, categories_meta)
+        if normalized_label:
+            if normalized_label not in existing_categories_canon:
+                existing_categories_canon.append(normalized_label)
+            if labels_to_values_map:
+                resolved_value = labels_to_values_map.get(normalized_label)
+                if resolved_value is not None:
+                    resolved_str = str(resolved_value).strip()
+                    if resolved_str and resolved_str not in existing_category_ids:
+                        existing_category_ids.append(resolved_str)
+        else:
+            text = str(item).strip()
+            if text and text not in unmatched_existing:
+                unmatched_existing.append(text)
 
     brand_hint_values = _ensure_list_of_strings(normalized_hints.get("brand_hint"))
     set_hint_values = _ensure_list_of_strings(normalized_hints.get("set_hint"))
-    category_hints: list[str] = []
-    category_hints.extend(brand_hint_values)
-    category_hints.extend(set_hint_values)
+    brand_attr_values = _ensure_list_of_strings((by_code.get("brand") or {}).get("value"))
+    attribute_set_candidates: list[str] = []
     if attribute_set_name and not _is_blank(attribute_set_name):
-        category_hints.append(str(attribute_set_name).strip())
+        attribute_set_candidates.append(str(attribute_set_name).strip())
 
-    merged_categories = _merge_unique(existing_categories_raw, category_hints)
-    normalized_categories: list[str] = []
-    unmatched_labels: list[str] = []
-    for label in merged_categories:
-        normalized_label = normalize_category_label(label, categories_meta)
+    category_candidates = _merge_unique(
+        brand_hint_values,
+        brand_attr_values,
+        set_hint_values,
+        attribute_set_candidates,
+    )
+
+    normalized_categories: list[str] = list(existing_categories_canon)
+    resolved_category_ids: list[str] = list(existing_category_ids)
+    ignored_candidates: list[str] = []
+    canonical_seen: Set[str] = set(existing_categories_canon)
+    resolved_seen: Set[str] = set(existing_category_ids)
+
+    for candidate in category_candidates:
+        normalized_label = _normalize_category_candidate(candidate, categories_meta)
         if normalized_label:
-            if normalized_label not in normalized_categories:
+            if labels_to_values_map:
+                resolved_value = labels_to_values_map.get(normalized_label)
+                if resolved_value is None:
+                    candidate_text = str(candidate).strip()
+                    if candidate_text and candidate_text not in ignored_candidates:
+                        ignored_candidates.append(candidate_text)
+                    continue
+                resolved_str = str(resolved_value).strip()
+                if resolved_str and resolved_str not in resolved_seen:
+                    resolved_seen.add(resolved_str)
+                    resolved_category_ids.append(resolved_str)
+            if normalized_label not in canonical_seen:
+                canonical_seen.add(normalized_label)
                 normalized_categories.append(normalized_label)
         else:
-            unmatched_labels.append(label)
+            candidate_text = str(candidate).strip()
+            if candidate_text and candidate_text not in ignored_candidates:
+                ignored_candidates.append(candidate_text)
 
     normalized_categories_added = [
         label for label in normalized_categories if label not in existing_categories_canon
@@ -834,22 +941,35 @@ def enrich_ai_suggestions(
             {"code": "categories", "reason": "enriched_from_hints"},
         )
         category_entry["value"] = normalized_categories
+        if resolved_category_ids:
+            category_entry["resolved_category_ids"] = list(resolved_category_ids)
         if _is_blank(category_entry.get("reason")):
             category_entry["reason"] = "enriched_from_hints"
-        if unmatched_labels:
-            category_entry["unmatched_labels"] = _ensure_list_of_strings(unmatched_labels)
         if normalized_categories_added:
             category_entry["normalized_categories_added"] = list(normalized_categories_added)
-        if "categories" not in order:
-            order.append("categories")
-    elif unmatched_labels:
-        category_entry = by_code.setdefault(
-            "categories",
-            {"code": "categories", "reason": "enriched_from_hints"},
+        ignored_tokens = _merge_unique(
+            _ensure_list_of_strings(category_entry.get("ignored_by_ai_filter")),
+            unmatched_existing,
+            ignored_candidates,
         )
-        category_entry["unmatched_labels"] = _ensure_list_of_strings(unmatched_labels)
+        if ignored_tokens:
+            category_entry["ignored_by_ai_filter"] = ignored_tokens
+            category_entry["unmatched_labels"] = list(ignored_tokens)
+        elif unmatched_existing:
+            category_entry["unmatched_labels"] = list(unmatched_existing)
         if "categories" not in order:
             order.append("categories")
+    else:
+        combined_ignored = _merge_unique(unmatched_existing, ignored_candidates)
+        if combined_ignored:
+            category_entry = by_code.setdefault(
+                "categories",
+                {"code": "categories", "reason": "enriched_from_hints"},
+            )
+            category_entry["ignored_by_ai_filter"] = combined_ignored
+            category_entry["unmatched_labels"] = list(combined_ignored)
+            if "categories" not in order:
+                order.append("categories")
 
     # Style enrichment using hints and detected model/series
     existing_styles = _ensure_list_of_strings(
@@ -930,7 +1050,7 @@ def enrich_ai_suggestions(
         meta_payload = dict(original_attrs.get("meta"))
     brand_hint_meta: str | None = None
     for hint_value in brand_hint_values:
-        normalized = normalize_category_label(hint_value, categories_meta)
+        normalized = _normalize_category_candidate(hint_value, categories_meta)
         if normalized:
             brand_hint_meta = normalized
             break
@@ -1051,6 +1171,18 @@ def infer_missing(
         "set_hint"
     )
 
+    brand_current = current_attributes.get("brand")
+    categories_meta_for_hints = st.session_state.get("categories_meta")
+    if not isinstance(categories_meta_for_hints, Mapping):
+        categories_meta_for_hints = {}
+    if _is_blank(sanitized_hints.get("brand_hint")) and _is_blank(brand_current):
+        guessed_brand = _guess_brand_from_name(
+            (product or {}).get("name") if isinstance(product, Mapping) else None,
+            categories_meta_for_hints,
+        )
+        if guessed_brand:
+            sanitized_hints["brand_hint"] = guessed_brand
+
     user_payload = {
         "sku": product.get("sku"),
         "name": product.get("name"),
@@ -1105,6 +1237,9 @@ def infer_missing(
             for code, entry in suggestions_map.items()
             if not _is_blank(entry.get("value"))
         }
+        brand_hint_values = _ensure_list_of_strings(sanitized_hints.get("brand_hint"))
+        if brand_hint_values and _is_blank(context_already_found.get("brand")):
+            context_already_found["brand"] = brand_hint_values[0]
         retry_payload = dict(user_payload)
         retry_payload["context_already_found"] = context_already_found
         retry_payload["remaining_codes"] = remaining_before_retry
