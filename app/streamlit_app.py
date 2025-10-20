@@ -1049,6 +1049,27 @@ def _apply_ai_suggestions_to_wide(
                 or meta.get("backend_type")
                 or ""
             ).lower()
+            allowed_multiselect_labels: dict[str, str] | None = None
+            multiselect_values_to_labels: dict[str, str] | None = None
+            if input_type == "multiselect" and isinstance(meta, dict):
+                options = meta.get("options")
+                if isinstance(options, list):
+                    allowed_multiselect_labels = {}
+                    multiselect_values_to_labels = {}
+                    for option in options:
+                        if not isinstance(option, dict):
+                            continue
+                        raw_label = option.get("label")
+                        if not isinstance(raw_label, str):
+                            continue
+                        trimmed_label = raw_label.strip()
+                        if not trimmed_label:
+                            continue
+                        allowed_multiselect_labels[trimmed_label] = trimmed_label
+                        if "value" in option and option["value"] not in (None, ""):
+                            value_text = str(option["value"]).strip()
+                            if value_text:
+                                multiselect_values_to_labels[value_text] = trimmed_label
             converted_value = _coerce_ai_value(ai_value, meta)
 
             for idx in row_indices:
@@ -1201,12 +1222,44 @@ def _apply_ai_suggestions_to_wide(
                 if input_type == "multiselect":
                     existing_list = _normalize_multiselect_list(existing_raw)
                     ai_values = _normalize_multiselect_list(converted_value)
+                    if (
+                        allowed_multiselect_labels is not None
+                        or multiselect_values_to_labels is not None
+                    ):
+                        filtered_ai_values: list[str] = []
+                        for item in ai_values:
+                            candidate = item.strip()
+                            if not candidate:
+                                continue
+                            if (
+                                allowed_multiselect_labels is not None
+                                and candidate in allowed_multiselect_labels
+                            ):
+                                filtered_ai_values.append(
+                                    allowed_multiselect_labels[candidate]
+                                )
+                                continue
+                            if (
+                                multiselect_values_to_labels is not None
+                                and candidate in multiselect_values_to_labels
+                            ):
+                                filtered_ai_values.append(
+                                    multiselect_values_to_labels[candidate]
+                                )
+                        ai_values = filtered_ai_values
                     if not ai_values:
                         continue
-                    new_items = [item for item in ai_values if item not in existing_list]
-                    skipped_duplicates = [
-                        item for item in ai_values if item in existing_list
-                    ]
+                    existing_normalized = [item.strip() for item in existing_list]
+                    seen = set(existing_normalized)
+                    new_items: list[str] = []
+                    skipped_duplicates: list[str] = []
+                    for item in ai_values:
+                        normalized_item = item.strip()
+                        if normalized_item in seen:
+                            skipped_duplicates.append(item)
+                            continue
+                        seen.add(normalized_item)
+                        new_items.append(item)
                     if new_items:
                         combined = existing_list + new_items
                         updated.at[idx, code_key] = combined
