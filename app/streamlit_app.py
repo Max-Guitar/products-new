@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import os
 from string import Template
@@ -2855,13 +2856,13 @@ step1_state = st.session_state.setdefault("step1", {})
 
 c1, c2, c3 = st.columns(3)
 btn_all = c1.button("📦 Load All", key="btn_load_all")
-btn_50 = c2.button("⚡ Load 50 (fast)", key="btn_load_50_fast")
+btn_50 = c2.button("🆕 New arrivals", key="btn_load_50_fast")
 btn_test = c3.button("🧪 Test ART-22895", key="btn_test_art_22895")
 
 if btn_all:
     requested_run_mode: str | None = "all"
 elif btn_50:
-    requested_run_mode = "fast50"
+    requested_run_mode = "new_arrivals"
 elif btn_test:
     requested_run_mode = "test_art_22895"
 else:
@@ -2874,7 +2875,7 @@ if requested_run_mode:
     if run_mode != "test_art_22895":
         step1_state.pop("products", None)
 
-    all_modes = {"all", "fast50", "test_art_22895"}
+    all_modes = {"all", "new_arrivals", "test_art_22895"}
     for prefix in ("default_products", "df_original", "df_edited", "attribute_sets"):
         for other_mode in all_modes - {run_mode}:
             st.session_state.pop(f"{prefix}_{other_mode}", None)
@@ -3047,9 +3048,15 @@ if requested_run_mode:
             st.success(f"Loaded {len(data or [])} test item(s).")
 
     else:
-        limit = 50 if run_mode == "fast50" else None
-        enabled_only = True if run_mode == "fast50" else None
-        minimal_fields = run_mode == "fast50"
+        limit = None
+        enabled_only = True if run_mode == "new_arrivals" else None
+        minimal_fields = run_mode == "new_arrivals"
+        type_ids_filter: list[str] | None = None
+        created_at_from: str | None = None
+        if run_mode == "new_arrivals":
+            type_ids_filter = sorted(_ALLOWED_TYPES)
+            cutoff_dt = datetime.now(timezone.utc) - timedelta(days=30)
+            created_at_from = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
 
         status = st.status("Loading default products…", expanded=True)
         pbar = st.progress(0)
@@ -3066,6 +3073,8 @@ if requested_run_mode:
                 limit=limit,
                 minimal_fields=minimal_fields,
                 enabled_only=enabled_only,
+                type_ids=type_ids_filter,
+                created_at_from=created_at_from,
             )
             st.session_state[cache_key] = data
             pbar.progress(60)

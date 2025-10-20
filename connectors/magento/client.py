@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote, urlencode
 
 import requests
@@ -86,6 +86,8 @@ def get_default_products(
     limit: Optional[int] = None,
     minimal_fields: bool = False,
     enabled_only: bool | None = None,
+    type_ids: Iterable[str] | None = None,
+    created_at_from: str | None = None,
     **kwargs: Any,
 ) -> List[dict]:
     """Return products for the default attribute set with optional limit.
@@ -108,6 +110,13 @@ def get_default_products(
         When ``True`` adds a status filter restricting results to enabled
         products. When ``False`` or ``None`` (default) no status filter is
         applied.
+    type_ids:
+        Optional iterable of product ``type_id`` values to filter server-side.
+        When provided the values are joined with ``OR`` within the same filter
+        group.
+    created_at_from:
+        Optional ISO timestamp string passed as a ``gteq`` filter for the
+        ``created_at`` field.
     kwargs:
         Extra query parameters merged into the Magento search criteria.
     """
@@ -144,6 +153,33 @@ def get_default_products(
 
     if kwargs:
         base_params.update(kwargs)
+
+    if type_ids:
+        values = [str(v) for v in type_ids if v not in (None, "")]
+        if values:
+            for idx, type_value in enumerate(values):
+                base_params[
+                    f"searchCriteria[filter_groups][{filter_index}][filters][{idx}][field]"
+                ] = "type_id"
+                base_params[
+                    f"searchCriteria[filter_groups][{filter_index}][filters][{idx}][value]"
+                ] = type_value
+                base_params[
+                    f"searchCriteria[filter_groups][{filter_index}][filters][{idx}][condition_type]"
+                ] = "eq"
+            filter_index += 1
+
+    if created_at_from:
+        base_params[
+            f"searchCriteria[filter_groups][{filter_index}][filters][0][field]"
+        ] = "created_at"
+        base_params[
+            f"searchCriteria[filter_groups][{filter_index}][filters][0][value]"
+        ] = created_at_from
+        base_params[
+            f"searchCriteria[filter_groups][{filter_index}][filters][0][condition_type]"
+        ] = "gteq"
+        filter_index += 1
 
     if minimal_fields:
         base_params[
