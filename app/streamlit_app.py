@@ -176,6 +176,21 @@ ORDER_PRESETS = {
         "categories",
         "short_description",
     ],
+    "Bass Guitar": [
+        "Profile",
+        "Neck Material",
+        "Fretboard Material",
+        "Tuning Machines",
+        "No Strings",
+        "Vintage",
+        "Cases Covers",
+        "Acoustic Bass",
+        "Amount Of Frets",
+        "Orientation",
+        "Kids Size",
+        "categories",
+        "Short Description",
+    ],
 
     # AMPS
     "amps": [
@@ -227,33 +242,23 @@ def _norm_code(s: str) -> str:
 
 
 def build_column_order(set_name: str, df_cols: list[str]) -> list[str]:
-    cols = list(df_cols)
-    norm_to_actual: dict[str, str] = {}
-    for col in cols:
-        if not isinstance(col, str):
-            continue
-        key = _norm_code(col)
-        if key and key not in norm_to_actual:
-            norm_to_actual[key] = col
-
-    def _resolve(codes: Iterable[str]) -> list[str]:
-        resolved: list[str] = []
-        for code in codes:
-            key = _norm_code(code)
-            col = norm_to_actual.get(key)
-            if col and col not in resolved:
-                resolved.append(col)
-        return resolved
-
-    first = _resolve(BASE_FIRST)
-
-    preset_codes = ORDER_PRESETS.get(_norm(set_name), [])
-    middle = [col for col in _resolve(preset_codes) if col not in first]
-
-    used = set(first) | set(middle)
-    tail = sorted((col for col in cols if col not in used), key=lambda c: _norm(c))
-
-    return first + middle + tail
+    cols = list(df_cols or [])
+    preset = ORDER_PRESETS.get(set_name)
+    if preset is None:
+        preset = ORDER_PRESETS.get(_norm(set_name), [])
+    if isinstance(preset, (list, tuple)):
+        preset = list(preset)
+    elif preset:
+        preset = [preset]
+    else:
+        preset = []
+    skip = ["sku", *preset]
+    cols = [
+        "sku",
+        *[c for c in preset if c in cols],
+        *[c for c in cols if c not in skip],
+    ]
+    return cols
 
 
 ID_RX = re.compile(r"#(\d+)\)?$")
