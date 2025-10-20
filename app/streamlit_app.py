@@ -2893,6 +2893,109 @@ if df_original_key in st.session_state:
                                     meta_cache = AttributeMetaCache(session, api_base)
                                     step2_state["meta_cache"] = meta_cache
 
+                                categories_meta = step2_state.get("categories_meta")
+                                if not isinstance(categories_meta, dict):
+                                    categories_meta = {}
+
+                                if not categories_meta.get("options"):
+                                    try:
+                                        with st.spinner("📂 Loading categories…"):
+                                            categories_meta = ensure_categories_meta(
+                                                meta_cache,
+                                                session,
+                                                api_base,
+                                                store_id=0,
+                                            )
+                                        if not isinstance(categories_meta, dict):
+                                            categories_meta = (
+                                                meta_cache.get("categories")
+                                                if isinstance(
+                                                    meta_cache, AttributeMetaCache
+                                                )
+                                                else {}
+                                            ) or {}
+                                        st.session_state["step2_categories_failed"] = False
+                                    except Exception as exc:  # pragma: no cover - UI interaction
+                                        st.warning(
+                                            f"Failed to load categories: {exc}"
+                                        )
+                                        categories_meta = (
+                                            meta_cache.get("categories")
+                                            if isinstance(meta_cache, AttributeMetaCache)
+                                            else {}
+                                        ) or {}
+                                        st.session_state["step2_categories_failed"] = True
+                                else:
+                                    st.session_state["step2_categories_failed"] = False
+
+                                normalized_options: list[dict[str, object]] = []
+                                seen_category_ids: set[str] = set()
+                                raw_options = categories_meta.get("options") or []
+                                if not isinstance(raw_options, list):
+                                    try:
+                                        raw_options = list(raw_options)
+                                    except TypeError:
+                                        raw_options = []
+                                for opt in raw_options:
+                                    if not isinstance(opt, dict):
+                                        continue
+                                    label_raw = opt.get("label")
+                                    value_raw = opt.get("value")
+                                    label = str(label_raw or "").strip()
+                                    if not label:
+                                        continue
+                                    try:
+                                        value_int = int(value_raw)
+                                    except (TypeError, ValueError):
+                                        continue
+                                    value_str = str(value_int)
+                                    if value_str in seen_category_ids:
+                                        continue
+                                    seen_category_ids.add(value_str)
+                                    normalized_options.append(
+                                        {"label": label, "value": value_int}
+                                    )
+                                normalized_options.sort(
+                                    key=lambda item: item["label"].casefold()
+                                )
+
+                                values_to_labels = categories_meta.get("values_to_labels")
+                                if not isinstance(values_to_labels, dict):
+                                    values_to_labels = {}
+                                labels_to_values = categories_meta.get("labels_to_values")
+                                if not isinstance(labels_to_values, dict):
+                                    labels_to_values = {}
+                                options_map = categories_meta.get("options_map")
+                                if not isinstance(options_map, dict):
+                                    options_map = {}
+
+                                for opt in normalized_options:
+                                    label = opt["label"]
+                                    value_int = opt["value"]
+                                    value_str = str(value_int)
+                                    values_to_labels[value_str] = label
+                                    normalized_label = _norm_label(label)
+                                    if normalized_label:
+                                        labels_to_values[normalized_label] = value_str
+                                    labels_to_values[label] = value_str
+                                    labels_to_values[label.casefold()] = value_str
+                                    options_map[label] = value_int
+                                    options_map[label.casefold()] = value_int
+                                    options_map[value_str] = value_int
+
+                                categories_meta["options"] = normalized_options
+                                categories_meta["values_to_labels"] = values_to_labels
+                                categories_meta["labels_to_values"] = labels_to_values
+                                categories_meta["options_map"] = options_map
+
+                                step2_state["categories_meta"] = categories_meta
+
+                                if isinstance(meta_cache, AttributeMetaCache):
+                                    try:
+                                        meta_cache.set_static("categories", categories_meta)
+                                    except Exception:
+                                        pass
+
                                 if not step2_state["dfs"]:
                                     (
                                         dfs_by_set,
@@ -3059,6 +3162,19 @@ if df_original_key in st.session_state:
                                             "resolved_codes", {}
                                         )
                                         resolved_storage[set_id] = resolved_map
+                                        categories_meta_for_ai = step2_state.get(
+                                            "categories_meta"
+                                        )
+                                        if isinstance(categories_meta_for_ai, dict):
+                                            meta_map["categories"] = dict(
+                                                categories_meta_for_ai
+                                            )
+                                            if DEBUG:
+                                                st.write(
+                                                    "DEBUG categories before AI:",
+                                                    meta_map.get("categories"),
+                                                )
+
                                         _apply_categories_fallback(meta_map)
                                         ai_cells_map = step2_state.setdefault(
                                             "ai_cells", {}
@@ -3266,6 +3382,19 @@ if df_original_key in st.session_state:
                                             "resolved_codes", {}
                                         )
                                         resolved_storage[set_id] = resolved_map
+                                        categories_meta_for_ai = step2_state.get(
+                                            "categories_meta"
+                                        )
+                                        if isinstance(categories_meta_for_ai, dict):
+                                            meta_map["categories"] = dict(
+                                                categories_meta_for_ai
+                                            )
+                                            if DEBUG:
+                                                st.write(
+                                                    "DEBUG categories before AI:",
+                                                    meta_map.get("categories"),
+                                                )
+
                                         _apply_categories_fallback(meta_map)
                                         ai_cells_map = step2_state.setdefault(
                                             "ai_cells", {}
@@ -3350,39 +3479,8 @@ if df_original_key in st.session_state:
                                 _pupdate(40, "Fetching metadata from Magento…")
 
                                 categories_meta = step2_state.get("categories_meta")
-                                if not isinstance(categories_meta, dict) or not categories_meta.get(
-                                    "options"
-                                ):
-                                    try:
-                                        with st.spinner("📂 Loading categories…"):
-                                            categories_meta = ensure_categories_meta(
-                                                meta_cache,
-                                                session,
-                                                api_base,
-                                                store_id=0,
-                                            )
-                                        if not isinstance(categories_meta, dict):
-                                            categories_meta = (
-                                                meta_cache.get("categories")
-                                                if isinstance(
-                                                    meta_cache, AttributeMetaCache
-                                                )
-                                                else {}
-                                            )
-                                        st.session_state["step2_categories_failed"] = False
-                                    except Exception as exc:  # pragma: no cover - UI interaction
-                                        st.warning(
-                                            f"Failed to load categories: {exc}"
-                                        )
-                                        categories_meta = (
-                                            meta_cache.get("categories")
-                                            if isinstance(meta_cache, AttributeMetaCache)
-                                            else {}
-                                        )
-                                        st.session_state["step2_categories_failed"] = True
-                                    step2_state["categories_meta"] = categories_meta
-                                else:
-                                    st.session_state["step2_categories_failed"] = False
+                                if not isinstance(categories_meta, dict):
+                                    categories_meta = {}
 
                                 _pupdate(45, "Preparing categories (full tree)…")
 
@@ -3436,11 +3534,13 @@ if df_original_key in st.session_state:
                                             meta_map = {}
                                             wide_meta[set_id] = meta_map
 
-                                        if (
-                                            isinstance(categories_meta, dict)
-                                            and categories_meta.get("options")
-                                        ):
+                                        if isinstance(categories_meta, dict):
                                             meta_map["categories"] = dict(categories_meta)
+                                            if DEBUG:
+                                                st.write(
+                                                    "DEBUG categories before UI:",
+                                                    meta_map.get("categories"),
+                                                )
 
                                         _apply_categories_fallback(meta_map)
                                         df_ref = _coerce_for_ui(wide_df, meta_map)
