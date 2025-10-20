@@ -158,6 +158,7 @@ ORDER_PRESETS = {
 "bass guitar": [
     "series",
     "model",
+    "guitarstylemultiplechoice",  # rendered as "Guitar style"
     "body_material",
     "top_material",
     "finish",
@@ -169,8 +170,10 @@ ORDER_PRESETS = {
     "neck_pickup",
     "controls",
     "scale_mensur",
-    "profile",
+    "neck_profile",
     "neck_material",
+    "neck_radius",
+    "neck_nutwidth",
     "fretboard_material",
     "tuning_machines",
     "no_strings",
