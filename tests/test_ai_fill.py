@@ -129,6 +129,27 @@ def test_enrich_ai_suggestions_creates_entries_from_hints():
     assert "no_strings_auto" not in meta
 
 
+def test_enrich_ai_suggestions_skips_styles_for_bass_items():
+    base_df = pd.DataFrame(
+        [
+            {"code": "model", "value": "Precision"},
+        ]
+    )
+
+    hints = {"style_hint": ["P-Style"]}
+
+    enriched = enrich_ai_suggestions(
+        base_df,
+        hints,
+        CATEGORIES_META,
+        "Bass Guitar",
+        42,
+        {"name": "Fender Precision Bass"},
+    )
+
+    assert enriched[enriched["code"] == "guitarstylemultiplechoice"].empty
+
+
 def test_enrich_ai_suggestions_sets_default_no_strings_for_bass_product():
     base_df = pd.DataFrame(
         [
