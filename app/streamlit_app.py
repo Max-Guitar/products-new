@@ -3048,7 +3048,7 @@ if requested_run_mode:
 
     else:
         limit = 50 if run_mode == "fast50" else None
-        enabled_only = True if run_mode == "fast50" else None
+        enabled_only = None
         minimal_fields = run_mode == "fast50"
         extra_params: dict[str, str] = {}
         if run_mode == "fast50":
