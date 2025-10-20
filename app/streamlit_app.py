@@ -319,6 +319,18 @@ def _split_multiselect_input(values) -> list[str]:
     return [item for item in iterable if item]
 
 
+def _norm_label(s: str) -> str:
+    if s is None:
+        return ""
+    s = s.replace("\u00A0", " ")
+    s = s.strip().casefold()
+    s = re.sub(r"\s+", " ", s)
+    s = s.replace("&", "and")
+    s = s.replace("’", "'")
+    s = s.replace("–", "-").replace("—", "-")
+    return s
+
+
 def _format_multiselect_display_value(values) -> str:
     parts = _split_multiselect_input(values)
     if not parts:
@@ -1025,8 +1037,35 @@ def _apply_ai_suggestions_to_wide(
                         if isinstance(meta_categories, dict)
                         else {}
                     )
+                    if values_to_labels:
+                        lbl = "Pedalboards & Power Supplies"
+                        meta = meta_map.get("categories") or {}
+                        v2l = meta.get("values_to_labels") or {}
+                        l2v = {
+                            (lbl_ or "").casefold().strip(): str(cid)
+                            for cid, lbl_ in v2l.items()
+                        }
+                        print("DBG: categories count:", len(v2l))
+                        print("DBG: exact l2v hit:", lbl.casefold().strip() in l2v)
+
+                        def norm(s):
+                            import re as _re
+
+                            return _re.sub(
+                                r"\s+", " ",
+                                (s or "").casefold().replace("\u00a0", " ").strip(),
+                            )
+
+                        norm_lbl = norm(lbl)
+                        near = [
+                            (cid, lab)
+                            for cid, lab in v2l.items()
+                            if norm(lab) == norm_lbl
+                            or ("pedalboard" in norm(lab) or "power" in norm(lab))
+                        ]
+                        print("DBG: near candidates:", near[:10])
                     labels_to_values: dict[str, str] = {
-                        (label or "").casefold().strip(): str(value)
+                        _norm_label(label): str(value)
                         for value, label in values_to_labels.items()
                     }
 
@@ -1064,7 +1103,7 @@ def _apply_ai_suggestions_to_wide(
                             else:
                                 ignored_tokens.append(token)
                         else:
-                            lookup_key = token.casefold().strip()
+                            lookup_key = _norm_label(token)
                             resolved = labels_to_values.get(lookup_key)
                             if resolved:
                                 if resolved not in found_ids:
