@@ -40,10 +40,12 @@ from services.ai_fill import (
     collect_attributes_table,
     compute_allowed_attrs,
     derive_styles_from_texts,
+    enrich_ai_suggestions,
     get_attribute_sets_map,
     get_ai_conversation,
     get_product_by_sku,
     infer_missing,
+    normalize_category_label,
     probe_api_base,
 )
 from services.inventory import (
@@ -1092,42 +1094,19 @@ def _apply_ai_suggestions_to_wide(
 
                 if code_key == "categories":
                     meta_categories = meta_map.get("categories") or {}
-                    values_to_labels: dict[str, str] = (
-                        meta_categories.get("values_to_labels") or {}
-                        if isinstance(meta_categories, dict)
-                        else {}
-                    )
-                    if values_to_labels:
-                        lbl = "Pedalboards & Power Supplies"
-                        meta = meta_map.get("categories") or {}
-                        v2l = meta.get("values_to_labels") or {}
-                        l2v = {
-                            (lbl_ or "").casefold().strip(): str(cid)
-                            for cid, lbl_ in v2l.items()
-                        }
-                        print("DBG: categories count:", len(v2l))
-                        print("DBG: exact l2v hit:", lbl.casefold().strip() in l2v)
-
-                        def norm(s):
-                            import re as _re
-
-                            return _re.sub(
-                                r"\s+", " ",
-                                (s or "").casefold().replace("\u00a0", " ").strip(),
-                            )
-
-                        norm_lbl = norm(lbl)
-                        near = [
-                            (cid, lab)
-                            for cid, lab in v2l.items()
-                            if norm(lab) == norm_lbl
-                            or ("pedalboard" in norm(lab) or "power" in norm(lab))
-                        ]
-                        print("DBG: near candidates:", near[:10])
-                    labels_to_values: dict[str, str] = {
-                        _norm_label(label): str(value)
-                        for value, label in values_to_labels.items()
-                    }
+                    values_to_labels: dict[str, str] = {}
+                    labels_to_values_map: dict[str, object] = {}
+                    if isinstance(meta_categories, Mapping):
+                        raw_v2l = meta_categories.get("values_to_labels")
+                        if isinstance(raw_v2l, Mapping):
+                            values_to_labels = {
+                                str(key): str(value)
+                                for key, value in raw_v2l.items()
+                                if key not in (None, "") and value not in (None, "")
+                            }
+                        raw_l2v = meta_categories.get("labels_to_values")
+                        if isinstance(raw_l2v, Mapping):
+                            labels_to_values_map = dict(raw_l2v)
 
                     ai_raw = (
                         suggestion_payload.get("categories")
@@ -1155,21 +1134,48 @@ def _apply_ai_suggestions_to_wide(
 
                     found_ids: list[str] = []
                     ignored_tokens: list[str] = []
+
+                    def _append_ignored(token: str) -> None:
+                        candidate = str(token).strip()
+                        if not candidate:
+                            return
+                        if candidate not in ignored_tokens:
+                            ignored_tokens.append(candidate)
+
+                    canonical_seen: set[str] = set()
                     for token in normalized_ai:
                         if token.isdigit():
                             if token in values_to_labels:
                                 if token not in found_ids:
                                     found_ids.append(token)
                             else:
-                                ignored_tokens.append(token)
+                                _append_ignored(token)
+                            continue
+
+                        canonical_label = normalize_category_label(token, meta_categories)
+                        if canonical_label:
+                            if canonical_label in canonical_seen:
+                                continue
+                            canonical_seen.add(canonical_label)
+                            resolved_value = labels_to_values_map.get(canonical_label)
+                            if resolved_value is None:
+                                _append_ignored(token)
+                                continue
+                            resolved_str = str(resolved_value)
+                            if resolved_str not in found_ids:
+                                found_ids.append(resolved_str)
                         else:
-                            lookup_key = _norm_label(token)
-                            resolved = labels_to_values.get(lookup_key)
-                            if resolved:
-                                if resolved not in found_ids:
-                                    found_ids.append(resolved)
-                            else:
-                                ignored_tokens.append(token)
+                            _append_ignored(token)
+
+                    unmatched_labels = _ensure_list_of_strings(
+                        suggestion_payload.get("unmatched_labels")
+                    )
+                    for item in unmatched_labels:
+                        _append_ignored(item)
+
+                    normalized_added = _ensure_list_of_strings(
+                        suggestion_payload.get("normalized_categories_added")
+                    )
 
                     existing_raw_value = existing_raw if code_key in updated.columns else None
                     if (
@@ -1201,6 +1207,8 @@ def _apply_ai_suggestions_to_wide(
                             "existing_before": existing_ids,
                             "combined_after": combined_ids,
                         }
+                        if normalized_added:
+                            log_entry["normalized_categories_added"] = normalized_added
                         _mark_ai_filled(
                             ai_cells,
                             row_idx=row_position,
@@ -1216,6 +1224,7 @@ def _apply_ai_suggestions_to_wide(
                                 "applied": found_ids,
                                 "existing_before": existing_ids,
                                 "combined_after": combined_ids,
+                                "normalized_categories_added": normalized_added,
                             }
                         )
 
@@ -1736,6 +1745,20 @@ def _unique_preserve_str(values: Iterable[object]) -> list[str]:
     return result
 
 
+def safe_label(entry: Mapping[str, object] | None) -> str:
+    if not isinstance(entry, Mapping):
+        return ""
+    label = entry.get("label")
+    if isinstance(label, str) and label.strip():
+        return label.strip()
+    raw_value = entry.get("raw_value")
+    if isinstance(raw_value, str) and raw_value.strip():
+        return raw_value.strip()
+    if raw_value not in (None, ""):
+        return str(raw_value)
+    return ""
+
+
 def _extract_attr_text(attr_rows: Mapping[str, dict], code: str) -> str:
     entry = attr_rows.get(code) if isinstance(attr_rows, Mapping) else None
     if not isinstance(entry, Mapping):
@@ -1802,10 +1825,16 @@ def _build_ai_hints(
     if set_name_clean:
         hints["attribute_set_name"] = set_name_clean
 
-    brand_text = _extract_attr_text(attr_rows, "brand")
-    brand_hint = _match_category_hint(brand_text, labels_to_values, values_to_labels)
-    if brand_hint:
-        hints["brand_hint"] = brand_hint
+    brand_label = safe_label(attr_rows.get("brand"))
+    if brand_label and isinstance(labels_to_values, Mapping):
+        brand_lookup = brand_label.casefold()
+        for raw_label in labels_to_values.keys():
+            key_text = str(raw_label or "").strip()
+            if not key_text:
+                continue
+            if key_text.casefold() == brand_lookup:
+                hints["brand_hint"] = brand_label
+                break
 
     set_hint = _match_category_hint(set_name_clean, labels_to_values, values_to_labels)
     if set_hint:
@@ -2196,6 +2225,18 @@ def build_attributes_df(
                     st.warning(error_message)
                     ai_errors.append(error_message)
                     continue
+
+                categories_meta_for_ai = step2_state.get("categories_meta")
+                if not isinstance(categories_meta_for_ai, Mapping):
+                    categories_meta_for_ai = {}
+                attribute_set_label = set_names.get(set_id, "")
+                ai_df = enrich_ai_suggestions(
+                    ai_df,
+                    hints_payload,
+                    categories_meta_for_ai,
+                    attribute_set_label,
+                    set_id,
+                )
 
                 sku_key = str(sku_value)
                 per_sku = ai_results.setdefault(set_id, {}).setdefault(sku_key, {})

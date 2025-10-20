@@ -20,6 +20,8 @@ from utils.http import MAGENTO_REST_PATH_CANDIDATES, build_magento_headers
 
 ALWAYS_ATTRS: Set[str] = {"brand", "country_of_manufacture", "short_description"}
 
+ELECTRIC_SET_IDS: Set[int] = {12, 16}
+
 SET_ATTRS: Mapping[str, Set[str]] = {
     "Accessories": {
         "condition",
@@ -280,6 +282,39 @@ def _merge_unique(*iterables: Iterable[str]) -> list[str]:
             seen.add(key)
             merged.append(normalized)
     return merged
+
+
+def normalize_category_label(label: str | None, meta: Mapping[str, object] | None) -> str | None:
+    if not label:
+        return None
+    s = str(label).strip()
+    if not s:
+        return None
+
+    meta = meta or {}
+    canon = meta.get("labels_to_values") if isinstance(meta, Mapping) else None
+    if not isinstance(canon, Mapping):
+        canon = {}
+
+    if s in canon:
+        return s
+
+    low = s.casefold()
+    rev_low = st.session_state.setdefault(
+        "cat_lowmap", {str(k).casefold(): str(k) for k in canon.keys()}
+    )
+    for key in canon.keys():
+        key_cf = str(key).casefold()
+        if key_cf not in rev_low:
+            rev_low[key_cf] = str(key)
+    if low in rev_low:
+        return rev_low[low]
+    if low.endswith("s") and low[:-1] in rev_low:
+        return rev_low[low[:-1]]
+    plural = f"{low}s"
+    if plural in rev_low:
+        return rev_low[plural]
+    return None
 
 
 def _is_blank(value: object) -> bool:
@@ -728,7 +763,9 @@ def _openai_complete(
 def enrich_ai_suggestions(
     ai_df: pd.DataFrame,
     hints: Mapping[str, object] | None,
-    set_name: str | None,
+    categories_meta: Mapping[str, object] | None,
+    attribute_set_name: str | None,
+    set_id: object | None,
 ) -> pd.DataFrame:
     """Post-process AI suggestions with deterministic hints and cascades."""
 
@@ -737,6 +774,7 @@ def enrich_ai_suggestions(
 
     hints = hints or {}
     normalized_hints = _sanitize_hints(hints)
+    categories_meta = categories_meta if isinstance(categories_meta, Mapping) else {}
 
     records = ai_df.to_dict(orient="records")
     order: list[str] = []
@@ -758,23 +796,58 @@ def enrich_ai_suggestions(
         by_code[code_key] = cleaned
 
     # Categories enrichment with brand/set hints
-    existing_categories = _ensure_list_of_strings(
+    existing_categories_raw = _ensure_list_of_strings(
         (by_code.get("categories") or {}).get("value")
     )
+    existing_categories_canon: list[str] = []
+    for item in existing_categories_raw:
+        normalized_label = normalize_category_label(item, categories_meta)
+        if normalized_label and normalized_label not in existing_categories_canon:
+            existing_categories_canon.append(normalized_label)
+
+    brand_hint_values = _ensure_list_of_strings(normalized_hints.get("brand_hint"))
+    set_hint_values = _ensure_list_of_strings(normalized_hints.get("set_hint"))
     category_hints: list[str] = []
-    category_hints.extend(_ensure_list_of_strings(normalized_hints.get("brand_hint")))
-    category_hints.extend(_ensure_list_of_strings(normalized_hints.get("set_hint")))
-    if set_name and not _is_blank(set_name):
-        category_hints.append(str(set_name).strip())
-    merged_categories = _merge_unique(existing_categories, category_hints)
-    if merged_categories:
+    category_hints.extend(brand_hint_values)
+    category_hints.extend(set_hint_values)
+    if attribute_set_name and not _is_blank(attribute_set_name):
+        category_hints.append(str(attribute_set_name).strip())
+
+    merged_categories = _merge_unique(existing_categories_raw, category_hints)
+    normalized_categories: list[str] = []
+    unmatched_labels: list[str] = []
+    for label in merged_categories:
+        normalized_label = normalize_category_label(label, categories_meta)
+        if normalized_label:
+            if normalized_label not in normalized_categories:
+                normalized_categories.append(normalized_label)
+        else:
+            unmatched_labels.append(label)
+
+    normalized_categories_added = [
+        label for label in normalized_categories if label not in existing_categories_canon
+    ]
+
+    if normalized_categories:
         category_entry = by_code.setdefault(
             "categories",
             {"code": "categories", "reason": "enriched_from_hints"},
         )
-        category_entry["value"] = merged_categories
+        category_entry["value"] = normalized_categories
         if _is_blank(category_entry.get("reason")):
             category_entry["reason"] = "enriched_from_hints"
+        if unmatched_labels:
+            category_entry["unmatched_labels"] = _ensure_list_of_strings(unmatched_labels)
+        if normalized_categories_added:
+            category_entry["normalized_categories_added"] = list(normalized_categories_added)
+        if "categories" not in order:
+            order.append("categories")
+    elif unmatched_labels:
+        category_entry = by_code.setdefault(
+            "categories",
+            {"code": "categories", "reason": "enriched_from_hints"},
+        )
+        category_entry["unmatched_labels"] = _ensure_list_of_strings(unmatched_labels)
         if "categories" not in order:
             order.append("categories")
 
@@ -797,15 +870,27 @@ def enrich_ai_suggestions(
         elif not _is_blank(value):
             candidate_texts.append(str(value))
 
-    derived_styles = derive_styles_from_texts(candidate_texts)
+    set_name_cf = str(attribute_set_name or "").casefold()
+    try:
+        set_id_int = int(set_id) if set_id not in (None, "") else None
+    except (TypeError, ValueError):
+        set_id_int = None
+    is_electric = set_name_cf in {"electric guitar", "electric guitars"} or (
+        set_id_int in ELECTRIC_SET_IDS if set_id_int is not None else False
+    )
+
+    derived_styles = (
+        derive_styles_from_texts(candidate_texts) if is_electric else []
+    )
     merged_styles = _merge_unique(existing_styles, style_hint_values, derived_styles)
-    if merged_styles:
+    if merged_styles and is_electric:
         cascade_styles = [
             STYLE_CASCADE.get(style)
             for style in merged_styles
             if STYLE_CASCADE.get(style)
         ]
         merged_styles = _merge_unique(merged_styles, cascade_styles)
+    if merged_styles:
         style_entry = by_code.setdefault(
             "guitarstylemultiplechoice",
             {"code": "guitarstylemultiplechoice", "reason": "enriched_from_hints"},
@@ -839,7 +924,22 @@ def enrich_ai_suggestions(
         enriched_records.append(payload)
 
     result_df = pd.DataFrame(enriched_records)
-    result_df.attrs = dict(getattr(ai_df, "attrs", {}))
+    original_attrs = dict(getattr(ai_df, "attrs", {}))
+    meta_payload: dict[str, object] = {}
+    if isinstance(original_attrs.get("meta"), Mapping):
+        meta_payload = dict(original_attrs.get("meta"))
+    brand_hint_meta: str | None = None
+    for hint_value in brand_hint_values:
+        normalized = normalize_category_label(hint_value, categories_meta)
+        if normalized:
+            brand_hint_meta = normalized
+            break
+    if brand_hint_meta is None and brand_hint_values:
+        brand_hint_meta = brand_hint_values[0]
+    meta_payload["brand_hint"] = brand_hint_meta
+    meta_payload["normalized_categories_added"] = normalized_categories_added
+    original_attrs["meta"] = meta_payload
+    result_df.attrs = original_attrs
     return result_df
 
 
@@ -967,8 +1067,6 @@ def infer_missing(
     completion, raw_content = _openai_complete(conv, payload_json, api_key, model=model)
     attributes = completion.get("attributes") if isinstance(completion, Mapping) else []
     ai_df = pd.DataFrame(attributes or [])
-    set_name_hint = attribute_set_name or sanitized_hints.get("set_hint")
-    ai_df = enrich_ai_suggestions(ai_df, sanitized_hints, set_name_hint)
 
     def _df_to_code_map(df: pd.DataFrame) -> dict[str, dict[str, object]]:
         mapping: dict[str, dict[str, object]] = {}
@@ -1018,7 +1116,6 @@ def infer_missing(
             else []
         )
         retry_df = pd.DataFrame(retry_attributes or [])
-        retry_df = enrich_ai_suggestions(retry_df, sanitized_hints, set_name_hint)
         retry_map = _df_to_code_map(retry_df)
         raw_previews.append(_truncate_preview(raw_retry))
 
