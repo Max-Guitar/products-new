@@ -6,6 +6,7 @@ import json
 import os
 import re
 import hashlib
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 from urllib.parse import quote
@@ -139,21 +140,126 @@ SET_ATTRS: Mapping[str, Set[str]] = {
     },
 }
 
+SPEC_FORCE_CODES: Set[str] = {
+    "bridge",
+    "bridge_type",
+    "bridge_pickup",
+    "middle_pickup",
+    "neck_pickup",
+    "pickup_config",
+    "scale_mensur",
+    "neck_radius",
+    "neck_nutwidth",
+    "fretboard_material",
+    "neck_material",
+    "tuning_machines",
+    "controls",
+    "finish",
+    "top_material",
+}
+
+SPEC_CODE_QUESTIONS: Mapping[str, str] = {
+    "bridge": "Extract the bridge hardware name if mentioned; otherwise leave it empty.",
+    "bridge_type": "Extract the bridge type (e.g. tremolo, hardtail) if present; otherwise leave empty.",
+    "bridge_pickup": "List the bridge pickup model if described; otherwise leave it empty.",
+    "middle_pickup": "List the middle pickup model if described; otherwise leave it empty.",
+    "neck_pickup": "List the neck pickup model if described; otherwise leave it empty.",
+    "pickup_config": "Extract the pickup configuration code (HH, HSS, etc.) if present; otherwise leave empty.",
+    "scale_mensur": "Extract the scale length (e.g. 25.5\") if present; otherwise leave empty.",
+    "neck_radius": "Extract the fretboard radius (e.g. 9.5\") if present; otherwise leave empty.",
+    "neck_nutwidth": "Extract the nut width in mm if mentioned; otherwise leave empty.",
+    "fretboard_material": "Extract the fretboard material if present; otherwise leave empty.",
+    "neck_material": "Extract the neck material if present; otherwise leave empty.",
+    "tuning_machines": "Extract the tuning machines type/brand if present; otherwise leave empty.",
+    "controls": "Extract the controls layout (e.g. volume/tone) if described; otherwise leave empty.",
+    "finish": "Extract the finish description if present; otherwise leave empty.",
+    "top_material": "Extract the top wood/material if present; otherwise leave empty.",
+}
+
+REGEX_DETECTION_PATTERNS: Mapping[str, dict] = {
+    "scale": {
+        "attribute": "scale_mensur",
+        "pattern": re.compile(r"(?<!\\d)(24\\.75|25\\.5|34|30)(?:\"| inch|”)", re.IGNORECASE),
+        "formatter": lambda match: f"{match.group(1)}\"",
+    },
+    "radius": {
+        "attribute": "neck_radius",
+        "pattern": re.compile(r"(7\\.25|9\\.5|10|12|14|16)\"?", re.IGNORECASE),
+        "formatter": lambda match: f"{match.group(1)}\"",
+    },
+    "nut": {
+        "attribute": "neck_nutwidth",
+        "pattern": re.compile(r"(38|40|42|43|45)\s?mm", re.IGNORECASE),
+        "formatter": lambda match: f"{match.group(1)}mm",
+    },
+    "pickup_config": {
+        "attribute": "pickup_config",
+        "pattern": re.compile(r"\b(H/H|HH|HSS|SSS|HS|P|PJ|MM)\b"),
+        "formatter": lambda match: match.group(1),
+    },
+    "pickup_models": {
+        "attribute": None,
+        "pattern": re.compile(
+            r"(Seymour Duncan [A-Za-z0-9 \-]+|DiMarzio [A-Za-z0-9 \-]+|Fender [A-Za-z0-9 \-]+|EMG [A-Z0-9\-]+)",
+            re.IGNORECASE,
+        ),
+        "formatter": lambda match: match.group(1),
+    },
+    "bridges": {
+        "attribute": "bridge",
+        "pattern": re.compile(
+            r"(Floyd Rose|Tune-o-matic|Hardtail|6-saddle|2-point|Bigsby)",
+            re.IGNORECASE,
+        ),
+        "formatter": lambda match: match.group(1),
+    },
+    "materials": {
+        "attribute": None,
+        "pattern": re.compile(r"\b(Maple|Rosewood|Ebony|Alder|Ash|Mahogany)\b", re.IGNORECASE),
+        "formatter": lambda match: match.group(1).title(),
+    },
+}
+
+MATERIAL_ALIAS_MAP: Mapping[str, str] = {"rosewood": "Indian Rosewood"}
+
+def _load_brand_lexicon() -> dict[str, object]:
+    path = Path(__file__).with_name("brand_lexicon.json")
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as fp:
+            data = json.load(fp)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if isinstance(data, dict):
+        return data
+    return {}
+
+
+BRAND_LEXICON: Mapping[str, object] = _load_brand_lexicon()
+
 AI_RULES_TEXT = (
     "Ты помощник по каталогизации гитар. Используй входные данные, чтобы заполнить "
-    "пропущенные атрибуты товара. Всегда отвечай JSON вида "
-    "{\"attributes\":[{\"code\":...,\"value\":...,\"reason\":...}]}. Правила:\n"
-    "- Бренд и название набора атрибутов помогают подобрать категории по совпадению "
-    "названий; если нет уверенности — оставляй поле пустым.\n"
-    "- Ищи упоминания серии и модели в названии, используй их в подсказках.\n"
-    "- Соотносить модели Telecaster→T-Style, Stratocaster→S-Style, Les Paul→Single cut, "
-    "SG→Double cut.\n"
-    "- При наличии T-Style добавляй также Single cut; при наличии S-Style добавляй "
-    "Double cut.\n"
-    "- Значения мультиселектов представляй как массив строк, без дублей.\n"
-    "- Булевы значения задавай как true/false.\n"
-    "- Для категорий используй текстовые лейблы.\n"
-    "- Если данных недостаточно — возвращай пустое значение."
+    "пропущенные атрибуты товара. Всегда отвечай валидным JSON без комментариев "
+    "в формате {\"attributes\":[{...}]}. Строгая схема элемента массива:\n"
+    "- code — строка с кодом атрибута.\n"
+    "- value — строка, число, булево или массив строк без пустых значений.\n"
+    "- reason — короткое пояснение на русском, почему выбранное значение уместно.\n"
+    "- evidence — дословная выдержка (5–60 символов) из исходного текста, где найдено значение.\n"
+    "Если данных недостаточно, оставляй value пустым (\"\" или []), а reason и evidence поясняй, "
+    "что информации нет.\n"
+    "Используй hints.regex_hits и hints.brand_lexicon как подсказки, но проверяй, что текст "
+    "действительно подтверждает значение.\n"
+    "Соотносить модели Telecaster→T-Style, Stratocaster→S-Style, Les Paul→Single cut, SG→Double cut.\n"
+    "При наличии T-Style добавляй также Single cut; при наличии S-Style добавляй Double cut.\n"
+    "Значения мультиселектов представляй как массив строк без дублей, булевы атрибуты — true/false.\n"
+    "Для категорий используй текстовые лейблы.\n"
+    "Пример 1:\n"
+    "Вход → name: \"Fender Player Stratocaster\", hints.regex_hits.scale: 25.5\"\n"
+    "Ответ → {\"attributes\":[{\"code\":\"scale_mensur\",\"value\":\"25.5\"\",\"reason\":\"Стандартная мензура для Player Stratocaster\",\"evidence\":\"scale length 25.5\"\"}]}\n"
+    "Пример 2:\n"
+    "Вход → description содержит \"Mahogany body\"\n"
+    "Ответ → {\"attributes\":[{\"code\":\"body_material\",\"value\":\"Mahogany\",\"reason\":\"В описании указано дерево корпуса\",\"evidence\":\"Mahogany body\"}]}\n"
 )
 
 AI_RULES_HASH = hashlib.sha256(AI_RULES_TEXT.encode("utf-8")).hexdigest()
@@ -262,6 +368,340 @@ def _ensure_list_of_strings(value: object) -> list[str]:
         return result
     text = str(value).strip()
     return [text] if text else []
+
+
+def _custom_attributes_map(product: Mapping[str, object] | None) -> dict[str, object]:
+    mapping: dict[str, object] = {}
+    if not isinstance(product, Mapping):
+        return mapping
+    custom_attrs = product.get("custom_attributes")
+    if not isinstance(custom_attrs, Iterable):
+        return mapping
+    for attr in custom_attrs:
+        if not isinstance(attr, Mapping):
+            continue
+        code = attr.get("attribute_code")
+        if not isinstance(code, str) or not code:
+            continue
+        mapping[code] = attr.get("value")
+    return mapping
+
+
+def _collect_product_texts(
+    product: Mapping[str, object] | None,
+    custom_attrs: Mapping[str, object],
+) -> list[str]:
+    texts: list[str] = []
+    candidates: list[object] = []
+    if isinstance(product, Mapping):
+        candidates.extend(
+            [
+                product.get("name"),
+                product.get("sku"),
+                product.get("meta_title"),
+            ]
+        )
+    candidates.extend(
+        [
+            custom_attrs.get("short_description"),
+            custom_attrs.get("description"),
+            custom_attrs.get("meta_title"),
+            custom_attrs.get("meta_keyword"),
+            custom_attrs.get("meta_description"),
+        ]
+    )
+    seen: Set[str] = set()
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        text = _strip_html(candidate)
+        if not text:
+            continue
+        lowered = text.casefold()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        texts.append(text)
+    return texts
+
+
+def _build_evidence_snippet(text: str, start: int, end: int, pad: int = 30) -> str:
+    left = max(start - pad, 0)
+    right = min(end + pad, len(text))
+    snippet = text[left:right].strip()
+    return snippet[:120]
+
+
+def _detect_regex_hits(texts: Iterable[str]) -> dict[str, list[dict[str, str]]]:
+    hits: dict[str, list[dict[str, str]]] = {}
+    for raw_text in texts:
+        if not isinstance(raw_text, str) or not raw_text.strip():
+            continue
+        for key, spec in REGEX_DETECTION_PATTERNS.items():
+            pattern = spec.get("pattern")
+            if not isinstance(pattern, re.Pattern):
+                continue
+            for match in pattern.finditer(raw_text):
+                value = match.group(0)
+                formatter = spec.get("formatter")
+                if callable(formatter):
+                    try:
+                        value = formatter(match)
+                    except Exception:
+                        value = match.group(0)
+                evidence = _build_evidence_snippet(raw_text, match.start(), match.end())
+                entry: dict[str, str] = {"value": str(value), "evidence": evidence}
+                attribute = spec.get("attribute")
+                if isinstance(attribute, str) and attribute:
+                    entry["attribute"] = attribute
+                hits.setdefault(key, []).append(entry)
+    for key, entries in hits.items():
+        deduped: list[dict[str, str]] = []
+        seen_values: Set[str] = set()
+        for entry in entries:
+            value = entry.get("value")
+            if not isinstance(value, str):
+                continue
+            normalized = value.casefold()
+            if normalized in seen_values:
+                continue
+            seen_values.add(normalized)
+            deduped.append(entry)
+        hits[key] = deduped
+    return hits
+
+
+def _match_brand_lexicon(
+    brand_hint: Optional[str],
+    texts: Iterable[str],
+) -> tuple[dict[str, object], dict[str, object]]:
+    if not brand_hint:
+        return {}, {}
+    brand_canonical: Optional[str] = None
+    brand_payload: Mapping[str, object] | None = None
+    for candidate, payload in BRAND_LEXICON.items():
+        if not isinstance(candidate, str):
+            continue
+        if candidate.casefold() == str(brand_hint).casefold():
+            brand_canonical = candidate
+            if isinstance(payload, Mapping):
+                brand_payload = payload
+            break
+    if brand_payload is None:
+        return {}, {}
+    normalized_texts = [str(text).casefold() for text in texts if isinstance(text, str)]
+    series_hits: list[str] = []
+    if isinstance(brand_payload.get("series"), Iterable):
+        for series in brand_payload.get("series", []):
+            if not isinstance(series, str) or not series.strip():
+                continue
+            lowered = series.casefold()
+            if any(lowered in text for text in normalized_texts):
+                series_hits.append(series)
+    attribute_candidates: dict[str, list[str]] = {}
+    model_hits: list[dict[str, object]] = []
+    models_payload = brand_payload.get("models")
+    if isinstance(models_payload, Mapping):
+        for model_name, attrs in models_payload.items():
+            if not isinstance(model_name, str) or not model_name.strip():
+                continue
+            lowered = model_name.casefold()
+            if not any(lowered in text for text in normalized_texts):
+                continue
+            attributes_map: dict[str, object] = {}
+            if isinstance(attrs, Mapping):
+                for attr_code, attr_value in attrs.items():
+                    if attr_code == "pickups" and isinstance(attr_value, Mapping):
+                        for pickup_code, pickup_value in attr_value.items():
+                            if not isinstance(pickup_code, str):
+                                continue
+                            values_list = _ensure_list_of_strings(pickup_value)
+                            if values_list:
+                                attribute_candidates.setdefault(pickup_code, []).extend(
+                                    values_list
+                                )
+                                attributes_map[pickup_code] = values_list
+                    elif isinstance(attr_code, str):
+                        values_list = _ensure_list_of_strings(attr_value)
+                        if values_list:
+                            attribute_candidates.setdefault(attr_code, []).extend(
+                                values_list
+                            )
+                            attributes_map[attr_code] = values_list
+            if attributes_map:
+                model_hits.append(
+                    {
+                        "model": model_name,
+                        "attributes": attributes_map,
+                    }
+                )
+    for attr_code, values in list(attribute_candidates.items()):
+        deduped: list[str] = []
+        seen: Set[str] = set()
+        for value in values:
+            normalized = value.casefold()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(value)
+        attribute_candidates[attr_code] = deduped
+    if not attribute_candidates and not series_hits:
+        return {}, {}
+    hint_payload: dict[str, object] = {
+        "brand": brand_canonical or brand_hint,
+        "series": series_hits,
+        "attributes": attribute_candidates,
+    }
+    hits_payload: dict[str, object] = {
+        "brand": brand_canonical or brand_hint,
+        "series": series_hits,
+        "models": model_hits,
+    }
+    return hint_payload, hits_payload
+
+
+def _normalize_measurement_string(value: str) -> str:
+    normalized = value.replace("”", '\"').replace("″", '\"').replace("“", '"')
+    normalized = re.sub(
+        r"(?P<num>\d+(?:\.\d+)?)\s*(?:inch|inches)",
+        lambda m: f"{m.group('num')}\"",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(
+        r"(?P<num>\d+(?:\.\d+)?)\s*\"",
+        lambda m: f"{m.group('num')}\"",
+        normalized,
+    )
+    normalized = re.sub(
+        r"(?P<num>\d+(?:\.\d+)?)\s*mm",
+        lambda m: f"{m.group('num')}mm",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip()
+
+
+def _apply_material_alias(value: str) -> str:
+    alias = MATERIAL_ALIAS_MAP.get(value.casefold())
+    if alias:
+        return alias
+    return value
+
+
+def _map_to_meta_option(
+    session: requests.Session,
+    api_base: str,
+    code: str,
+    value: str,
+) -> tuple[str, Optional[str]]:
+    meta = get_attribute_meta(session, api_base, code) or {}
+    options = meta.get("options")
+    if not isinstance(options, list) or not options:
+        return value, None
+
+    def _normalize(text: object) -> str:
+        return re.sub(r"\s+", " ", str(text or "").casefold()).strip()
+
+    normalized_value = _normalize(value)
+    if not normalized_value:
+        return value, None
+
+    best_label: Optional[str] = None
+    best_score: tuple[int, int] | None = None
+    for option in options:
+        if not isinstance(option, Mapping):
+            continue
+        label = option.get("label")
+        opt_value = option.get("value")
+        normalized_label = _normalize(label)
+        normalized_opt_value = _normalize(opt_value)
+        if normalized_value == normalized_label or normalized_value == normalized_opt_value:
+            best_label = str(label or opt_value or value).strip()
+            best_score = (0, len(normalized_label))
+            break
+        if normalized_label and normalized_label in normalized_value:
+            score = (1, -len(normalized_label))
+            if best_score is None or score < best_score:
+                best_score = score
+                best_label = str(label or value).strip()
+        elif normalized_value and normalized_value in normalized_label:
+            score = (2, len(normalized_value))
+            if best_score is None or score < best_score:
+                best_score = score
+                best_label = str(label or value).strip()
+        elif normalized_value and normalized_value in normalized_opt_value:
+            score = (3, len(normalized_value))
+            if best_score is None or score < best_score:
+                best_score = score
+                best_label = str(label or value).strip()
+    if best_label:
+        return best_label, best_label
+    return value, None
+
+
+def _postprocess_suggestions(
+    suggestions_map: dict[str, dict[str, object]],
+    session: requests.Session,
+    api_base: str,
+) -> list[dict[str, object]]:
+    adjustments: list[dict[str, object]] = []
+    for code, payload in suggestions_map.items():
+        if not isinstance(payload, Mapping):
+            continue
+        value = payload.get("value")
+        if value in (None, ""):
+            continue
+        updated_value = value
+        change_reason: Optional[str] = None
+        if isinstance(value, str):
+            normalized = _normalize_measurement_string(value)
+            normalized = _apply_material_alias(normalized)
+            mapped_value, mapped_reason = _map_to_meta_option(session, api_base, code, normalized)
+            updated_value = mapped_value
+            change_reason = mapped_reason
+            if mapped_value != normalized:
+                change_reason = mapped_reason or "meta_mapping"
+            elif normalized != value:
+                change_reason = "normalized"
+        elif isinstance(value, (list, tuple, set)):
+            normalized_items: list[str] = []
+            for item in value:
+                if not isinstance(item, str):
+                    item_text = str(item)
+                else:
+                    item_text = item
+                item_normalized = _normalize_measurement_string(item_text)
+                item_normalized = _apply_material_alias(item_normalized)
+                mapped_value, mapped_reason = _map_to_meta_option(
+                    session, api_base, code, item_normalized
+                )
+                normalized_items.append(mapped_value)
+                if mapped_reason:
+                    change_reason = mapped_reason
+                elif item_normalized != item_text:
+                    change_reason = "normalized"
+            deduped_items: list[str] = []
+            seen: Set[str] = set()
+            for item in normalized_items:
+                normalized_key = item.casefold()
+                if normalized_key in seen:
+                    continue
+                seen.add(normalized_key)
+                deduped_items.append(item)
+            updated_value = deduped_items
+        if updated_value != value:
+            payload["value"] = updated_value
+            adjustments.append(
+                {
+                    "code": code,
+                    "from": value,
+                    "to": updated_value,
+                    "reason": change_reason or "normalized",
+                }
+            )
+    return adjustments
 
 
 def _merge_unique(*iterables: Iterable[str]) -> list[str]:
@@ -1081,7 +1521,10 @@ def infer_missing(
     current_attributes: Dict[str, object] = {}
     bool_codes: Set[str] = set()
     missing_codes: Set[str] = set()
-    force_codes: Set[str] = {"categories", "guitarstylemultiplechoice"}
+    force_codes: Set[str] = {"categories", "guitarstylemultiplechoice"} | set(
+        SPEC_FORCE_CODES
+    )
+    postprocess_adjustments: list[dict[str, object]] = []
     global _CATEGORIES_CACHE
 
     for raw_code, row in df_full.iterrows():
@@ -1160,11 +1603,25 @@ def infer_missing(
         | {code for code in missing_codes if code in allowed_set}
     )
 
-    short_desc = ""
-    for attr in product.get("custom_attributes", []) or []:
-        if attr.get("attribute_code") == "short_description":
-            short_desc = _strip_html(attr.get("value"))
-            break
+    custom_attrs_map = _custom_attributes_map(product)
+    short_desc = _strip_html(custom_attrs_map.get("short_description"))
+    long_desc = _strip_html(custom_attrs_map.get("description"))
+    meta_title = _strip_html(custom_attrs_map.get("meta_title"))
+    if not meta_title:
+        meta_title = _strip_html((product or {}).get("meta_title"))
+    vendor_sku = _strip_html(custom_attrs_map.get("vendor_sku"))
+    mpn_value = _strip_html(custom_attrs_map.get("mpn"))
+    ean_value = _strip_html(custom_attrs_map.get("ean"))
+    upc_value = _strip_html(custom_attrs_map.get("upc"))
+    product_texts = _collect_product_texts(product, custom_attrs_map)
+    regex_hits = _detect_regex_hits(product_texts)
+    attributes_raw_payload = product.get("custom_attributes")
+    if isinstance(attributes_raw_payload, list):
+        attributes_raw = attributes_raw_payload
+    elif isinstance(attributes_raw_payload, Iterable):
+        attributes_raw = list(attributes_raw_payload)
+    else:
+        attributes_raw = []
 
     sanitized_hints = _sanitize_hints(hints)
     attribute_set_name = sanitized_hints.get("attribute_set_name") or sanitized_hints.get(
@@ -1183,10 +1640,34 @@ def infer_missing(
         if guessed_brand:
             sanitized_hints["brand_hint"] = guessed_brand
 
+    if regex_hits:
+        sanitized_hints["regex_hits"] = regex_hits
+
+    brand_hint_values = _ensure_list_of_strings(sanitized_hints.get("brand_hint"))
+    brand_for_lexicon: Optional[str] = brand_hint_values[0] if brand_hint_values else None
+    if not brand_for_lexicon and isinstance(brand_current, str) and brand_current.strip():
+        brand_for_lexicon = str(brand_current).strip()
+    brand_lexicon_hint, brand_lexicon_hits = _match_brand_lexicon(
+        brand_for_lexicon,
+        product_texts,
+    )
+    if brand_lexicon_hint:
+        sanitized_hints["brand_lexicon"] = brand_lexicon_hint
+
+    description_payload = long_desc or short_desc
+
     user_payload = {
         "sku": product.get("sku"),
         "name": product.get("name"),
-        "description": short_desc,
+        "short_description": short_desc,
+        "description": description_payload,
+        "meta_title": meta_title,
+        "vendor_sku": vendor_sku,
+        "mpn": mpn_value,
+        "ean": ean_value,
+        "upc": upc_value,
+        "attributes_raw": attributes_raw,
+        "attributes_raw_map": custom_attrs_map,
         "attribute_set_name": attribute_set_name,
         "current_attributes": current_attributes,
         "ai_codes": ai_codes,
@@ -1220,16 +1701,24 @@ def infer_missing(
         return mapping
 
     suggestions_map = _df_to_code_map(ai_df)
+    if suggestions_map:
+        postprocess_adjustments.extend(
+            _postprocess_suggestions(suggestions_map, session, api_base)
+        )
     order: list[str] = list(ai_codes)
     for code in suggestions_map.keys():
         if code not in order:
             order.append(code)
 
     raw_previews: list[str] = [_truncate_preview(raw_content)]
-    remaining_before_retry = [
+    remaining_all = [
         code for code in ai_codes if _is_blank(suggestions_map.get(code, {}).get("value"))
     ]
+    spec_missing = [code for code in SPEC_FORCE_CODES if code in remaining_all]
+    remaining_before_retry = spec_missing or remaining_all
     retried = False
+    retry_questions: dict[str, str] = {}
+    retry_context: dict[str, object] | None = None
 
     if remaining_before_retry:
         context_already_found = {
@@ -1240,9 +1729,23 @@ def infer_missing(
         brand_hint_values = _ensure_list_of_strings(sanitized_hints.get("brand_hint"))
         if brand_hint_values and _is_blank(context_already_found.get("brand")):
             context_already_found["brand"] = brand_hint_values[0]
+        if regex_hits:
+            context_already_found["regex_hits"] = regex_hits
+        if brand_lexicon_hint:
+            context_already_found["brand_lexicon"] = brand_lexicon_hint
+        retry_context = context_already_found
+        retry_questions = {
+            code: SPEC_CODE_QUESTIONS.get(
+                code,
+                f"Extract the value for {code} if present; otherwise leave empty.",
+            )
+            for code in remaining_before_retry
+        }
         retry_payload = dict(user_payload)
         retry_payload["context_already_found"] = context_already_found
         retry_payload["remaining_codes"] = remaining_before_retry
+        if retry_questions:
+            retry_payload["questions"] = retry_questions
         retry_json = json.dumps(retry_payload, ensure_ascii=False)
         completion_retry, raw_retry = _openai_complete(conv, retry_json, api_key, model=model)
         retry_attributes = (
@@ -1266,6 +1769,10 @@ def infer_missing(
             if code not in order:
                 order.append(code)
         retried = True
+        if suggestions_map:
+            postprocess_adjustments.extend(
+                _postprocess_suggestions(suggestions_map, session, api_base)
+            )
 
     final_rows: list[dict[str, object]] = []
     for code in order:
@@ -1298,6 +1805,13 @@ def infer_missing(
         "used_hints": sanitized_hints,
         "retried": retried,
         "remaining_before_retry": remaining_before_retry,
+        "remaining_all_codes": remaining_all,
+        "spec_missing": spec_missing,
+        "retry_questions": retry_questions,
+        "retry_context": retry_context,
+        "regex_hits": regex_hits,
+        "brand_lexicon_hits": brand_lexicon_hits,
+        "postprocess_adjustments": postprocess_adjustments,
         "raw_response_preview": "\n".join(previews_for_log),
     }
     result_df.attrs["meta"] = metadata

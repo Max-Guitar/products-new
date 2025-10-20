@@ -1526,16 +1526,20 @@ def _collect_ai_suggestions_log(
                     str(set_id), sku_key, normalized_key
                 ) not in valid_cells:
                     continue
-                value = (
-                    payload.get("value")
-                    if isinstance(payload, dict)
-                    else payload
-                )
+                value = payload.get("value") if isinstance(payload, dict) else payload
                 if value in (None, ""):
                     continue
                 if isinstance(value, (list, tuple, set)) and not value:
                     continue
-                suggestions_log.setdefault(sku_key, {})[normalized_key] = value
+                entry: dict[str, object] = {"value": value}
+                if isinstance(payload, dict):
+                    reason = payload.get("reason")
+                    if reason not in (None, ""):
+                        entry["reason"] = reason
+                    evidence = payload.get("evidence")
+                    if evidence not in (None, ""):
+                        entry["evidence"] = evidence
+                suggestions_log.setdefault(sku_key, {})[normalized_key] = entry
 
     if suggestions_log:
         suggestions_log = dict(sorted(suggestions_log.items(), key=lambda item: item[0]))
@@ -2258,10 +2262,13 @@ def build_attributes_df(
                     if isinstance(value, str) and not value.strip():
                         continue
                     reason = suggestion.get("reason")
-                    per_sku[str(code)] = {
-                        "value": value,
-                        "reason": reason,
-                    }
+                    evidence = suggestion.get("evidence")
+                    entry_payload: dict[str, object] = {"value": value}
+                    if reason not in (None, ""):
+                        entry_payload["reason"] = reason
+                    if evidence not in (None, ""):
+                        entry_payload["evidence"] = evidence
+                    per_sku[str(code)] = entry_payload
 
     return (
         dfs,
