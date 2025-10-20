@@ -14,7 +14,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from urllib.parse import quote
 import re
 
@@ -39,7 +39,9 @@ from services.ai_fill import (
     HTMLResponseError,
     collect_attributes_table,
     compute_allowed_attrs,
+    derive_styles_from_texts,
     get_attribute_sets_map,
+    get_ai_conversation,
     get_product_by_sku,
     infer_missing,
     probe_api_base,
@@ -1031,11 +1033,20 @@ def _apply_ai_suggestions_to_wide(
         if not isinstance(attrs, dict):
             continue
         sku_value = str(raw_sku)
+        attrs_payload = dict(attrs)
+        meta_payload = attrs_payload.pop("__meta__", None)
+        if isinstance(meta_payload, Mapping):
+            meta_entry = {"sku": sku_value}
+            for key, value in meta_payload.items():
+                if value is None:
+                    continue
+                meta_entry[key] = value
+            ai_log.append(meta_entry)
         row_mask = updated[sku_col].astype(str) == sku_value
         if not row_mask.any():
             continue
         row_indices = updated.index[row_mask]
-        for code, payload in attrs.items():
+        for code, payload in attrs_payload.items():
             code_key = str(code)
             if code_key not in updated.columns:
                 continue
@@ -1708,6 +1719,123 @@ def build_wide_colcfg(
     return cfg
 
 
+def _unique_preserve_str(values: Iterable[object]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values or []:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        key = text.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+    return result
+
+
+def _extract_attr_text(attr_rows: Mapping[str, dict], code: str) -> str:
+    entry = attr_rows.get(code) if isinstance(attr_rows, Mapping) else None
+    if not isinstance(entry, Mapping):
+        return ""
+    label = entry.get("label")
+    if isinstance(label, str) and label.strip():
+        return label.strip()
+    raw_value = entry.get("raw_value")
+    if isinstance(raw_value, str) and raw_value.strip():
+        return raw_value.strip()
+    if raw_value not in (None, "", []):
+        return str(raw_value)
+    return ""
+
+
+def _match_category_hint(
+    candidate: str,
+    labels_to_values: Mapping[str, object],
+    values_to_labels: Mapping[str, str],
+) -> str | None:
+    if not isinstance(candidate, str):
+        return None
+    normalized = _norm_label(candidate)
+    if not normalized:
+        return None
+    value_key = None
+    if isinstance(labels_to_values, Mapping):
+        for lookup in (candidate, candidate.casefold(), normalized):
+            if lookup in labels_to_values:
+                value_key = labels_to_values[lookup]
+                break
+    if value_key is None:
+        return None
+    if isinstance(values_to_labels, Mapping):
+        resolved = values_to_labels.get(str(value_key)) or values_to_labels.get(value_key)
+        if isinstance(resolved, str) and resolved.strip():
+            return resolved.strip()
+    return str(candidate).strip() or None
+
+
+def _extract_model_series_from_name(name: object) -> list[str]:
+    if not isinstance(name, str):
+        return []
+    pattern = re.compile(r"\b(series|model)\b[:#-]?\s*([A-Za-z0-9][A-Za-z0-9 '\-/&]+)", re.I)
+    candidates: list[str] = []
+    for match in pattern.finditer(name):
+        candidate = match.group(2).strip()
+        candidate = re.split(r"[()\[\],]| with | featuring | includes ", candidate)[0]
+        candidate = candidate.strip("-:/ ")
+        if candidate:
+            candidates.append(candidate)
+    return _unique_preserve_str(candidates)
+
+
+def _build_ai_hints(
+    attr_rows: Mapping[str, dict],
+    set_name: str,
+    product: Mapping[str, object],
+    labels_to_values: Mapping[str, object],
+    values_to_labels: Mapping[str, str],
+) -> dict[str, object]:
+    hints: dict[str, object] = {}
+    set_name_clean = str(set_name).strip() if isinstance(set_name, str) else ""
+    if set_name_clean:
+        hints["attribute_set_name"] = set_name_clean
+
+    brand_text = _extract_attr_text(attr_rows, "brand")
+    brand_hint = _match_category_hint(brand_text, labels_to_values, values_to_labels)
+    if brand_hint:
+        hints["brand_hint"] = brand_hint
+
+    set_hint = _match_category_hint(set_name_clean, labels_to_values, values_to_labels)
+    if set_hint:
+        hints["set_hint"] = set_hint
+
+    candidates: list[str] = []
+    for key in ("model", "series"):
+        text = _extract_attr_text(attr_rows, key)
+        if text:
+            candidates.append(text)
+    candidates.extend(
+        _extract_model_series_from_name(product.get("name"))
+        if isinstance(product, Mapping)
+        else []
+    )
+    candidates = _unique_preserve_str(candidates)
+    if candidates:
+        hints["model_series_candidates"] = candidates
+
+    style_texts = list(candidates)
+    product_name = product.get("name") if isinstance(product, Mapping) else None
+    if isinstance(product_name, str) and product_name.strip():
+        style_texts.append(product_name)
+    style_hints = derive_styles_from_texts(style_texts)
+    if style_hints:
+        hints["style_hint"] = style_hints
+
+    return hints
+
+
 def build_attributes_df(
     df_changed: pd.DataFrame,
     session,
@@ -1752,6 +1880,15 @@ def build_attributes_df(
         normalized_values_to_labels[str(raw_value)] = label_text
     cat_values_to_labels = normalized_values_to_labels
     cats_meta["values_to_labels"] = cat_values_to_labels
+    labels_to_values_map = cats_meta.get("labels_to_values") or {}
+    if not isinstance(labels_to_values_map, dict):
+        labels_to_values_map = {}
+    if not labels_to_values_map:
+        stored_meta = st.session_state.get("categories_meta")
+        if isinstance(stored_meta, dict):
+            alt_map = stored_meta.get("labels_to_values")
+            if isinstance(alt_map, dict):
+                labels_to_values_map = alt_map
     if isinstance(meta_cache, AttributeMetaCache):
         try:
             meta_cache.set_static("categories", cats_meta)
@@ -1775,11 +1912,12 @@ def build_attributes_df(
 
     ai_enabled = bool(ai_api_key)
     ai_requests: list[
-        tuple[int, str, dict, pd.DataFrame, list[str]]
+        tuple[int, str, dict, pd.DataFrame, list[str], dict[str, object]]
     ] = []
     ai_results: dict[int, dict[str, dict[str, dict[str, object]]]] = defaultdict(dict)
     ai_errors: list[str] = []
     ai_model_name = ai_model or "gpt-5-mini"
+    ai_conv = get_ai_conversation(ai_model_name) if ai_enabled else None
 
     for _, row in df_changed.iterrows():
         sku_value = str(row.get("sku", "")).strip()
@@ -1866,6 +2004,17 @@ def build_attributes_df(
                 attr_rows["condition"] = {"label": inferred, "raw_value": inferred}
                 _force_mark(sku_value, "condition")
 
+        hints_payload: dict[str, object] = {}
+        if ai_enabled:
+            set_name_label = set_names.get(attr_set_id_int, "")
+            hints_payload = _build_ai_hints(
+                attr_rows,
+                set_name_label,
+                product,
+                labels_to_values_map,
+                cat_values_to_labels,
+            )
+
         force_codes = {"categories", "guitarstylemultiplechoice"}
         bool_codes = {
             c
@@ -1899,6 +2048,7 @@ def build_attributes_df(
                     product,
                     df_full.copy(deep=True),
                     list(ai_codes),
+                    hints_payload,
                 )
             )
 
@@ -2021,7 +2171,14 @@ def build_attributes_df(
 
     if ai_enabled and ai_requests:
         with st.spinner("🤖 Generating AI suggestions…"):
-            for set_id, sku_value, product_data, df_full, editor_codes in ai_requests:
+            for (
+                set_id,
+                sku_value,
+                product_data,
+                df_full,
+                editor_codes,
+                hints_payload,
+            ) in ai_requests:
                 try:
                     ai_df = infer_missing(
                         product_data,
@@ -2030,6 +2187,8 @@ def build_attributes_df(
                         api_base,
                         editor_codes,
                         ai_api_key,
+                        conv=ai_conv,
+                        hints=hints_payload,
                         model=ai_model_name,
                     )
                 except Exception as exc:  # pragma: no cover - network error handling
@@ -2038,10 +2197,16 @@ def build_attributes_df(
                     ai_errors.append(error_message)
                     continue
 
+                sku_key = str(sku_value)
+                per_sku = ai_results.setdefault(set_id, {}).setdefault(sku_key, {})
+
+                metadata = getattr(ai_df, "attrs", {}).get("meta") if hasattr(ai_df, "attrs") else None
+                if isinstance(metadata, dict) and metadata:
+                    per_sku["__meta__"] = metadata
+
                 if not isinstance(ai_df, pd.DataFrame) or ai_df.empty:
                     continue
 
-                sku_key = str(sku_value)
                 for _, suggestion in ai_df.iterrows():
                     code = suggestion.get("code")
                     if not code:
@@ -2052,9 +2217,7 @@ def build_attributes_df(
                     if isinstance(value, str) and not value.strip():
                         continue
                     reason = suggestion.get("reason")
-                    ai_results.setdefault(set_id, {}).setdefault(sku_key, {})[
-                        str(code)
-                    ] = {
+                    per_sku[str(code)] = {
                         "value": value,
                         "reason": reason,
                     }
