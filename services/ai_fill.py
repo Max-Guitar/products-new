@@ -355,6 +355,10 @@ AI_RULES_TEXT = (
     "Нормализуй стили: Telecaster→T-Style, Stratocaster→S-Style, Les Paul→Single cut, SG→Double cut; "
     "для T-Style добавляй Single cut, для S-Style — Double cut.\n"
     "Мультиселекты возвращай массивом уникальных строк, булевы — true/false. Для категорий используй текстовые лейблы.\n"
+    "- For bass guitars, the default number of strings (no_strings) is never 6.\n"
+    "  Most basses have 4 or 5 strings, 6 is rare.\n"
+    "  Always check product name, model, or description for a digit 4/5/6 near the word \"string(s)\" or \"bass\".\n"
+    "  If no explicit count found and it’s a bass guitar, prefer 4.\n"
     "Пример 1:\n"
     "Вход → name: \"Fender Player Stratocaster\", hints.regex_hits.scale: 25.5\"\n"
     "Ответ → {\"attributes\":[{\"code\":\"scale_mensur\",\"value\":\"25.5\"\",\"reason\":\"Стандартная мензура для Player Stratocaster\",\"evidence\":\"scale length 25.5\"\"}]}\n"
@@ -1522,6 +1526,7 @@ def enrich_ai_suggestions(
     categories_meta: Mapping[str, object] | None,
     attribute_set_name: str | None,
     set_id: object | None,
+    product: Mapping[str, object] | None = None,
 ) -> pd.DataFrame:
     """Post-process AI suggestions with deterministic hints and cascades."""
 
@@ -1550,6 +1555,43 @@ def enrich_ai_suggestions(
                 value = None
             cleaned[key] = value
         by_code[code_key] = cleaned
+
+    set_name_cf = str(attribute_set_name or "").casefold()
+    bass_hint_flag = bool(normalized_hints.get("bass_hint"))
+    product_name_text = ""
+    if isinstance(product, Mapping):
+        product_name_text = str(product.get("name", ""))
+    is_bass_item = "bass" in set_name_cf or bass_hint_flag
+    auto_no_strings_value: str | None = None
+    if is_bass_item:
+        entry = by_code.get("no_strings")
+        existing_value = entry.get("value") if isinstance(entry, Mapping) else None
+        existing_value_str = ""
+        if isinstance(existing_value, str):
+            existing_value_str = existing_value.strip()
+        elif isinstance(existing_value, (int, float)):
+            existing_value_str = str(existing_value)
+        elif isinstance(existing_value, (list, tuple, set)):
+            cleaned_items = [
+                str(item).strip()
+                for item in existing_value
+                if not _is_blank(item)
+            ]
+            if cleaned_items:
+                existing_value_str = cleaned_items[0]
+        should_override = _is_blank(existing_value) or existing_value_str == "6"
+        if should_override:
+            tokens = [token.strip() for token in product_name_text.split()] if product_name_text else []
+            has_five = "5" in product_name_text
+            has_v_token = any(token.upper() == "V" for token in tokens)
+            suggested_value = "5" if has_five or has_v_token else "4"
+            entry = by_code.setdefault("no_strings", {"code": "no_strings"})
+            entry["value"] = suggested_value
+            entry.pop("evidence", None)
+            entry["reason"] = "enriched_bass_default"
+            if "no_strings" not in order:
+                order.append("no_strings")
+            auto_no_strings_value = suggested_value
 
     # Categories enrichment with brand/set hints
     categories_meta = categories_meta if isinstance(categories_meta, Mapping) else {}
@@ -1681,7 +1723,7 @@ def enrich_ai_suggestions(
         elif not _is_blank(value):
             candidate_texts.append(str(value))
 
-    set_name_cf = str(attribute_set_name or "").casefold()
+    # set_name_cf already computed above
     try:
         set_id_int = int(set_id) if set_id not in (None, "") else None
     except (TypeError, ValueError):
@@ -1748,6 +1790,9 @@ def enrich_ai_suggestions(
     if brand_hint_meta is None and brand_hint_values:
         brand_hint_meta = brand_hint_values[0]
     meta_payload["brand_hint"] = brand_hint_meta
+    meta_payload["bass_hint"] = bool(is_bass_item)
+    if auto_no_strings_value is not None:
+        meta_payload["no_strings_auto"] = auto_no_strings_value
     meta_payload["normalized_categories_added"] = normalized_categories_added
     original_attrs["meta"] = meta_payload
     result_df.attrs = original_attrs
@@ -1772,7 +1817,11 @@ def infer_missing(
     current_attributes: Dict[str, object] = {}
     bool_codes: Set[str] = set()
     missing_codes: Set[str] = set()
-    force_codes: Set[str] = {"categories", "guitarstylemultiplechoice"} | set(
+    force_codes: Set[str] = {
+        "categories",
+        "guitarstylemultiplechoice",
+        "no_strings",
+    } | set(
         SPEC_FORCE_CODES
     )
     postprocess_adjustments: list[dict[str, object]] = []
@@ -1866,6 +1915,18 @@ def infer_missing(
     upc_value = _strip_html(custom_attrs_map.get("upc"))
     product_texts = _collect_product_texts(product, custom_attrs_map)
     regex_hits = _detect_regex_hits(product_texts)
+    if not isinstance(regex_hits, dict):
+        regex_hits = {}
+    full_text_parts: list[str] = [
+        str(text)
+        for text in product_texts
+        if isinstance(text, str) and text.strip()
+    ]
+    if full_text_parts:
+        full_text = " \n".join(full_text_parts)
+        m = re.search(r"(\d)\s*(?:string|strings)", full_text, re.IGNORECASE)
+        if m:
+            regex_hits["no_strings"] = m.group(1)
     attributes_raw_payload = product.get("custom_attributes")
     if isinstance(attributes_raw_payload, list):
         attributes_raw = attributes_raw_payload
@@ -1874,7 +1935,24 @@ def infer_missing(
     else:
         attributes_raw = []
 
-    sanitized_hints = _sanitize_hints(hints)
+    if isinstance(hints, Mapping):
+        hints_payload = dict(hints)
+    else:
+        hints_payload = {}
+
+    attribute_set_hint = (
+        hints_payload.get("attribute_set_name")
+        or hints_payload.get("set_hint")
+        or ""
+    )
+    product_name_text = ""
+    if isinstance(product, Mapping):
+        product_name_text = str(product.get("name", ""))
+    is_bass_product = "bass" in str(attribute_set_hint).lower() or "bass" in product_name_text.lower()
+    if is_bass_product:
+        hints_payload.setdefault("bass_hint", True)
+
+    sanitized_hints = _sanitize_hints(hints_payload)
     attribute_set_name = sanitized_hints.get("attribute_set_name") or sanitized_hints.get(
         "set_hint"
     )
