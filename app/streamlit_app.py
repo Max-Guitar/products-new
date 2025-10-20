@@ -786,7 +786,11 @@ def apply_wide_edits_to_long(
             continue
         if code not in wide_indexed.columns:
             continue
-        updated.at[row_idx, "value"] = wide_indexed.at[sku, code]
+        raw_value = wide_indexed.at[sku, code]
+        if isinstance(raw_value, list):
+            updated.at[row_idx, "value"] = ", ".join(str(v) for v in raw_value)
+        else:
+            updated.at[row_idx, "value"] = raw_value
 
     return updated
 
