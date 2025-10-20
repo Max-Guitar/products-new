@@ -344,6 +344,80 @@ def _split_multiselect_input(values) -> list[str]:
     return [item for item in iterable if item]
 
 
+def _collect_meta_option_lookups(
+    meta: Mapping | None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Return lookups for option labels and values from attribute metadata."""
+
+    labels_lookup: dict[str, str] = {}
+    values_lookup: dict[str, str] = {}
+
+    if not isinstance(meta, Mapping):
+        return labels_lookup, values_lookup
+
+    raw_labels_to_values = meta.get("labels_to_values")
+    if isinstance(raw_labels_to_values, Mapping):
+        for raw_label, mapped_value in raw_labels_to_values.items():
+            if isinstance(raw_label, str):
+                label_text = raw_label.strip()
+            else:
+                label_text = str(raw_label).strip()
+            if not label_text:
+                continue
+            canonical = label_text
+            labels_lookup.setdefault(label_text, canonical)
+            labels_lookup.setdefault(label_text.casefold(), canonical)
+            if mapped_value not in (None, ""):
+                value_key = str(mapped_value).strip()
+                if value_key:
+                    values_lookup.setdefault(value_key, canonical)
+                    values_lookup.setdefault(value_key.casefold(), canonical)
+
+    if not labels_lookup:
+        raw_values_to_labels = meta.get("values_to_labels")
+        if isinstance(raw_values_to_labels, Mapping):
+            for raw_value, raw_label in raw_values_to_labels.items():
+                if isinstance(raw_label, str):
+                    label_text = raw_label.strip()
+                else:
+                    label_text = str(raw_label).strip()
+                if not label_text:
+                    continue
+                canonical = label_text
+                labels_lookup.setdefault(label_text, canonical)
+                labels_lookup.setdefault(label_text.casefold(), canonical)
+                if raw_value not in (None, ""):
+                    value_key = str(raw_value).strip()
+                    if value_key:
+                        values_lookup.setdefault(value_key, canonical)
+                        values_lookup.setdefault(value_key.casefold(), canonical)
+
+    if not labels_lookup:
+        options = meta.get("options")
+        if isinstance(options, list):
+            for option in options:
+                if not isinstance(option, Mapping):
+                    continue
+                raw_label = option.get("label")
+                if isinstance(raw_label, str):
+                    label_text = raw_label.strip()
+                else:
+                    label_text = str(raw_label).strip()
+                if not label_text:
+                    continue
+                canonical = label_text
+                labels_lookup.setdefault(label_text, canonical)
+                labels_lookup.setdefault(label_text.casefold(), canonical)
+                raw_value = option.get("value")
+                if raw_value not in (None, ""):
+                    value_key = str(raw_value).strip()
+                    if value_key:
+                        values_lookup.setdefault(value_key, canonical)
+                        values_lookup.setdefault(value_key.casefold(), canonical)
+
+    return labels_lookup, values_lookup
+
+
 def _norm_label(s: str) -> str:
     if s is None:
         return ""
@@ -974,16 +1048,52 @@ def _apply_ai_suggestions_to_wide(
     meta_cache=None,
     session=None,
     api_base: str | None = None,
-) -> tuple[pd.DataFrame, list[dict[str, object]], list[dict[str, object]]]:
+) -> tuple[
+    pd.DataFrame,
+    list[dict[str, object]],
+    list[dict[str, object]],
+    dict[str, dict[str, list[str]]],
+]:
     if not isinstance(wide_df, pd.DataFrame) or wide_df.empty:
-        return wide_df, [], []
+        return wide_df, [], [], {}
     if not isinstance(suggestions, dict):
-        return wide_df, [], []
+        return wide_df, [], [], {}
 
     updated = wide_df.copy(deep=True)
 
     ai_cells: dict[tuple[str, str], dict[str, object]] = {}
     ai_log: list[dict[str, object]] = []
+    invalid_suggestions: dict[str, dict[str, list[str]]] = {}
+
+    def _record_invalid_option(
+        sku_value: str, code_key: str, labels: Iterable[object]
+    ) -> None:
+        cleaned_labels: list[str] = []
+        for item in labels or []:
+            if item in (None, ""):
+                continue
+            text = str(item).strip()
+            if not text:
+                continue
+            per_code = invalid_suggestions.setdefault(sku_value, {}).setdefault(
+                code_key, []
+            )
+            if text not in per_code:
+                per_code.append(text)
+            cleaned_labels.append(text)
+        if cleaned_labels:
+            log_value: object
+            if len(cleaned_labels) == 1:
+                log_value = cleaned_labels[0]
+            else:
+                log_value = cleaned_labels
+            ai_log.append(
+                {
+                    "sku": sku_value,
+                    "code": code_key,
+                    "ignored_invalid_option": log_value,
+                }
+            )
 
     def _mark_ai_filled(
         container: dict[tuple[str, str], dict[str, object]],
@@ -1029,7 +1139,7 @@ def _apply_ai_suggestions_to_wide(
 
     sku_col = "sku" if "sku" in updated.columns else None
     if not sku_col:
-        return updated, [], []
+        return updated, [], [], {}
 
     for raw_sku, attrs in suggestions.items():
         if not isinstance(attrs, dict):
@@ -1062,27 +1172,7 @@ def _apply_ai_suggestions_to_wide(
                 or meta.get("backend_type")
                 or ""
             ).lower()
-            allowed_multiselect_labels: dict[str, str] | None = None
-            multiselect_values_to_labels: dict[str, str] | None = None
-            if input_type == "multiselect" and isinstance(meta, dict):
-                options = meta.get("options")
-                if isinstance(options, list):
-                    allowed_multiselect_labels = {}
-                    multiselect_values_to_labels = {}
-                    for option in options:
-                        if not isinstance(option, dict):
-                            continue
-                        raw_label = option.get("label")
-                        if not isinstance(raw_label, str):
-                            continue
-                        trimmed_label = raw_label.strip()
-                        if not trimmed_label:
-                            continue
-                        allowed_multiselect_labels[trimmed_label] = trimmed_label
-                        if "value" in option and option["value"] not in (None, ""):
-                            value_text = str(option["value"]).strip()
-                            if value_text:
-                                multiselect_values_to_labels[value_text] = trimmed_label
+            labels_lookup, values_lookup = _collect_meta_option_lookups(meta)
             converted_value = _coerce_ai_value(ai_value, meta)
 
             for idx in row_indices:
@@ -1241,34 +1331,34 @@ def _apply_ai_suggestions_to_wide(
 
                 if input_type == "multiselect":
                     existing_list = _normalize_multiselect_list(existing_raw)
-                    ai_values = _normalize_multiselect_list(converted_value)
-                    if (
-                        allowed_multiselect_labels is not None
-                        or multiselect_values_to_labels is not None
-                    ):
-                        filtered_ai_values: list[str] = []
-                        for item in ai_values:
-                            candidate = item.strip()
-                            if not candidate:
+                    ai_values_raw = _normalize_multiselect_list(converted_value)
+                    needs_validation = bool(labels_lookup or values_lookup)
+                    resolved_ai_values: list[str] = []
+                    invalid_tokens: list[str] = []
+                    for item in ai_values_raw:
+                        candidate = item.strip()
+                        if not candidate:
+                            continue
+                        canonical = (
+                            labels_lookup.get(candidate)
+                            or labels_lookup.get(candidate.casefold())
+                        )
+                        if canonical is None and values_lookup:
+                            canonical = (
+                                values_lookup.get(candidate)
+                                or values_lookup.get(candidate.casefold())
+                            )
+                        if canonical is None:
+                            if needs_validation:
+                                invalid_tokens.append(candidate)
                                 continue
-                            if (
-                                allowed_multiselect_labels is not None
-                                and candidate in allowed_multiselect_labels
-                            ):
-                                filtered_ai_values.append(
-                                    allowed_multiselect_labels[candidate]
-                                )
-                                continue
-                            if (
-                                multiselect_values_to_labels is not None
-                                and candidate in multiselect_values_to_labels
-                            ):
-                                filtered_ai_values.append(
-                                    multiselect_values_to_labels[candidate]
-                                )
-                        ai_values = filtered_ai_values
-                    if not ai_values:
+                            canonical = candidate
+                        resolved_ai_values.append(canonical)
+                    if invalid_tokens:
+                        _record_invalid_option(sku_value, code_key, invalid_tokens)
+                    if not resolved_ai_values:
                         continue
+                    ai_values = resolved_ai_values
                     existing_normalized = [item.strip() for item in existing_list]
                     seen = set(existing_normalized)
                     new_items: list[str] = []
@@ -1323,6 +1413,41 @@ def _apply_ai_suggestions_to_wide(
                         )
                     continue
 
+                if input_type in {"select", "dropdown", "boolean"}:
+                    needs_validation = bool(labels_lookup or values_lookup)
+                    if needs_validation:
+                        tokens: list[str] = []
+                        if isinstance(ai_value, str):
+                            tokens = [ai_value]
+                        elif isinstance(ai_value, (list, tuple, set)):
+                            tokens = [str(item) for item in ai_value]
+                        elif isinstance(ai_value, Mapping):
+                            label_hint = ai_value.get("label")
+                            if isinstance(label_hint, str):
+                                tokens = [label_hint]
+                        if not tokens and isinstance(converted_value, str):
+                            tokens = [converted_value]
+                        invalid_tokens: list[str] = []
+                        for token in tokens:
+                            candidate = str(token).strip()
+                            if not candidate:
+                                continue
+                            if candidate in labels_lookup:
+                                continue
+                            candidate_fold = candidate.casefold()
+                            if candidate_fold in labels_lookup:
+                                continue
+                            if candidate in values_lookup:
+                                continue
+                            if candidate_fold in values_lookup:
+                                continue
+                            invalid_tokens.append(candidate)
+                        if invalid_tokens:
+                            _record_invalid_option(
+                                sku_value, code_key, invalid_tokens
+                            )
+                            continue
+
                 if not _is_blank_value(existing_raw):
                     continue
 
@@ -1336,7 +1461,12 @@ def _apply_ai_suggestions_to_wide(
                     log_entry=None,
                 )
 
-    return updated, list(ai_cells.values()), ai_log
+    normalized_invalid = {
+        sku: {code: values[:] for code, values in per_code.items()}
+        for sku, per_code in invalid_suggestions.items()
+    }
+
+    return updated, list(ai_cells.values()), ai_log, normalized_invalid
 
 def _render_ai_highlight(
     df_view: pd.DataFrame,
@@ -2504,7 +2634,11 @@ def save_step2_to_magento():
         return
 
     staged_map = (step2_state.get("staged") or {}).copy()
+    editor_sources: dict[int, pd.DataFrame] = {}
     if staged_map:
+        for set_id, draft in staged_map.items():
+            if isinstance(draft, pd.DataFrame):
+                editor_sources[set_id] = draft.copy(deep=True)
         for set_id, draft in staged_map.items():
             if not isinstance(draft, pd.DataFrame):
                 continue
@@ -2541,10 +2675,60 @@ def save_step2_to_magento():
         st.info("No changes to save.")
         return
 
+    source_map: dict[int, pd.DataFrame] = (
+        editor_sources if editor_sources else wide_map
+    )
+
     payload_by_sku: dict[str, dict[str, object]] = {}
     errors: list[dict[str, object]] = []
+    applied_summary: dict[str, dict[str, object]] = {}
+    skipped_invalid: dict[str, dict[str, object]] = {}
 
-    for set_id, wide_df in wide_map.items():
+    def _record_applied(sku: str, code: str, value: object) -> None:
+        if code == "attribute_set_id":
+            return
+        applied_summary.setdefault(sku, {})[code] = value
+
+    def _record_skipped_invalid(sku: str, code: str, value: object) -> None:
+        skipped_invalid.setdefault(sku, {})[code] = value
+
+    def _format_summary_values(values_map: Mapping[str, object] | None) -> str:
+        if not isinstance(values_map, Mapping) or not values_map:
+            return ""
+        parts: list[str] = []
+        for code, raw_value in sorted(values_map.items(), key=lambda item: item[0]):
+            if isinstance(raw_value, (list, tuple, set)):
+                seq = [
+                    str(item)
+                    for item in raw_value
+                    if item not in (None, "")
+                ]
+                value_text = ", ".join(seq)
+            else:
+                value_text = str(raw_value)
+            parts.append(f"{code}={value_text}")
+        return "; ".join(parts)
+
+    def _build_summary_rows() -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        all_skus = sorted(
+            set(applied_summary.keys()) | set(skipped_invalid.keys())
+        )
+        for sku in all_skus:
+            applied_text = _format_summary_values(applied_summary.get(sku))
+            skipped_text = _format_summary_values(skipped_invalid.get(sku))
+            if not applied_text and not skipped_text:
+                continue
+            rows.append(
+                {
+                    "sku": sku,
+                    "applied": applied_text,
+                    "skipped_invalid": skipped_text,
+                }
+            )
+        return rows
+
+    for set_id, wide_df in source_map.items():
         if not isinstance(wide_df, pd.DataFrame) or wide_df.empty:
             continue
 
@@ -2635,12 +2819,39 @@ def save_step2_to_magento():
                 )
                 input_type = str(input_type).lower()
 
+                lookup_source = meta_info if meta_info else meta
+                labels_lookup_meta, values_lookup_meta = _collect_meta_option_lookups(
+                    lookup_source
+                )
+
                 prepared_value = new_raw
                 if (
                     attr_code != "categories"
                     and input_type == "multiselect"
                 ):
                     labels = _split_multiselect_input(new_raw)
+                    needs_validation = bool(
+                        labels_lookup_meta or values_lookup_meta
+                    )
+                    if needs_validation:
+                        invalid_labels: list[str] = []
+                        for label in labels:
+                            candidate = label.strip()
+                            if not candidate:
+                                continue
+                            if candidate in labels_lookup_meta:
+                                continue
+                            candidate_fold = candidate.casefold()
+                            if candidate_fold in labels_lookup_meta:
+                                continue
+                            if candidate in values_lookup_meta:
+                                continue
+                            if candidate_fold in values_lookup_meta:
+                                continue
+                            invalid_labels.append(candidate)
+                        if invalid_labels:
+                            _record_skipped_invalid(sku_value, attr_code, new_raw)
+                            continue
                     label_to_value: dict[str, object] = {}
 
                     options_map = meta_info.get("options_map") if isinstance(meta_info, dict) else {}
@@ -2727,6 +2938,48 @@ def save_step2_to_magento():
 
                     prepared_value = mapped_ids
 
+                if (
+                    attr_code != "categories"
+                    and input_type in {"select", "dropdown", "boolean"}
+                ):
+                    needs_validation = bool(
+                        labels_lookup_meta or values_lookup_meta
+                    )
+                    if needs_validation:
+                        tokens: list[str] = []
+                        if isinstance(new_raw, str):
+                            tokens = [new_raw]
+                        elif isinstance(new_raw, (list, tuple, set)):
+                            tokens = [str(item) for item in new_raw]
+                        elif isinstance(new_raw, Mapping):
+                            label_hint = new_raw.get("label")
+                            if isinstance(label_hint, str):
+                                tokens = [label_hint]
+                            else:
+                                value_hint = new_raw.get("value")
+                                if isinstance(value_hint, str):
+                                    tokens = [value_hint]
+                        if not tokens and isinstance(prepared_value, str):
+                            tokens = [prepared_value]
+                        invalid_labels: list[str] = []
+                        for token in tokens:
+                            candidate = str(token).strip()
+                            if not candidate:
+                                continue
+                            if candidate in labels_lookup_meta:
+                                continue
+                            candidate_fold = candidate.casefold()
+                            if candidate_fold in labels_lookup_meta:
+                                continue
+                            if candidate in values_lookup_meta:
+                                continue
+                            if candidate_fold in values_lookup_meta:
+                                continue
+                            invalid_labels.append(candidate)
+                        if invalid_labels:
+                            _record_skipped_invalid(sku_value, attr_code, new_raw)
+                            continue
+
                 try:
                     normalized = normalize_for_magento(attr_code, prepared_value, meta_cache)
                 except Exception as exc:  # pragma: no cover - safety guard
@@ -2779,13 +3032,22 @@ def save_step2_to_magento():
                     continue
 
                 payload_by_sku.setdefault(sku_value, {})[attr_code] = normalized
+                _record_applied(sku_value, attr_code, normalized)
 
             entry = payload_by_sku.get(sku_value)
             if entry and set(entry.keys()) == {"attribute_set_id"}:
                 payload_by_sku.pop(sku_value, None)
 
     if not payload_by_sku and not errors:
-        st.info("No changes to save.")
+        summary_rows = _build_summary_rows()
+        if summary_rows:
+            st.info("No valid attributes to save; some values were skipped.")
+            st.dataframe(
+                pd.DataFrame(summary_rows),
+                use_container_width=True,
+            )
+        else:
+            st.info("No changes to save.")
         return
 
     api_base = st.session_state.get("ai_api_base")
@@ -2808,6 +3070,13 @@ def save_step2_to_magento():
                     "expected_codes": "",
                 }
             )
+
+    summary_rows = _build_summary_rows()
+    if summary_rows:
+        st.dataframe(
+            pd.DataFrame(summary_rows, columns=["sku", "applied", "skipped_invalid"]),
+            use_container_width=True,
+        )
 
     if ok_skus:
         st.success("Updated SKUs:")
@@ -4036,6 +4305,7 @@ if df_original_key in st.session_state:
                                                 updated_df,
                                                 filled_cells,
                                                 ai_log_entries,
+                                                invalid_options,
                                             ) = (
                                                 _apply_ai_suggestions_to_wide(
                                                     step2_state["wide"].get(set_id),
@@ -4062,6 +4332,13 @@ if df_original_key in st.session_state:
                                                     ai_logs_map[set_id] = ai_log_entries
                                                 else:
                                                     ai_logs_map.pop(set_id, None)
+                                                invalid_map = step2_state.setdefault(
+                                                    "ai_invalid_suggestions", {}
+                                                )
+                                                if invalid_options:
+                                                    invalid_map[set_id] = invalid_options
+                                                else:
+                                                    invalid_map.pop(set_id, None)
                                         _ensure_wide_meta_options(
                                             meta_map,
                                             step2_state["wide"].get(set_id),
@@ -4247,6 +4524,7 @@ if df_original_key in st.session_state:
                                                 updated_df,
                                                 filled_cells,
                                                 ai_log_entries,
+                                                invalid_options,
                                             ) = (
                                                 _apply_ai_suggestions_to_wide(
                                                     step2_state["wide"].get(set_id),
@@ -4268,6 +4546,13 @@ if df_original_key in st.session_state:
                                                     ai_logs_map[set_id] = ai_log_entries
                                                 else:
                                                     ai_logs_map.pop(set_id, None)
+                                                invalid_map = step2_state.setdefault(
+                                                    "ai_invalid_suggestions", {}
+                                                )
+                                                if invalid_options:
+                                                    invalid_map[set_id] = invalid_options
+                                                else:
+                                                    invalid_map.pop(set_id, None)
                                         _ensure_wide_meta_options(
                                             meta_map,
                                             step2_state["wide"].get(set_id),

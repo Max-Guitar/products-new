@@ -124,7 +124,7 @@ def normalize_for_magento(code: str, val: Any, meta: AttributeMetaCache | None):
         try:
             return int(s)
         except (TypeError, ValueError):
-            return _sanitize_target(s)
+            return None
 
     if ftype in {"select", "boolean", "int"}:
         if ftype == "boolean":
