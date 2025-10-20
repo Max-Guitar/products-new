@@ -1767,6 +1767,24 @@ def build_attributes_df(
         )
         attr_rows = df_full.to_dict(orient="index") if not df_full.empty else {}
 
+        def _infer_condition_from_sku(sku: str) -> str | None:
+            s = (sku or "").upper()
+            if "ART" in s:
+                return "New"
+            if "ARC" in s or "ARO" in s:
+                return "Pre-owned"
+            if "ARB" in s:
+                return "B-Stock"
+            return None
+
+        curr_cond = (attr_rows.get("condition", {}) or {}).get("label") or (
+            (attr_rows.get("condition", {}) or {}).get("raw_value")
+        )
+        if _is_blank_value(curr_cond):
+            inferred = _infer_condition_from_sku(sku_value)
+            if inferred:
+                attr_rows["condition"] = {"label": inferred, "raw_value": inferred}
+
         needs_ai = False
         if ai_enabled:
             for code in editor_codes:
