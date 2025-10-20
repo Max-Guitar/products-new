@@ -658,6 +658,7 @@ def _reset_step2_state():
         "ai_suggestions",
         "ai_cells",
         "ai_errors",
+        "ai_logs",
     ):
         step2_state.pop(key, None)
 
@@ -679,6 +680,7 @@ def _ensure_step2_state() -> dict:
     state.setdefault("ai_suggestions", {})
     state.setdefault("ai_cells", {})
     state.setdefault("ai_errors", [])
+    state.setdefault("ai_logs", {})
     return state
 
 
@@ -928,16 +930,39 @@ def _apply_ai_suggestions_to_wide(
     meta_cache=None,
     session=None,
     api_base: str | None = None,
-) -> tuple[pd.DataFrame, list[dict[str, object]]]:
+) -> tuple[pd.DataFrame, list[dict[str, object]], list[dict[str, object]]]:
     if not isinstance(wide_df, pd.DataFrame) or wide_df.empty:
-        return wide_df, []
+        return wide_df, [], []
     if not isinstance(suggestions, dict):
-        return wide_df, []
+        return wide_df, [], []
 
     updated = wide_df.copy(deep=True)
-    filled: dict[tuple[str, str], dict[str, object]] = {}
 
-    category_options_map: dict[str, int] | None = None
+    ai_cells: dict[tuple[str, str], dict[str, object]] = {}
+    ai_log: list[dict[str, object]] = []
+
+    def _mark_ai_filled(
+        container: dict[tuple[str, str], dict[str, object]],
+        *,
+        row_idx: int | None,
+        col_key: str,
+        sku_value: str,
+        value: object,
+        log_entry: dict[str, object] | None = None,
+    ) -> None:
+        key = (sku_value, col_key)
+        entry = container.setdefault(key, {"sku": sku_value, "code": col_key})
+        if row_idx is not None:
+            try:
+                entry["row"] = int(row_idx)
+            except Exception:
+                pass
+        entry["value"] = value
+        if isinstance(log_entry, dict):
+            for log_key, log_value in log_entry.items():
+                if log_value in (None, [], {}):
+                    continue
+                entry[log_key] = log_value
 
     def _normalize_multiselect_list(value: object) -> list[str]:
         if isinstance(value, (list, tuple, set)):
@@ -958,126 +983,9 @@ def _apply_ai_suggestions_to_wide(
                 normalized.append(text)
         return normalized
 
-    def _get_category_options_map(current_meta: dict) -> dict[str, int]:
-        nonlocal category_options_map
-        if category_options_map is not None:
-            return category_options_map
-
-        options_map = (
-            current_meta.get("options_map") if isinstance(current_meta, dict) else {}
-        )
-        categories_meta = None
-
-        if not isinstance(options_map, dict) or not options_map:
-            source_meta = None
-            if hasattr(meta_cache, "get"):
-                try:
-                    source_meta = meta_cache.get("categories")
-                except Exception:
-                    source_meta = None
-            elif isinstance(meta_cache, dict):
-                source_meta = meta_cache.get("categories")
-            if isinstance(source_meta, dict):
-                options_map = source_meta.get("options_map") or {}
-            if (not isinstance(options_map, dict) or not options_map) and session and api_base:
-                try:
-                    categories_meta = ensure_categories_meta(
-                        meta_cache, session, api_base, store_id=0
-                    )
-                except Exception:
-                    categories_meta = None
-                if isinstance(categories_meta, dict):
-                    options_map = categories_meta.get("options_map") or {}
-
-        normalized_map: dict[str, int] = {}
-        if isinstance(options_map, dict):
-            for key, value in options_map.items():
-                if key is None:
-                    continue
-                key_str = str(key)
-                try:
-                    int_value = int(value)
-                except (TypeError, ValueError):
-                    continue
-                normalized_map[key_str] = int_value
-                if key_str:
-                    normalized_map[key_str.casefold()] = int_value
-                normalized_map[str(int_value)] = int_value
-
-        category_options_map = normalized_map
-        return category_options_map
-
-    def _ensure_multiselect_sequence(value: object) -> list[object]:
-        if isinstance(value, list):
-            return value.copy()
-        if isinstance(value, (tuple, set)):
-            return list(value)
-        if value in (None, ""):
-            return []
-        return _split_multiselect_input(value)
-
-    def _existing_category_state(
-        value: object, options_map: dict[str, int]
-    ) -> tuple[list[object], set[int], set[str]]:
-        values = _ensure_multiselect_sequence(value)
-        ids: set[int] = set()
-        label_keys: set[str] = set()
-        for item in values:
-            cid = _parse_category_token(item)
-            text_key: str | None = None
-            if isinstance(item, str):
-                stripped = item.strip()
-                if stripped:
-                    text_key = stripped.casefold()
-            elif item not in (None, "") and not isinstance(item, (int, float)):
-                stripped = str(item).strip()
-                if stripped:
-                    text_key = stripped.casefold()
-            if cid is None and text_key:
-                cid = options_map.get(text_key)
-            if cid is None and isinstance(item, str):
-                raw_text = item.strip()
-                if raw_text and raw_text in options_map:
-                    cid = options_map[raw_text]
-            if cid is not None:
-                ids.add(cid)
-            if text_key:
-                label_keys.add(text_key)
-        return values, ids, label_keys
-
-    def _partition_ai_categories(
-        values: list[str] | None, options_map: dict[str, int]
-    ) -> tuple[list[int], list[str]]:
-        known_ids: list[int] = []
-        unknown_labels: list[str] = []
-        seen_ids: set[int] = set()
-        seen_labels: set[str] = set()
-        for item in values or []:
-            if item in (None, ""):
-                continue
-            text = str(item).strip()
-            if not text:
-                continue
-            cid = _parse_category_token(item)
-            if cid is None:
-                if text in options_map:
-                    cid = options_map[text]
-                else:
-                    cid = options_map.get(text.casefold())
-            if cid is not None:
-                if cid not in seen_ids:
-                    known_ids.append(cid)
-                    seen_ids.add(cid)
-                continue
-            label_key = text.casefold()
-            if label_key not in seen_labels:
-                unknown_labels.append(text)
-                seen_labels.add(label_key)
-        return known_ids, unknown_labels
-
     sku_col = "sku" if "sku" in updated.columns else None
     if not sku_col:
-        return updated, []
+        return updated, [], []
 
     for raw_sku, attrs in suggestions.items():
         if not isinstance(attrs, dict):
@@ -1091,98 +999,204 @@ def _apply_ai_suggestions_to_wide(
             code_key = str(code)
             if code_key not in updated.columns:
                 continue
-            value = payload.get("value") if isinstance(payload, dict) else payload
-            if value in (None, ""):
+            suggestion_payload = payload if isinstance(payload, dict) else {"value": payload}
+            ai_value = suggestion_payload.get("value")
+            if ai_value in (None, ""):
                 continue
             meta = meta_map.get(code_key, {}) if isinstance(meta_map, dict) else {}
-            converted = _coerce_ai_value(value, meta)
             input_type = str(
                 meta.get("frontend_input")
                 or meta.get("backend_type")
                 or ""
             ).lower()
-            normalized_ai_values: list[str] | None = None
-            ai_category_ids: list[int] | None = None
-            ai_category_labels: list[str] | None = None
-            if input_type == "multiselect":
-                normalized_ai_values = _normalize_multiselect_list(converted)
-                if code_key == "categories":
-                    options_map = _get_category_options_map(meta)
-                    (
-                        ai_category_ids,
-                        ai_category_labels,
-                    ) = _partition_ai_categories(normalized_ai_values, options_map)
+            converted_value = _coerce_ai_value(ai_value, meta)
+
             for idx in row_indices:
-                existing = updated.at[idx, code_key]
-                if not _is_blank_value(existing):
-                    if input_type != "multiselect":
-                        continue
-                    if code_key == "categories":
-                        options_map = _get_category_options_map(meta)
-                        (
-                            existing_values,
-                            existing_ids,
-                            existing_label_keys,
-                        ) = _existing_category_state(existing, options_map)
-                        combined_value = existing_values.copy()
-                        changed = False
-                        for cid in ai_category_ids or []:
-                            if cid not in existing_ids:
-                                combined_value.append(cid)
-                                existing_ids.add(cid)
-                                changed = True
-                        for label in ai_category_labels or []:
-                            key = label.casefold()
-                            if key not in existing_label_keys:
-                                combined_value.append(label)
-                                existing_label_keys.add(key)
-                                changed = True
-                        if not changed:
-                            continue
-                    else:
-                        existing_list = _normalize_multiselect_list(existing)
-                        new_items = [
-                            item
-                            for item in (normalized_ai_values or [])
-                            if item not in existing_list
-                        ]
-                        if not new_items:
-                            continue
-                        combined_value = existing_list + new_items
-                    updated.at[idx, code_key] = combined_value
-                    key = (sku_value, code_key)
-                    if key not in filled:
-                        filled[key] = {
-                            "sku": sku_value,
-                            "code": code_key,
-                            "value": combined_value,
-                        }
-                    continue
-                if input_type == "multiselect":
-                    if code_key == "categories":
-                        combined_value: list[object] = []
-                        for cid in ai_category_ids or []:
-                            combined_value.append(cid)
-                        for label in ai_category_labels or []:
-                            combined_value.append(label)
-                        if not combined_value:
-                            continue
-                        value_to_assign = combined_value
-                    else:
-                        value_to_assign = normalized_ai_values or []
-                else:
-                    value_to_assign = converted
-                updated.at[idx, code_key] = value_to_assign
-                key = (sku_value, code_key)
-                if key not in filled:
-                    filled[key] = {
-                        "sku": sku_value,
-                        "code": code_key,
-                        "value": value_to_assign,
+                existing_raw = updated.at[idx, code_key]
+                row_position_arr = updated.index.get_indexer([idx])
+                row_position: int | None = None
+                if len(row_position_arr) == 1 and row_position_arr[0] >= 0:
+                    row_position = int(row_position_arr[0])
+
+                if code_key == "categories":
+                    meta_categories = meta_map.get("categories") or {}
+                    values_to_labels: dict[str, str] = (
+                        meta_categories.get("values_to_labels") or {}
+                        if isinstance(meta_categories, dict)
+                        else {}
+                    )
+                    labels_to_values: dict[str, str] = {
+                        (label or "").casefold().strip(): str(value)
+                        for value, label in values_to_labels.items()
                     }
 
-    return updated, list(filled.values())
+                    ai_raw = (
+                        suggestion_payload.get("categories")
+                        or suggestion_payload.get("category")
+                        or ai_value
+                    )
+                    if isinstance(ai_raw, dict):
+                        candidate = (
+                            ai_raw.get("value")
+                            or ai_raw.get("values")
+                            or list(ai_raw.values())
+                        )
+                        ai_raw = candidate
+                    if isinstance(ai_raw, (str, int, float)):
+                        ai_raw = [ai_raw]
+                    normalized_ai: list[str] = []
+                    for item in ai_raw or []:
+                        text = str(item).strip()
+                        if not text:
+                            continue
+                        if text.isdigit():
+                            normalized_ai.append(str(int(text)))
+                        else:
+                            normalized_ai.append(text)
 
+                    found_ids: list[str] = []
+                    ignored_tokens: list[str] = []
+                    for token in normalized_ai:
+                        if token.isdigit():
+                            if token in values_to_labels:
+                                if token not in found_ids:
+                                    found_ids.append(token)
+                            else:
+                                ignored_tokens.append(token)
+                        else:
+                            lookup_key = token.casefold().strip()
+                            resolved = labels_to_values.get(lookup_key)
+                            if resolved:
+                                if resolved not in found_ids:
+                                    found_ids.append(resolved)
+                            else:
+                                ignored_tokens.append(token)
+
+                    existing_raw_value = existing_raw if code_key in updated.columns else None
+                    if (
+                        existing_raw_value is None
+                        or (isinstance(existing_raw_value, float) and pd.isna(existing_raw_value))
+                        or existing_raw_value == ""
+                    ):
+                        existing_ids: list[str] = []
+                    elif isinstance(existing_raw_value, (list, tuple, set)):
+                        existing_ids = [str(item) for item in existing_raw_value]
+                    elif isinstance(existing_raw_value, str):
+                        parts = [
+                            part.strip()
+                            for part in re.split(r"[;,]\s*", existing_raw_value)
+                            if part.strip() != ""
+                        ]
+                        existing_ids = [part for part in parts if part.isdigit()]
+                    else:
+                        existing_ids = []
+
+                    combined_ids = existing_ids + [
+                        cid for cid in found_ids if cid not in existing_ids
+                    ]
+
+                    if combined_ids != existing_ids:
+                        updated.at[idx, code_key] = combined_ids
+                        log_entry = {
+                            "applied": found_ids,
+                            "existing_before": existing_ids,
+                            "combined_after": combined_ids,
+                        }
+                        _mark_ai_filled(
+                            ai_cells,
+                            row_idx=row_position,
+                            col_key=code_key,
+                            sku_value=sku_value,
+                            value=combined_ids,
+                            log_entry=log_entry,
+                        )
+                        ai_log.append(
+                            {
+                                "sku": sku_value,
+                                "code": "categories",
+                                "applied": found_ids,
+                                "existing_before": existing_ids,
+                                "combined_after": combined_ids,
+                            }
+                        )
+
+                    if ignored_tokens:
+                        ai_log.append(
+                            {
+                                "sku": sku_value,
+                                "code": "categories",
+                                "ignored_by_ai_filter": ignored_tokens,
+                            }
+                        )
+
+                    continue
+
+                if input_type == "multiselect":
+                    existing_list = _normalize_multiselect_list(existing_raw)
+                    ai_values = _normalize_multiselect_list(converted_value)
+                    if not ai_values:
+                        continue
+                    new_items = [item for item in ai_values if item not in existing_list]
+                    skipped_duplicates = [
+                        item for item in ai_values if item in existing_list
+                    ]
+                    if new_items:
+                        combined = existing_list + new_items
+                        updated.at[idx, code_key] = combined
+                        log_entry = {
+                            "applied": new_items,
+                            "existing_before": existing_list,
+                            "combined_after": combined,
+                        }
+                        if skipped_duplicates:
+                            log_entry["skipped_duplicates"] = skipped_duplicates
+                        _mark_ai_filled(
+                            ai_cells,
+                            row_idx=row_position,
+                            col_key=code_key,
+                            sku_value=sku_value,
+                            value=combined,
+                            log_entry=log_entry,
+                        )
+                        ai_log.append(
+                            {
+                                "sku": sku_value,
+                                "code": code_key,
+                                "applied": new_items,
+                                "existing_before": existing_list,
+                                "combined_after": combined,
+                                **(
+                                    {"skipped_duplicates": skipped_duplicates}
+                                    if skipped_duplicates
+                                    else {}
+                                ),
+                            }
+                        )
+                    elif skipped_duplicates:
+                        ai_log.append(
+                            {
+                                "sku": sku_value,
+                                "code": code_key,
+                                "existing_before": existing_list,
+                                "skipped_duplicates": skipped_duplicates,
+                            }
+                        )
+                    continue
+
+                if not _is_blank_value(existing_raw):
+                    continue
+
+                updated.at[idx, code_key] = converted_value
+                _mark_ai_filled(
+                    ai_cells,
+                    row_idx=row_position,
+                    col_key=code_key,
+                    sku_value=sku_value,
+                    value=converted_value,
+                    log_entry=None,
+                )
+
+    return updated, list(ai_cells.values()), ai_log
 
 def _render_ai_highlight(
     df_view: pd.DataFrame,
@@ -1196,15 +1210,15 @@ def _render_ai_highlight(
 
     df_reset = df_view.reset_index(drop=True)
     row_positions = {
-        str(df_reset.at[idx, "sku"]): idx + 1 for idx in df_reset.index
+        str(df_reset.at[idx, "sku"]): int(idx) for idx in df_reset.index
     }
     column_positions = {
-        col: idx + 1
+        col: int(idx)
         for idx, col in enumerate(column_order)
         if col in df_view.columns
     }
     sku_index = column_positions.get("sku")
-    if not sku_index:
+    if sku_index is None:
         return
 
     targets: list[dict[str, object]] = []
@@ -1218,18 +1232,27 @@ def _render_ai_highlight(
             yield item
 
     for cell in _iter_cells():
+        row_idx_from_cell: int | None = None
         if isinstance(cell, dict):
             raw_sku = cell.get("sku")
             code_value = cell.get("code")
+            raw_row = cell.get("row")
+            if isinstance(raw_row, (int, float)) and not pd.isna(raw_row):
+                try:
+                    row_idx_from_cell = int(raw_row)
+                except Exception:
+                    row_idx_from_cell = None
         elif isinstance(cell, (list, tuple)) and len(cell) >= 2:
             raw_sku, code_value = cell[0], cell[1]
         else:
             continue
         sku_value = str(raw_sku)
         code_key = str(code_value)
-        row_idx = row_positions.get(sku_value)
+        row_idx = row_idx_from_cell
+        if row_idx is None:
+            row_idx = row_positions.get(sku_value)
         col_idx = column_positions.get(code_key)
-        if not row_idx or not col_idx:
+        if row_idx is None or col_idx is None:
             continue
         key = (sku_value, code_key)
         if key in seen_targets:
@@ -1241,147 +1264,94 @@ def _render_ai_highlight(
     _inject_ai_highlight_script(payload)
 
 
-def _inject_ai_highlight_script(payload: object) -> None:
-    script_template = Template(
+def _inject_ai_highlight_script(payload: dict) -> None:
+    payload_json = json.dumps(payload, ensure_ascii=False)
+
+    st.markdown(
         """
-        <style id="ai-highlight-style">[data-ai-filled="true"], [data-ai-filled="true"] * {
-            background-color: #fff7ae !important;
-        }</style>
-        <script>
-        (function() {{
-            const payload = $payload || {};
-            const parentWin = window.parent;
-            const parentDoc = parentWin.document;
-            const targets = Array.isArray(payload.targets) ? payload.targets : [];
-            const targetKeys = new Set(
-                targets.map(
-                    (target) => target.row + ':' + target.col + ':' + target.sku
-                )
-            );
-            function clearHighlight(table) {{
-                table
-                    .querySelectorAll('td[data-ai-highlighted="1"]')
-                    .forEach((cell) => {{
-                        const key = cell.getAttribute('data-ai-key');
-                        if (!key || !targetKeys.has(key)) {{
-                            cell.style.backgroundColor = '';
-                            cell.removeAttribute('data-ai-highlighted');
-                            cell.removeAttribute('data-ai-key');
-                        }}
-                    }});
-            }}
-            function highlightTable(table) {{
-                let touched = false;
-                clearHighlight(table);
-                targets.forEach((target) => {{
-                    const rowEl = table.querySelector('tbody tr:nth-child(' + target.row + ')');
-                    if (!rowEl) {{
-                        return;
-                    }}
-                    const skuCell = rowEl.querySelector('td:nth-child(' + payload.sku_index + ')');
-                    if (!skuCell) {{
-                        return;
-                    }}
-                    if ((skuCell.textContent || '').trim() !== target.sku) {{
-                        return;
-                    }}
-                    const cell = rowEl.querySelector('td:nth-child(' + target.col + ')');
-                    if (!cell) {{
-                        return;
-                    }}
-                    cell.style.backgroundColor = '#fff7cc';
-                    cell.setAttribute('data-ai-highlighted', '1');
-                    cell.setAttribute(
-                        'data-ai-key',
-                        target.row + ':' + target.col + ':' + target.sku
-                    );
-                    touched = true;
-                }});
-                return touched;
-            }}
-            function apply(attempt) {{
-                const editors = parentDoc.querySelectorAll('div[data-testid="stDataEditor"]');
-                let applied = false;
-                editors.forEach((editor) => {
-                    const table = editor.querySelector('table');
-                    if (!table) {
-                        return;
-                    }
-                    const body = table.querySelector('tbody');
-                    if (!body) {
-                        return;
-                    }
-                    const rows = body.querySelectorAll('tr');
-                    if (!rows.length) {
-                        return;
-                    }
-                    table
-                        .querySelectorAll('[data-ai-filled]')
-                        .forEach((cell) => cell.removeAttribute('data-ai-filled'));
-                    targets.forEach((target) => {
-                        const rowEl = body.querySelector('tr:nth-child(' + target.row + ')');
-                        if (!rowEl) {
-                            return;
-                        }
-                        const skuCell = rowEl.querySelector('td:nth-child(' + payload.sku_index + ')');
-                        if (!skuCell) {
-                            return;
-                        }
-                        if ((skuCell.textContent || '').trim() !== target.sku) {
-                            return;
-                        }
-                        const cell = rowEl.querySelector('td:nth-child(' + target.col + ')');
-                        if (!cell) {
-                            return;
-                        }
-                        cell.setAttribute('data-ai-filled', 'true');
-                        applied = true;
-                    });
-                });
-                return applied;
-            }
-
-            function scheduleHighlight(attempt) {
-                if (apply(0)) {
-                    return;
-                }
-                if (attempt >= 60) {
-                    return;
-                }
-                window.requestAnimationFrame(() => scheduleHighlight(attempt + 1));
-            }
-
-            if (!parentWin.__aiHighlightObserver) {
-                parentWin.__aiHighlightObserver = new MutationObserver(() => {
-                    scheduleHighlight(0);
-                });
-                parentWin.__aiHighlightObserver.observe(parentDoc.body, {
-                    childList: true,
-                    subtree: true,
-                });
-            }
-
-            scheduleHighlight(0);
-        })();
-        </script>
-        """
+<style id="ai-highlight-style">
+  [data-ai-filled="true"], [data-ai-filled="true"] * {
+    background-color: #fff7ae !important;
+  }
+</style>
+""",
+        unsafe_allow_html=True,
     )
-    st.write("DEBUG AI highlight payload (truncated)", str(payload)[:300])
-    try:
-        json_payload = json.dumps(payload)
-        script = script_template.substitute(payload=json_payload)
-    except ValueError as exc:
-        st.error(f"Script injection failed: {exc}")
-        return
-    st.markdown(script, unsafe_allow_html=True)
 
+    st.markdown(
+        f"""
+<script>
+(function() {{
+  const cfg = {payload_json};  // {{ targets: [{{row, col, sku}}...], sku_index }}
+  const MAX_TRIES = 80;
+
+  function findTableRoot() {{
+    // стараемся найти самый свежий stDataEditor (последний)
+    const editors = Array.from(document.querySelectorAll('div[data-testid="stDataEditor"]'));
+    return editors.length ? editors[editors.length - 1] : null;
+  }}
+
+  function applyOnce() {{
+    const root = findTableRoot();
+    if (!root) return false;
+
+    // Пытаемся подсветить по row/col индексам
+    let changed = false;
+    (cfg.targets || []).forEach(t => {{
+      // сперва ищем ячейку по data-row-index/data-col-index (если в текущей версии они есть)
+      let cell = root.querySelector(`[data-row-index="${{t.row}}"][data-col-index="${{t.col}}"]`);
+      if (!cell) {{
+        // fallback: ищем по тексту SKU в ряду (если передан sku_index)
+        try {{
+          const rows = root.querySelectorAll('tbody tr');
+          const skuIdx = cfg.sku_index;
+          if (rows && rows.length && Number.isInteger(skuIdx)) {{
+            const tr = rows[t.row];
+            if (tr) {{
+              const cells = tr.querySelectorAll('td');
+              if (cells && cells.length > Math.max(skuIdx, t.col)) {{
+                const skuCell = cells[skuIdx];
+                if (skuCell && (skuCell.innerText || '').trim() === (t.sku || '').trim()) {{
+                  cell = cells[t.col];
+                }}
+              }}
+            }}
+          }}
+        }} catch (e) {{}}
+      }}
+      if (cell) {{
+        cell.setAttribute('data-ai-filled', 'true');
+        changed = true;
+      }}
+    }});
+    return changed;
+  }}
+
+  function scheduleApply(tries) {{
+    if (applyOnce()) return;
+    if (tries >= MAX_TRIES) return;
+    setTimeout(() => scheduleApply(tries + 1), 100);
+  }}
+
+  // первая попытка сразу
+  scheduleApply(0);
+
+  // пересветка при изменениях DOM (скролл/перерисовка)
+  const obs = new MutationObserver(() => scheduleApply(0));
+  obs.observe(document.body, {{ childList: true, subtree: true }});
+}})();
+</script>
+""",
+        unsafe_allow_html=True,
+    )
 
 def _collect_ai_suggestions_log(
     ai_suggestions: dict | None,
     ai_cells: dict | None,
-) -> dict[str, dict[str, object]]:
+    applied_logs: dict | None = None,
+) -> dict[str, object]:
     if not isinstance(ai_suggestions, dict):
-        return {}
+        ai_suggestions = {}
 
     valid_cells: set[tuple[str, str, str]] = set()
     if isinstance(ai_cells, dict):
@@ -1397,7 +1367,7 @@ def _collect_ai_suggestions_log(
                     continue
                 valid_cells.add((str(set_id), str(sku_value), str(code_value)))
 
-    log: dict[str, dict[str, object]] = {}
+    suggestions_log: dict[str, dict[str, object]] = {}
     for set_id, per_sku in ai_suggestions.items():
         if not isinstance(per_sku, dict):
             continue
@@ -1425,9 +1395,27 @@ def _collect_ai_suggestions_log(
                     continue
                 if isinstance(value, (list, tuple, set)) and not value:
                     continue
-                log.setdefault(sku_key, {})[normalized_key] = value
+                suggestions_log.setdefault(sku_key, {})[normalized_key] = value
 
-    return dict(sorted(log.items(), key=lambda item: item[0]))
+    if suggestions_log:
+        suggestions_log = dict(sorted(suggestions_log.items(), key=lambda item: item[0]))
+
+    applied_entries: list[dict[str, object]] = []
+    if isinstance(applied_logs, dict):
+        for entries in applied_logs.values():
+            if not isinstance(entries, Iterable):
+                continue
+            for entry in entries:
+                if isinstance(entry, dict):
+                    applied_entries.append(entry)
+
+    result: dict[str, object] = {}
+    if suggestions_log:
+        result["suggestions"] = suggestions_log
+    if applied_entries:
+        result["applied"] = applied_entries
+
+    return result
 
 
 def _to_list_str(value: object) -> list[str]:
@@ -1558,11 +1546,14 @@ def colcfg_from_meta(
     column_label = _attr_label(meta, code)
     ftype_raw = meta.get("frontend_input") or meta.get("backend_type") or "text"
     ftype = str(ftype_raw).lower()
-    labels = [
-        opt.get("label")
-        for opt in (meta.get("options") or [])
-        if isinstance(opt, dict) and opt.get("label")
-    ]
+    labels: list[str] = []
+    for opt in meta.get("options") or []:
+        if not isinstance(opt, dict):
+            continue
+        label = opt.get("label")
+        if label is None:
+            continue
+        labels.append(str(label))
 
     if ftype == "multiselect" and labels:
         return st.column_config.MultiselectColumn(column_label, options=labels)
@@ -1618,6 +1609,34 @@ def build_attributes_df(
         cats_meta = {}
     cat_values_to_labels: dict[str, str] = cats_meta.get("values_to_labels") or {}
     raw_options_map: dict[str, int] = cats_meta.get("options_map") or {}
+
+    category_option_items: list[dict[str, str]] = []
+    seen_category_ids: set[str] = set()
+    for raw_value, raw_label in cat_values_to_labels.items():
+        value_str = str(raw_value)
+        if value_str in seen_category_ids:
+            continue
+        label_text = str(raw_label or "").strip()
+        if not label_text:
+            continue
+        seen_category_ids.add(value_str)
+        category_option_items.append({"label": label_text, "value": value_str})
+
+    category_option_items.sort(key=lambda item: item["label"].casefold())
+    cats_meta["options"] = [{"label": "", "value": ""}] + category_option_items
+    normalized_values_to_labels: dict[str, str] = {}
+    for raw_value, raw_label in cat_values_to_labels.items():
+        label_text = str(raw_label or "").strip()
+        if not label_text:
+            continue
+        normalized_values_to_labels[str(raw_value)] = label_text
+    cat_values_to_labels = normalized_values_to_labels
+    cats_meta["values_to_labels"] = cat_values_to_labels
+    if isinstance(meta_cache, AttributeMetaCache):
+        try:
+            meta_cache.set_static("categories", cats_meta)
+        except Exception:
+            pass
     cat_options_map: dict[str, int] = {}
     for key, value in raw_options_map.items():
         if not isinstance(key, str):
@@ -3024,7 +3043,11 @@ if df_original_key in st.session_state:
                                                     "✅ DF BEFORE AI",
                                                     df_before_ai[["sku", "categories"]].head(5),
                                                 )
-                                            updated_df, filled_cells = (
+                                            (
+                                                updated_df,
+                                                filled_cells,
+                                                ai_log_entries,
+                                            ) = (
                                                 _apply_ai_suggestions_to_wide(
                                                     step2_state["wide"].get(set_id),
                                                     suggestions_for_set,
@@ -3043,6 +3066,13 @@ if df_original_key in st.session_state:
                                                     )
                                                 if filled_cells:
                                                     ai_cells_map[set_id] = filled_cells
+                                                ai_logs_map = step2_state.setdefault(
+                                                    "ai_logs", {}
+                                                )
+                                                if ai_log_entries:
+                                                    ai_logs_map[set_id] = ai_log_entries
+                                                else:
+                                                    ai_logs_map.pop(set_id, None)
                                         _ensure_wide_meta_options(
                                             meta_map,
                                             step2_state["wide"].get(set_id),
@@ -3211,7 +3241,11 @@ if df_original_key in st.session_state:
                                                 step2_state["wide"].get(set_id), pd.DataFrame
                                             )
                                         ):
-                                            updated_df, filled_cells = (
+                                            (
+                                                updated_df,
+                                                filled_cells,
+                                                ai_log_entries,
+                                            ) = (
                                                 _apply_ai_suggestions_to_wide(
                                                     step2_state["wide"].get(set_id),
                                                     suggestions_for_set,
@@ -3225,6 +3259,13 @@ if df_original_key in st.session_state:
                                                 step2_state["wide"][set_id] = updated_df
                                                 if filled_cells:
                                                     ai_cells_map[set_id] = filled_cells
+                                                ai_logs_map = step2_state.setdefault(
+                                                    "ai_logs", {}
+                                                )
+                                                if ai_log_entries:
+                                                    ai_logs_map[set_id] = ai_log_entries
+                                                else:
+                                                    ai_logs_map.pop(set_id, None)
                                         _ensure_wide_meta_options(
                                             meta_map,
                                             step2_state["wide"].get(set_id),
@@ -3616,6 +3657,7 @@ if df_original_key in st.session_state:
                                     ai_log_payload = _collect_ai_suggestions_log(
                                         step2_state.get("ai_suggestions"),
                                         step2_state.get("ai_cells"),
+                                        step2_state.get("ai_logs"),
                                     )
                                     with st.expander("🧠 AI suggestions log"):
                                         if ai_log_payload:
