@@ -1743,7 +1743,7 @@ def enrich_ai_suggestions(
             if STYLE_CASCADE.get(style)
         ]
         merged_styles = _merge_unique(merged_styles, cascade_styles)
-    if merged_styles:
+    if merged_styles and not is_bass_item:
         style_entry = by_code.setdefault(
             "guitarstylemultiplechoice",
             {"code": "guitarstylemultiplechoice", "reason": "enriched_from_hints"},

@@ -68,6 +68,56 @@ def _force_mark(sku: str, code: str):
     fs.setdefault(str(sku), set()).add(str(code))
 
 
+def normalize_no_strings(val: str | int | None, meta: Mapping | None) -> str | None:
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    labels = {}
+    if isinstance(meta, Mapping):
+        raw_labels = meta.get("labels_to_values", {})
+        if isinstance(raw_labels, Mapping):
+            labels = {
+                str(key).strip(): raw_labels[key]
+                for key in raw_labels.keys()
+                if str(key).strip()
+            }
+    rev_low = {key.casefold(): key for key in labels.keys()}
+    for n in ("4", "5", "6"):
+        if s == n:
+            for guess in (f"{n}-String", f"{n} Strings", f"{n} String"):
+                key = guess.casefold()
+                if key in rev_low:
+                    return rev_low[key]
+    lookup_key = s.casefold()
+    if lookup_key in rev_low:
+        return rev_low[lookup_key]
+    return None
+
+
+def _lookup_option_id_by_label(meta: Mapping | None, label: str | None) -> str | None:
+    if not isinstance(label, str) or not label.strip():
+        return None
+    if not isinstance(meta, Mapping):
+        return None
+    mapping = meta.get("labels_to_values")
+    if not isinstance(mapping, Mapping):
+        return None
+    label_clean = label.strip()
+    lookup = label_clean.casefold()
+    for raw_label, option_id in mapping.items():
+        text = str(raw_label).strip() if raw_label not in (None, "") else ""
+        if not text:
+            continue
+        if text.casefold() == lookup:
+            if option_id in (None, ""):
+                return None
+            option_text = str(option_id).strip()
+            return option_text or None
+    return None
+
+
 _DEF_ATTR_SET_NAME = "Default"
 _ALLOWED_TYPES = {"simple", "configurable"}
 
@@ -1426,6 +1476,9 @@ def _apply_ai_suggestions_to_wide(
                         )
                     continue
 
+                no_strings_label: str | None = None
+                no_strings_option_id: str | None = None
+
                 if input_type in {"select", "dropdown", "boolean"}:
                     if not (labels_lookup or values_lookup):
                         tokens = _normalize_multiselect_list(converted_value)
@@ -1441,30 +1494,59 @@ def _apply_ai_suggestions_to_wide(
                             payload_tokens,
                         )
                         continue
-                    tokens: list[str] = []
+
+                    raw_candidates: list[object] = []
+                    if code_key == "no_strings":
+                        normalized_candidate = normalize_no_strings(converted_value, meta)
+                        if normalized_candidate is None:
+                            normalized_candidate = normalize_no_strings(ai_value, meta)
+                        if normalized_candidate is not None:
+                            converted_value = normalized_candidate
+                            raw_candidates.append(normalized_candidate)
                     if isinstance(ai_value, str):
-                        tokens = [ai_value]
+                        raw_candidates.append(ai_value)
                     elif isinstance(ai_value, (list, tuple, set)):
-                        tokens = [str(item) for item in ai_value]
+                        raw_candidates.extend(ai_value)
                     elif isinstance(ai_value, Mapping):
                         label_hint = ai_value.get("label")
                         if isinstance(label_hint, str):
-                            tokens = [label_hint]
+                            raw_candidates.append(label_hint)
                         else:
                             value_hint = ai_value.get("value")
                             if isinstance(value_hint, str):
-                                tokens = [value_hint]
-                    if not tokens and isinstance(converted_value, str):
-                        tokens = [converted_value]
-                    if not tokens and isinstance(converted_value, bool):
-                        tokens = ["1" if converted_value else "0"]
-                    if not tokens and converted_value not in (None, ""):
-                        tokens = [str(converted_value)]
-                    cleaned_tokens = [
-                        str(token).strip() for token in tokens if str(token).strip()
-                    ]
+                                raw_candidates.append(value_hint)
+                    if isinstance(converted_value, str):
+                        raw_candidates.append(converted_value)
+                    elif isinstance(converted_value, bool):
+                        raw_candidates.append("1" if converted_value else "0")
+                    elif converted_value not in (None, ""):
+                        raw_candidates.append(converted_value)
+
+                    cleaned_tokens: list[str] = []
+                    seen_tokens: set[str] = set()
+                    for token in raw_candidates:
+                        if isinstance(token, (list, tuple, set)):
+                            iterable = token
+                        else:
+                            iterable = [token]
+                        for item in iterable:
+                            if item in (None, ""):
+                                continue
+                            if isinstance(item, bool):
+                                text = "1" if item else "0"
+                            else:
+                                text = str(item).strip()
+                            if not text:
+                                continue
+                            key = text.casefold()
+                            if key in seen_tokens:
+                                continue
+                            seen_tokens.add(key)
+                            cleaned_tokens.append(text)
+
                     if not cleaned_tokens:
                         continue
+
                     invalid_tokens: list[str] = []
                     resolved_tokens: list[str] = []
                     for token in cleaned_tokens:
@@ -1478,6 +1560,7 @@ def _apply_ai_suggestions_to_wide(
                             invalid_tokens.append(token)
                             continue
                         resolved_tokens.append(canonical)
+
                     if invalid_tokens or not resolved_tokens:
                         _record_skipped_invalid(
                             sku_value,
@@ -1486,19 +1569,56 @@ def _apply_ai_suggestions_to_wide(
                             details=invalid_tokens or cleaned_tokens,
                         )
                         continue
+
                     converted_value = resolved_tokens[0]
+                    if code_key == "no_strings":
+                        normalized_label = normalize_no_strings(converted_value, meta)
+                        if normalized_label is not None:
+                            converted_value = normalized_label
+                        if isinstance(converted_value, str):
+                            no_strings_label = converted_value
+                            no_strings_option_id = _lookup_option_id_by_label(
+                                meta, converted_value
+                            )
 
                 if not _is_blank_value(existing_raw):
                     continue
 
                 updated.at[idx, code_key] = converted_value
+                mark_log_entry: dict[str, object] | None = None
+                if pass_through_attr:
+                    mark_log_entry = {"pass_through": True}
+                if code_key == "no_strings":
+                    mark_log_entry = dict(mark_log_entry or {})
+                    before_label = ""
+                    if isinstance(existing_raw, str):
+                        before_label = existing_raw.strip()
+                    elif existing_raw not in (None, ""):
+                        before_label = str(existing_raw).strip()
+                    after_label = (
+                        converted_value.strip()
+                        if isinstance(converted_value, str)
+                        else str(converted_value)
+                        if converted_value not in (None, "")
+                        else ""
+                    )
+                    if before_label:
+                        mark_log_entry["no_strings_before"] = before_label
+                    if after_label:
+                        mark_log_entry["no_strings_after"] = after_label
+                    if no_strings_label:
+                        mark_log_entry["no_strings_normalized_label"] = no_strings_label
+                    if no_strings_option_id:
+                        mark_log_entry["no_strings_option_id"] = no_strings_option_id
+                    mark_log_entry = mark_log_entry or None
+
                 _mark_ai_filled(
                     ai_cells,
                     row_idx=row_position,
                     col_key=code_key,
                     sku_value=sku_value,
                     value=converted_value,
-                    log_entry={"pass_through": True} if pass_through_attr else None,
+                    log_entry=mark_log_entry,
                 )
                 if pass_through_attr:
                     ai_log.append(
@@ -1509,6 +1629,25 @@ def _apply_ai_suggestions_to_wide(
                             "pass_through": True,
                         }
                     )
+                if code_key == "no_strings":
+                    log_entry: dict[str, object] = {"sku": sku_value, "code": code_key}
+                    if isinstance(existing_raw, str) and existing_raw.strip():
+                        log_entry["no_strings_before"] = existing_raw.strip()
+                    elif existing_raw not in (None, ""):
+                        text_before = str(existing_raw).strip()
+                        if text_before:
+                            log_entry["no_strings_before"] = text_before
+                    if isinstance(converted_value, str) and converted_value.strip():
+                        log_entry["no_strings_after"] = converted_value.strip()
+                        log_entry["no_strings_normalized_label"] = converted_value.strip()
+                    if no_strings_option_id:
+                        log_entry["no_strings_option_id"] = no_strings_option_id
+                    reason_text = suggestion_payload.get("reason")
+                    if reason_text not in (None, ""):
+                        log_entry["reason"] = reason_text
+                    ai_log.append(log_entry)
+                    if str(suggestion_payload.get("reason") or "") == "enriched_bass_default":
+                        _force_mark(sku_value, "no_strings")
 
     normalized_skipped = {
         sku: {code: values[:] for code, values in per_code.items()}
@@ -2995,6 +3134,19 @@ def save_step2_to_magento():
                 )
 
                 prepared_value = new_raw
+                original_no_strings_value = new_raw
+                if attr_code == "no_strings":
+                    label_source = meta_info if meta_info else meta
+                    normalized_label = normalize_no_strings(new_raw, label_source)
+                    if normalized_label is None:
+                        _record_skipped_invalid(
+                            sku_value,
+                            attr_code,
+                            original_no_strings_value,
+                        )
+                        continue
+                    new_raw = normalized_label
+                    prepared_value = normalized_label
                 if (
                     attr_code != "categories"
                     and input_type == "multiselect"
