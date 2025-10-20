@@ -3256,13 +3256,39 @@ if df_original_key in st.session_state:
                         st.session_state["show_attributes_trigger"] = False
                     else:
                         df_new_common = df_new_idx.loc[common_skus]
-                        new_sets = df_new_common["attribute set"].fillna("")
-                        old_sets = df_old_idx.loc[common_skus, "attribute set"].fillna("")
-                        df_changed = (
-                            df_new_common.loc[
-                                df_new_common["attribute_set_id"] != 4
-                            ].reset_index()
+                        attr_sets_name_to_id = st.session_state.get(
+                            attribute_sets_key, {}
                         )
+
+                        def _coerce_set_id(val):
+                            try:
+                                if val is None or (
+                                    isinstance(val, float) and pd.isna(val)
+                                ):
+                                    raise ValueError
+                                return int(val)
+                            except Exception:
+                                name = str(val or "").strip()
+                                if not name:
+                                    return None
+                                if name.casefold() == "default":
+                                    return 4
+                                raw = attr_sets_name_to_id.get(name)
+                                try:
+                                    return int(raw) if raw is not None else None
+                                except Exception:
+                                    return None
+
+                        if "attribute_set_id" in df_new_common.columns:
+                            eff_ids = df_new_common["attribute_set_id"].apply(
+                                _coerce_set_id
+                            )
+                        else:
+                            eff_ids = df_new_common["attribute set"].apply(
+                                _coerce_set_id
+                            )
+
+                        df_changed = df_new_common.loc[eff_ids.ne(4)].reset_index()
 
                         if df_changed.empty:
                             st.warning("No updated products.")
