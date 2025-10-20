@@ -59,6 +59,11 @@ from utils.http import build_magento_headers, get_session
 logger = logging.getLogger(__name__)
 
 
+def _force_mark(sku: str, code: str):
+    fs = st.session_state.setdefault("force_send", {})
+    fs.setdefault(str(sku), set()).add(str(code))
+
+
 _DEF_ATTR_SET_NAME = "Default"
 _ALLOWED_TYPES = {"simple", "configurable"}
 
@@ -1777,6 +1782,7 @@ def build_attributes_df(
         }:
             if any(k in name_text for k in ["left", "left-handed", "lefty", "lh "]):
                 attr_rows["orientation"] = {"label": "Left", "raw_value": "Left"}
+                _force_mark(sku_value, "orientation")
 
         def _infer_condition_from_sku(sku: str) -> str | None:
             s = (sku or "").upper()
@@ -1795,6 +1801,7 @@ def build_attributes_df(
             inferred = _infer_condition_from_sku(sku_value)
             if inferred:
                 attr_rows["condition"] = {"label": inferred, "raw_value": inferred}
+                _force_mark(sku_value, "condition")
 
         force_codes = {"categories", "guitarstylemultiplechoice"}
         bool_codes = {
@@ -2249,6 +2256,10 @@ def save_step2_to_magento():
     if meta_cache is None:
         meta_cache = step2_state.get("meta")
 
+    force_map = st.session_state.get("force_send", {})
+    if not isinstance(force_map, dict):
+        force_map = {}
+
     if isinstance(meta_cache, AttributeMetaCache):
         meta_cache.build_and_set_static_for(["country_of_manufacture"], store_id=0)
 
@@ -2306,6 +2317,14 @@ def save_step2_to_magento():
             else:
                 baseline_row = None
 
+            sku_force_codes_raw = force_map.get(sku_value, set())
+            if isinstance(sku_force_codes_raw, (set, list, tuple)):
+                sku_force_codes = {str(item) for item in sku_force_codes_raw}
+            elif sku_force_codes_raw in (None, ""):
+                sku_force_codes = set()
+            else:
+                sku_force_codes = {str(sku_force_codes_raw)}
+
             for code in attr_cols:
                 new_raw = row.get(code)
                 old_raw = (
@@ -2314,7 +2333,8 @@ def save_step2_to_magento():
                     else None
                 )
 
-                if _values_equal(new_raw, old_raw):
+                must_force = str(code) in sku_force_codes
+                if (not must_force) and _values_equal(new_raw, old_raw):
                     continue
 
                 meta = meta_for_set.get(code) or {}
@@ -2518,6 +2538,9 @@ def save_step2_to_magento():
     if ok_skus:
         st.success("Updated SKUs:")
         st.markdown("\n".join(f"- `{sku}`" for sku in sorted(ok_skus)))
+        for sku in ok_skus:
+            force_map.pop(str(sku), None)
+        st.session_state["force_send"] = force_map
 
     if errors:
         import pandas as _pd
