@@ -1638,6 +1638,7 @@ def _collect_ai_suggestions_log(
                 valid_cells.add((str(set_id), str(sku_value), str(code_value)))
 
     suggestions_log: dict[str, dict[str, object]] = {}
+    meta_entries: list[dict[str, object]] = []
     for set_id, per_sku in ai_suggestions.items():
         if not isinstance(per_sku, dict):
             continue
@@ -1650,7 +1651,19 @@ def _collect_ai_suggestions_log(
                 continue
             if not isinstance(attrs, dict):
                 continue
+            meta_payload = attrs.get("__meta__")
+            if isinstance(meta_payload, Mapping):
+                meta_entry: dict[str, object] = {
+                    "set_id": str(set_id),
+                    "sku": sku_key,
+                    "bass_hint": bool(meta_payload.get("bass_hint")),
+                }
+                if "no_strings_auto" in meta_payload:
+                    meta_entry["no_strings_auto"] = meta_payload.get("no_strings_auto")
+                meta_entries.append(meta_entry)
             for code, payload in attrs.items():
+                if code == "__meta__":
+                    continue
                 normalized_key = str(code)
                 if valid_cells and (
                     str(set_id), sku_key, normalized_key
@@ -1688,6 +1701,8 @@ def _collect_ai_suggestions_log(
         result["suggestions"] = suggestions_log
     if applied_entries:
         result["applied"] = applied_entries
+    if meta_entries:
+        result["meta"] = meta_entries
 
     return result
 
@@ -1995,6 +2010,19 @@ def _build_ai_hints(
     style_hints = derive_styles_from_texts(style_texts)
     if style_hints:
         hints["style_hint"] = style_hints
+
+    is_bass = False
+    set_name_cf = set_name_clean.casefold()
+    if "bass" in set_name_cf:
+        is_bass = True
+    else:
+        product_name_text = ""
+        if isinstance(product, Mapping):
+            product_name_text = str(product.get("name", ""))
+        if "bass" in product_name_text.casefold():
+            is_bass = True
+    if is_bass:
+        hints["bass_hint"] = True
 
     return hints
 
@@ -2370,6 +2398,7 @@ def build_attributes_df(
                     categories_meta_for_ai,
                     attribute_set_label,
                     set_id,
+                    product_data,
                 )
 
                 sku_key = str(sku_value)
