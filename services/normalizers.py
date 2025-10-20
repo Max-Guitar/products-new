@@ -6,6 +6,18 @@ from typing import Any
 from connectors.magento.attributes import AttributeMetaCache
 
 
+TEXT_PASS_THROUGH = {
+    "finish",
+    "controls",
+    "tuning_machines",
+    "bridge",
+    "top_material",
+    "neck_material",
+    "fretboard_material",
+    "short_description",
+}
+
+
 def _sanitize_target(target: Any) -> Any:
     if target is None:
         return None
@@ -104,6 +116,12 @@ def normalize_for_magento(code: str, val: Any, meta: AttributeMetaCache | None):
     ftype = info.get("frontend_input") or info.get("backend_type") or "text"
     ftype = str(ftype).lower()
 
+    if code in TEXT_PASS_THROUGH:
+        if isinstance(val, str):
+            cleaned = val.strip()
+            return cleaned
+        return val
+
     def to_id(value: Any):
         if value is None:
             return None
@@ -118,13 +136,7 @@ def normalize_for_magento(code: str, val: Any, meta: AttributeMetaCache | None):
         matched = _match_option_value(value, info)
         if matched is not None:
             return matched
-        s = str(value).strip()
-        if not s:
-            return None
-        try:
-            return int(s)
-        except (TypeError, ValueError):
-            return None
+        return None
 
     if ftype in {"select", "boolean", "int"}:
         if ftype == "boolean":
