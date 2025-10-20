@@ -17,6 +17,8 @@ from collections.abc import Iterable
 from urllib.parse import quote
 import re
 
+import requests
+
 import pandas as pd
 import streamlit as st
 
@@ -29,7 +31,7 @@ st.title("🤖 Peter v.1.0 (AI Content Manager)")
 
 from connectors.magento.attributes import AttributeMetaCache
 from connectors.magento.categories import ensure_categories_meta
-from connectors.magento.client import get_default_products
+from connectors.magento.client import get_default_products, magento_get
 from services.ai_fill import (
     ALWAYS_ATTRS,
     SET_ATTRS,
@@ -2612,21 +2614,66 @@ if requested_run_mode:
         sku = "ART-22895"
         status = st.status(f"Loading product {sku}…", expanded=True)
         pbar = st.progress(0)
+
+        encoded_sku = quote(sku, safe="")
+        product: dict | None = None
+
+        load_failed = False
         try:
             pbar.progress(10)
-            status.update(label="Discovering Magento API…")
-            api_base = st.session_state.get("ai_api_base")
-            if not api_base:
-                api_base = probe_api_base(session, base_url)
-                st.session_state["ai_api_base"] = api_base
-
-            pbar.progress(40)
             status.update(label=f"Fetching product {sku}…")
-            product = get_product_by_sku(session, api_base, sku)
+            product = magento_get(
+                session,
+                base_url,
+                f"/products/{encoded_sku}?storeId=0",
+            )
+        except requests.HTTPError as exc:  # pragma: no cover - network error handling
+            status.update(state="error", label="Failed to load product")
+            if exc.response is not None and exc.response.status_code == 404:
+                st.warning(f"SKU {sku} not found.")
+            else:
+                st.error(f"Error: {exc}")
+            st.session_state.pop(df_original_key, None)
+            st.session_state.pop(df_edited_key, None)
+            st.session_state.pop(attribute_sets_key, None)
+            _reset_step2_state()
+            load_failed = True
+        except Exception as exc:  # pragma: no cover - UI error handling
+            status.update(state="error", label="Failed to load product")
+            st.error(f"Error: {exc}")
+            st.session_state.pop(df_original_key, None)
+            st.session_state.pop(df_edited_key, None)
+            st.session_state.pop(attribute_sets_key, None)
+            _reset_step2_state()
+            load_failed = True
+
+        if load_failed or not product or not product.get("sku"):
+            status.update(state="error", label="Failed to load product")
+            st.warning(f"SKU {sku} not found.")
+            st.session_state.pop(df_original_key, None)
+            st.session_state.pop(df_edited_key, None)
+            st.session_state.pop(attribute_sets_key, None)
+            _reset_step2_state()
+        else:
             step1_state["products"] = [product]
+            step1_state["skus"] = [sku]
+            attr_set_id_value = product.get("attribute_set_id")
+            try:
+                attr_set_id_int = int(attr_set_id_value)
+            except (TypeError, ValueError):
+                attr_set_id_int = None
+
+            set_choices = step1_state.get("set_choices")
+            if not isinstance(set_choices, dict):
+                set_choices = {}
+            set_choices[sku] = {
+                "attribute_set_id": attr_set_id_int,
+            }
+            step1_state["set_choices"] = set_choices
+
             st.session_state[cache_key] = [product]
 
-            pbar.progress(60)
+            pbar.progress(40)
             status.update(label="Loading attribute sets…")
             try:
                 attribute_sets = list_attribute_sets(session, base_url)
@@ -2634,12 +2681,6 @@ if requested_run_mode:
                 st.error(f"Failed to fetch attribute sets: {exc}")
                 attribute_sets = {}
             st.session_state[attribute_sets_key] = attribute_sets
-
-            attr_set_id_value = product.get("attribute_set_id")
-            try:
-                attr_set_id_int = int(attr_set_id_value)
-            except (TypeError, ValueError):
-                attr_set_id_int = None
 
             attr_name = None
             if attribute_sets:
@@ -2655,55 +2696,57 @@ if requested_run_mode:
                     attr_name = _DEF_ATTR_SET_NAME
                 else:
                     attr_name = str(attr_set_id_int)
+            step1_state["set_choices"][sku]["attribute_set_name"] = attr_name
 
-            pbar.progress(85)
+            pbar.progress(70)
             status.update(label="Preparing table…")
-            df_items = pd.DataFrame(
-                [
-                    {
-                        "sku": product.get("sku", ""),
-                        "name": product.get("name", ""),
-                        "attribute set": attr_name,
-                        "attribute_set_id": attr_set_id_int,
-                        "created_at": product.get("created_at", ""),
-                    }
-                ]
+            df_items = load_items(
+                session,
+                base_url,
+                attr_set_id=attr_set_id_int,
+                products=[product],
             )
-            df_items["attribute_set_id"] = pd.Series(
-                [
-                    attr_set_id_int if attr_set_id_int is not None else pd.NA,
-                ],
-                dtype="Int64",
-            )
-            df_items["created_at"] = pd.to_datetime(
-                df_items["created_at"], errors="coerce"
-            )
-            df_ui = df_items.sort_values("created_at", ascending=False).reset_index(
-                drop=True
-            )
-            st.session_state[df_original_key] = df_ui.copy()
-            if "hint" not in df_ui.columns:
-                df_ui["hint"] = ""
-            cols_order = [
-                "sku",
-                "name",
-                "attribute set",
-                "attribute_set_id",
-                "hint",
-                "created_at",
-            ]
-            column_order = [col for col in cols_order if col in df_ui.columns]
-            lead_cols = [c for c in ("sku", "name") if c in column_order]
-            tail_cols = [c for c in column_order if c not in ("sku", "name")]
-            column_order = lead_cols + tail_cols
-            st.session_state[df_edited_key] = df_ui[column_order].copy()
-            _reset_step2_state()
 
-            pbar.progress(100)
-            status.update(state="complete", label="Loaded 1 item")
-        except Exception as exc:  # pragma: no cover - UI error handling
-            status.update(state="error", label="Failed to load product")
-            st.error(f"Error: {exc}")
+            if df_items.empty:
+                status.update(state="error", label="No products to display")
+                st.warning(f"SKU {sku} not found.")
+                st.session_state.pop(df_original_key, None)
+                st.session_state.pop(df_edited_key, None)
+                _reset_step2_state()
+            else:
+                df_ui = df_items.copy()
+                df_ui["created_at"] = pd.to_datetime(
+                    df_ui["created_at"], errors="coerce"
+                )
+                df_ui = df_ui.sort_values("created_at", ascending=False).reset_index(
+                    drop=True
+                )
+                st.session_state[df_original_key] = df_ui.copy()
+
+                df_for_edit = df_ui.copy()
+                if "hint" not in df_for_edit.columns:
+                    df_for_edit["hint"] = ""
+                cols_order = [
+                    "sku",
+                    "name",
+                    "attribute set",
+                    "attribute_set_id",
+                    "hint",
+                    "created_at",
+                ]
+                column_order = [
+                    col for col in cols_order if col in df_for_edit.columns
+                ]
+                lead_cols = [c for c in ("sku", "name") if c in column_order]
+                tail_cols = [c for c in column_order if c not in ("sku", "name")]
+                column_order = lead_cols + tail_cols
+                df_for_edit = df_for_edit[column_order]
+                st.session_state[df_edited_key] = df_for_edit.copy()
+                _reset_step2_state()
+
+                pbar.progress(100)
+                status.update(state="complete", label="Loaded 1 item")
+
     else:
         limit = 50 if run_mode == "fast50" else None
         enabled_only = True if run_mode == "fast50" else None
