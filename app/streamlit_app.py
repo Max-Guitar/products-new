@@ -7,6 +7,7 @@ import math
 import sys
 from pathlib import Path
 import os
+import traceback
 from string import Template
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -84,6 +85,8 @@ from utils.http import build_magento_headers, get_session
 
 
 logger = logging.getLogger(__name__)
+
+MODEL_ALIASES = {"4": "gpt-4o", "4-mini": "gpt-4o-mini", "5": "gpt-5"}
 
 
 def _force_mark(sku: str, code: str):
@@ -2127,16 +2130,20 @@ def _collect_ai_suggestions_log(
                     str(set_id), sku_key, normalized_key
                 ) not in valid_cells:
                     continue
-                value = (
-                    payload.get("value")
-                    if isinstance(payload, dict)
-                    else payload
-                )
+                reason = None
+                if isinstance(payload, Mapping):
+                    value = payload.get("value")
+                    reason = payload.get("reason")
+                else:
+                    value = payload
                 if value in (None, ""):
                     continue
                 if isinstance(value, (list, tuple, set)) and not value:
                     continue
-                suggestions_log.setdefault(sku_key, {})[normalized_key] = value
+                entry_payload: dict[str, object] = {"value": value}
+                if reason:
+                    entry_payload["reason"] = reason
+                suggestions_log.setdefault(sku_key, {})[normalized_key] = entry_payload
 
     if suggestions_log:
         suggestions_log = dict(sorted(suggestions_log.items(), key=lambda item: item[0]))
@@ -2575,7 +2582,10 @@ def build_attributes_df(
     ai_results: dict[int, dict[str, dict[str, dict[str, object]]]] = defaultdict(dict)
     ai_errors: list[str] = []
     ai_log_data: dict[str, list[dict[str, object]]] = {"errors": []}
-    ai_model_name = ai_model or "gpt-5-mini"
+    resolved_model = MODEL_ALIASES.get(ai_model, ai_model)
+    if not resolved_model:
+        resolved_model = st.session_state.get("ai_model_resolved")
+    ai_model_name = resolved_model or "gpt-5-mini"
     ai_conv = get_ai_conversation(ai_model_name) if ai_enabled else None
 
     for _, row in df_changed.iterrows():
@@ -2852,15 +2862,19 @@ def build_attributes_df(
                         model=ai_model_name,
                     )
                 except Exception as exc:  # pragma: no cover - network error handling
-                    raw_resp = getattr(exc, "raw_response", None)
-                    if raw_resp is None:
-                        raw_resp = getattr(exc, "raw_response_retry", None)
+                    raw_preview_source = (
+                        getattr(exc, "raw_response", None)
+                        or getattr(exc, "raw_response_retry", None)
+                        or getattr(exc, "raw_response_sanitized", None)
+                        or ""
+                    )
                     trace(
                         {
                             "where": "ai:json_error",
                             "sku": sku_value,
                             "err": str(exc),
-                            "raw_preview": (raw_resp or "")[:400],
+                            "raw_preview": str(raw_preview_source)[:400],
+                            "tb": traceback.format_exc()[-600:],
                         }
                     )
                     if "json" in str(exc).lower():
@@ -3868,6 +3882,10 @@ selected_model = st.sidebar.selectbox(
     index=model_options.index(current_model),
 )
 st.session_state["ai_model"] = selected_model
+SELECTED_MODEL = MODEL_ALIASES.get(
+    st.session_state.get("ai_model"), st.session_state.get("ai_model")
+)
+st.session_state["ai_model_resolved"] = SELECTED_MODEL
 
 if not st.session_state.get("_mg_auth_logged"):
     st.write(
@@ -4611,7 +4629,10 @@ if df_original_key in st.session_state:
                                         attr_sets_map,
                                         meta_cache,
                                         ai_api_key=st.session_state.get("ai_api_key", ""),
-                                        ai_model=st.session_state.get("ai_model"),
+                                        ai_model=(
+                                            st.session_state.get("ai_model_resolved")
+                                            or st.session_state.get("ai_model")
+                                        ),
                                     )
                                     step2_state["ai_suggestions"] = (
                                         ai_suggestions_map or {}

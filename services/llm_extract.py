@@ -6,11 +6,13 @@ import json
 import logging
 import math
 import re
+import traceback
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
 MODEL_STRONG = "gpt-5"
 MODEL_FALLBACK = "gpt-4o"
+FALLBACK_MODEL = MODEL_FALLBACK
 
 SYSTEM_PROMPT = """
 You are a senior product data expert for guitars & basses (Fender, Gibson, Ibanez, PRS, etc.).
@@ -37,8 +39,7 @@ If metric given, convert mm -> inches (25.4 mm = 1").
 Return only normalized attribute values, not sentences.
 If value is unclear — leave empty.
 
-Return a SINGLE valid JSON object. No markdown, no extra text, no comments.
-Use plain ASCII quotes (") in values like 25.5". Do not escape with backticks.
+Return a SINGLE valid JSON object. No markdown, no prose. Use only standard quotes (") in values like 25.5".
 """
 
 FEW_SHOT_EXAMPLES: Sequence[dict[str, str]] = (
@@ -114,26 +115,21 @@ def _trace(event: Mapping[str, object]) -> None:
         pass
 
 
-def _try_parse_json(txt: str):
+def _try_json(s: str):
     try:
-        return json.loads(txt), None
-    except Exception as exc:  # pragma: no cover - json failure branch exercised in tests
-        return None, exc
+        return json.loads(s), None
+    except Exception as e:  # pragma: no cover - exercised via tests
+        return None, e
 
 
-def _sanitize_llm_json(txt: str) -> str:
-    s = txt.strip()
-
-    s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s, flags=re.IGNORECASE | re.DOTALL)
-
-    m = re.search(r"\{.*\}\s*$", s, flags=re.DOTALL)
+def _sanitize_llm_json(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s, flags=re.I | re.S)
+    m = re.search(r"\{.*\}\s*$", s, flags=re.S)
     if m:
         s = m.group(0)
-
     s = s.replace("“", '"').replace("”", '"').replace("’", "'")
-
     s = re.sub(r",(\s*[}\]])", r"\1", s)
-
     return s
 
 
@@ -694,6 +690,16 @@ def _payload_to_attributes(parsed: object) -> dict[str, object]:
         attributes = parsed.get("attributes")
         if isinstance(attributes, Mapping):
             return dict(attributes)
+        if isinstance(attributes, Sequence):
+            collected: dict[str, object] = {}
+            for item in attributes:
+                if not isinstance(item, Mapping):
+                    continue
+                code_value = item.get("code")
+                if not code_value:
+                    continue
+                collected[str(code_value)] = item.get("value")
+            return collected
         return dict(parsed)
     return {}
 
@@ -706,17 +712,18 @@ def extract_attributes(
     attribute_tasks: Sequence[dict[str, object]],
     hints: Mapping[str, object] | None = None,
     model: str = MODEL_STRONG,
-    temperature: float = 0.0,
+    temperature: float = 0.2,
 ) -> tuple[dict[str, object], dict[str, object]]:
     """Call an LLM to extract attributes with deterministic pre-extraction fallback."""
 
-    pre = regex_preextract(title, description)
+    pre_initial = regex_preextract(title, description)
     messages = _build_messages(title, description, attribute_tasks, hints)
 
     kwargs = {
         "messages": messages,
         "temperature": temperature,
         "top_p": 1,
+        "max_tokens": 1200,
         "response_format": {"type": "json_object"},
     }
 
@@ -728,119 +735,183 @@ def extract_attributes(
             return ""
         return _extract_response_content(response)
 
-    raw_primary = _invoke(model)
+    raw_primary = ""
+    raw_retry = ""
+    sanitized = ""
+    raw_content = ""
     used_model = model
-    parsed_payload: object | None = None
-    raw_content = raw_primary
 
-    data_primary, err_primary = _try_parse_json(raw_primary)
-    err_sanitized = None
-    err_retry = None
-    sanitized = raw_primary
+    try:
+        raw_primary = _invoke(model)
+        raw_content = raw_primary
+        parsed_payload: object | None = None
 
-    if data_primary is not None:
-        parsed_payload = data_primary
-    else:
-        sanitized = _sanitize_llm_json(raw_primary)
-        data_sanitized, err_sanitized = _try_parse_json(sanitized)
-        if data_sanitized is not None:
-            parsed_payload = data_sanitized
-            raw_content = sanitized
+        data_primary, err_primary = _try_json(raw_primary)
+        err_sanitized = None
+        err_retry = None
+
+        if data_primary is not None:
+            parsed_payload = data_primary
         else:
-            retry_model = MODEL_FALLBACK or model
-            raw_retry = _invoke(retry_model)
-            raw_content = raw_retry or raw_primary
-            data_retry, err_retry = _try_parse_json(raw_retry)
-            if data_retry is not None:
-                parsed_payload = data_retry
-                used_model = retry_model
+            sanitized = _sanitize_llm_json(raw_primary)
+            data_sanitized, err_sanitized = _try_json(sanitized)
+            if data_sanitized is not None:
+                parsed_payload = data_sanitized
+                raw_content = sanitized
             else:
-                _trace(
-                    {
-                        "where": "llm:json_fail",
-                        "raw": (raw_primary or "")[:500],
-                        "err": str(err_primary) if err_primary else None,
-                        "sanitized": (sanitized or "")[:500],
-                        "err2": str(err_sanitized) if err_sanitized else None,
-                        "raw2": (raw_retry or "")[:500],
-                        "err3": str(err_retry) if err_retry else None,
-                    }
+                retry_model = FALLBACK_MODEL or model
+                raw_retry = _invoke(retry_model)
+                raw_content = raw_retry or raw_primary
+                data_retry, err_retry = _try_json(raw_retry)
+                if data_retry is not None:
+                    parsed_payload = data_retry
+                    used_model = retry_model
+                else:
+                    _trace(
+                        {
+                            "where": "llm:json_fail",
+                            "raw1_preview": (raw_primary or "")[:500],
+                            "err1": str(err_primary) if err_primary else None,
+                            "raw2_preview": (raw_retry or "")[:500],
+                            "err2": str(err_sanitized) if err_sanitized else None,
+                            "err3": str(err_retry) if err_retry else None,
+                        }
+                    )
+                    failure = ValueError("LLM JSON parse failed after sanitize+retry")
+                    setattr(failure, "raw_response", raw_primary)
+                    setattr(failure, "raw_response_retry", raw_retry)
+                    setattr(failure, "raw_response_sanitized", sanitized)
+                    setattr(failure, "traceback", "".join(traceback.format_stack()))
+                    raise failure
+
+        if parsed_payload is None:
+            parsed_payload = {}
+
+        llm_out = _payload_to_attributes(parsed_payload)
+
+        if not llm_out and FALLBACK_MODEL and FALLBACK_MODEL != used_model:
+            raw_retry = _invoke(FALLBACK_MODEL)
+            raw_content = raw_retry or raw_content
+            retry_payload, err_retry_parse = _try_json(raw_retry)
+            if retry_payload is not None:
+                llm_out = _payload_to_attributes(retry_payload)
+                used_model = FALLBACK_MODEL
+            else:
+                logger.warning(
+                    "Fallback model %s returned non-JSON payload: %s",
+                    FALLBACK_MODEL,
+                    str(err_retry_parse),
                 )
-                failure = ValueError("LLM JSON parse failed after sanitize+retry")
-                setattr(failure, "raw_response", raw_primary)
-                setattr(failure, "raw_response_retry", raw_retry)
-                setattr(failure, "raw_response_sanitized", sanitized)
-                raise failure
 
-    llm_out = _payload_to_attributes(parsed_payload)
+        defaults_seed: dict[str, object] = {
+            key: value for key, value in pre_initial.items() if not _is_blank(value)
+        }
+        for key, value in llm_out.items():
+            if not _is_blank(value):
+                defaults_seed[key] = value
+        defaults_with_series = apply_series_defaults(title, defaults_seed)
 
-    if not llm_out and MODEL_FALLBACK and MODEL_FALLBACK != used_model:
-        raw_fallback = _invoke(MODEL_FALLBACK)
-        raw_content = raw_fallback or raw_content
-        fallback_payload, err_fallback = _try_parse_json(raw_fallback)
-        if fallback_payload is not None:
-            llm_out = _payload_to_attributes(fallback_payload)
-            used_model = MODEL_FALLBACK
-        else:
-            logger.warning(
-                "Fallback model %s returned non-JSON payload: %s",
-                MODEL_FALLBACK,
-                str(err_fallback),
-            )
+        default_candidates: dict[str, object] = {}
+        for key, value in defaults_with_series.items():
+            if (
+                _is_blank(llm_out.get(key))
+                and _is_blank(pre_initial.get(key))
+                and not _is_blank(value)
+            ):
+                default_candidates[key] = value
 
-    defaults_seed: dict[str, object] = {
-        key: value for key, value in pre.items() if not _is_blank(value)
-    }
-    for key, value in llm_out.items():
-        if not _is_blank(value):
-            defaults_seed[key] = value
-    defaults_with_series = apply_series_defaults(title, defaults_seed)
+        finish_guess = color_from_title(title)
+        if (
+            finish_guess
+            and _is_blank(llm_out.get("finish"))
+            and _is_blank(pre_initial.get("finish"))
+        ):
+            default_candidates.setdefault("finish", finish_guess)
 
-    default_candidates: dict[str, object] = {}
-    for key, value in defaults_with_series.items():
-        if _is_blank(llm_out.get(key)) and _is_blank(pre.get(key)) and not _is_blank(value):
-            default_candidates[key] = value
+        final: dict[str, object] = {}
+        for task in attribute_tasks:
+            code = str(task.get("code"))
+            if not code:
+                continue
+            llm_value = llm_out.get(code)
+            pre_value = pre_initial.get(code)
+            if _is_blank(llm_value):
+                llm_value = None
+            if _is_blank(pre_value):
+                pre_value = None
 
-    finish_guess = color_from_title(title)
-    if finish_guess and _is_blank(llm_out.get("finish")) and _is_blank(pre.get("finish")):
-        default_candidates.setdefault("finish", finish_guess)
+            default_value = default_candidates.get(code)
 
-    final: dict[str, object] = {}
-    for task in attribute_tasks:
-        code = str(task.get("code"))
-        llm_value = llm_out.get(code)
-        pre_value = pre.get(code)
-        if _is_blank(llm_value):
-            llm_value = None
-        if _is_blank(pre_value):
-            pre_value = None
+            if is_numeric_spec(code):
+                if pre_value is not None:
+                    final[code] = pre_value
+                elif llm_value is not None:
+                    final[code] = llm_value
+                elif default_value is not None:
+                    final[code] = default_value
+                else:
+                    final[code] = None
+                continue
 
-        default_value = default_candidates.get(code)
-
-        if is_numeric_spec(code):
-            if pre_value is not None:
-                final[code] = pre_value
-            elif llm_value is not None:
+            if llm_value is not None:
                 final[code] = llm_value
+            elif pre_value is not None:
+                final[code] = pre_value
             elif default_value is not None:
                 final[code] = default_value
             else:
                 final[code] = None
-            continue
 
-        if llm_value is not None:
-            final[code] = llm_value
-        elif pre_value is not None:
-            final[code] = pre_value
-        elif default_value is not None:
-            final[code] = default_value
-        else:
-            final[code] = None
+        metadata = {
+            "preextract": pre_initial,
+            "raw_response": raw_content,
+            "used_model": used_model,
+        }
 
-    metadata = {
-        "preextract": pre,
-        "raw_response": raw_content,
-        "used_model": used_model,
-    }
+        return final, metadata
 
-    return final, metadata
+    except Exception as exc:
+        title_value = title or ""
+        pre_local = regex_preextract(title, description)
+        attrs = apply_series_defaults(title_value, dict(pre_local))
+        if not attrs.get("finish"):
+            finish_guess = color_from_title(title_value)
+            if finish_guess:
+                attrs["finish"] = finish_guess
+
+        non_empty_attrs = {k: v for k, v in attrs.items() if not _is_blank(v)}
+        _trace(
+            {
+                "where": "llm:fallback_local",
+                "reason": str(exc)[:200],
+                "attrs_preview": {k: v for k, v in non_empty_attrs.items()},
+            }
+        )
+
+        fallback_attributes = [
+            {"code": k, "value": v, "reason": "fallback_local"}
+            for k, v in non_empty_attrs.items()
+        ]
+        fallback_map = {item["code"]: item["value"] for item in fallback_attributes}
+
+        final: dict[str, object] = {}
+        for task in attribute_tasks:
+            code = str(task.get("code"))
+            if not code:
+                continue
+            value = fallback_map.get(code)
+            if value is None:
+                value = pre_local.get(code)
+            final[code] = value if not _is_blank(value) else None
+
+        metadata = {
+            "preextract": pre_local,
+            "raw_response": raw_content or raw_primary or raw_retry or sanitized,
+            "used_model": "fallback_local",
+            "fallback_reason": str(exc),
+            "fallback_attributes": fallback_attributes,
+            "raw_response_primary": raw_primary,
+            "raw_response_retry": raw_retry,
+        }
+
+        return final, metadata
