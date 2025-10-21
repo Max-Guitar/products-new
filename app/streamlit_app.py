@@ -56,7 +56,7 @@ from services.inventory import (
     iter_products_by_attr_set,
     list_attribute_sets,
 )
-from services.normalizers import TEXT_PASS_THROUGH, normalize_for_magento
+from services.normalizers import normalize_for_magento
 from utils.http import build_magento_headers, get_session
 
 
@@ -66,56 +66,6 @@ logger = logging.getLogger(__name__)
 def _force_mark(sku: str, code: str):
     fs = st.session_state.setdefault("force_send", {})
     fs.setdefault(str(sku), set()).add(str(code))
-
-
-def normalize_no_strings(val: str | int | None, meta: Mapping | None) -> str | None:
-    if val is None:
-        return None
-    s = str(val).strip()
-    if not s:
-        return None
-    labels = {}
-    if isinstance(meta, Mapping):
-        raw_labels = meta.get("labels_to_values", {})
-        if isinstance(raw_labels, Mapping):
-            labels = {
-                str(key).strip(): raw_labels[key]
-                for key in raw_labels.keys()
-                if str(key).strip()
-            }
-    rev_low = {key.casefold(): key for key in labels.keys()}
-    for n in ("4", "5", "6"):
-        if s == n:
-            for guess in (f"{n}-String", f"{n} Strings", f"{n} String"):
-                key = guess.casefold()
-                if key in rev_low:
-                    return rev_low[key]
-    lookup_key = s.casefold()
-    if lookup_key in rev_low:
-        return rev_low[lookup_key]
-    return None
-
-
-def _lookup_option_id_by_label(meta: Mapping | None, label: str | None) -> str | None:
-    if not isinstance(label, str) or not label.strip():
-        return None
-    if not isinstance(meta, Mapping):
-        return None
-    mapping = meta.get("labels_to_values")
-    if not isinstance(mapping, Mapping):
-        return None
-    label_clean = label.strip()
-    lookup = label_clean.casefold()
-    for raw_label, option_id in mapping.items():
-        text = str(raw_label).strip() if raw_label not in (None, "") else ""
-        if not text:
-            continue
-        if text.casefold() == lookup:
-            if option_id in (None, ""):
-                return None
-            option_text = str(option_id).strip()
-            return option_text or None
-    return None
 
 
 _DEF_ATTR_SET_NAME = "Default"
@@ -392,80 +342,6 @@ def _split_multiselect_input(values) -> list[str]:
         iterable = [str(values).strip()]
 
     return [item for item in iterable if item]
-
-
-def _collect_meta_option_lookups(
-    meta: Mapping | None,
-) -> tuple[dict[str, str], dict[str, str]]:
-    """Return lookups for option labels and values from attribute metadata."""
-
-    labels_lookup: dict[str, str] = {}
-    values_lookup: dict[str, str] = {}
-
-    if not isinstance(meta, Mapping):
-        return labels_lookup, values_lookup
-
-    raw_labels_to_values = meta.get("labels_to_values")
-    if isinstance(raw_labels_to_values, Mapping):
-        for raw_label, mapped_value in raw_labels_to_values.items():
-            if isinstance(raw_label, str):
-                label_text = raw_label.strip()
-            else:
-                label_text = str(raw_label).strip()
-            if not label_text:
-                continue
-            canonical = label_text
-            labels_lookup.setdefault(label_text, canonical)
-            labels_lookup.setdefault(label_text.casefold(), canonical)
-            if mapped_value not in (None, ""):
-                value_key = str(mapped_value).strip()
-                if value_key:
-                    values_lookup.setdefault(value_key, canonical)
-                    values_lookup.setdefault(value_key.casefold(), canonical)
-
-    if not labels_lookup:
-        raw_values_to_labels = meta.get("values_to_labels")
-        if isinstance(raw_values_to_labels, Mapping):
-            for raw_value, raw_label in raw_values_to_labels.items():
-                if isinstance(raw_label, str):
-                    label_text = raw_label.strip()
-                else:
-                    label_text = str(raw_label).strip()
-                if not label_text:
-                    continue
-                canonical = label_text
-                labels_lookup.setdefault(label_text, canonical)
-                labels_lookup.setdefault(label_text.casefold(), canonical)
-                if raw_value not in (None, ""):
-                    value_key = str(raw_value).strip()
-                    if value_key:
-                        values_lookup.setdefault(value_key, canonical)
-                        values_lookup.setdefault(value_key.casefold(), canonical)
-
-    if not labels_lookup:
-        options = meta.get("options")
-        if isinstance(options, list):
-            for option in options:
-                if not isinstance(option, Mapping):
-                    continue
-                raw_label = option.get("label")
-                if isinstance(raw_label, str):
-                    label_text = raw_label.strip()
-                else:
-                    label_text = str(raw_label).strip()
-                if not label_text:
-                    continue
-                canonical = label_text
-                labels_lookup.setdefault(label_text, canonical)
-                labels_lookup.setdefault(label_text.casefold(), canonical)
-                raw_value = option.get("value")
-                if raw_value not in (None, ""):
-                    value_key = str(raw_value).strip()
-                    if value_key:
-                        values_lookup.setdefault(value_key, canonical)
-                        values_lookup.setdefault(value_key.casefold(), canonical)
-
-    return labels_lookup, values_lookup
 
 
 def _norm_label(s: str) -> str:
@@ -1098,54 +974,16 @@ def _apply_ai_suggestions_to_wide(
     meta_cache=None,
     session=None,
     api_base: str | None = None,
-) -> tuple[
-    pd.DataFrame,
-    list[dict[str, object]],
-    list[dict[str, object]],
-    dict[str, dict[str, list[str]]],
-]:
+) -> tuple[pd.DataFrame, list[dict[str, object]], list[dict[str, object]]]:
     if not isinstance(wide_df, pd.DataFrame) or wide_df.empty:
-        return wide_df, [], [], {}
+        return wide_df, [], []
     if not isinstance(suggestions, dict):
-        return wide_df, [], [], {}
+        return wide_df, [], []
 
     updated = wide_df.copy(deep=True)
 
     ai_cells: dict[tuple[str, str], dict[str, object]] = {}
     ai_log: list[dict[str, object]] = []
-    skipped_invalid: dict[str, dict[str, list[str]]] = {}
-
-    def _record_skipped_invalid(
-        sku_value: str,
-        code_key: str,
-        incoming_values: Iterable[object],
-        *,
-        details: Iterable[object] | None = None,
-    ) -> None:
-        normalized_values: list[str] = []
-        for item in incoming_values or []:
-            if item in (None, ""):
-                continue
-            text = str(item).strip()
-            if not text:
-                continue
-            normalized_values.append(text)
-        skipped_invalid.setdefault(sku_value, {})[code_key] = normalized_values
-        if normalized_values:
-            log_entry: dict[str, object] = {
-                "sku": sku_value,
-                "code": code_key,
-                "skipped_invalid": normalized_values,
-            }
-            if details:
-                detail_values = [
-                    str(item).strip()
-                    for item in details
-                    if item not in (None, "") and str(item).strip()
-                ]
-                if detail_values:
-                    log_entry["invalid_tokens"] = detail_values
-            ai_log.append(log_entry)
 
     def _mark_ai_filled(
         container: dict[tuple[str, str], dict[str, object]],
@@ -1191,7 +1029,7 @@ def _apply_ai_suggestions_to_wide(
 
     sku_col = "sku" if "sku" in updated.columns else None
     if not sku_col:
-        return updated, [], [], {}
+        return updated, [], []
 
     for raw_sku, attrs in suggestions.items():
         if not isinstance(attrs, dict):
@@ -1224,16 +1062,27 @@ def _apply_ai_suggestions_to_wide(
                 or meta.get("backend_type")
                 or ""
             ).lower()
-            labels_lookup, values_lookup = _collect_meta_option_lookups(meta)
-            pass_through_attr = code_key in TEXT_PASS_THROUGH
-            if input_type in {"select", "dropdown"} and not (
-                labels_lookup or values_lookup
-            ):
-                # опций нет — показываем пользователю как текст, чтобы он увидел/отредактировал
-                input_type = "text"
-                pass_through_attr = True
-            if pass_through_attr:
-                input_type = "text"
+            allowed_multiselect_labels: dict[str, str] | None = None
+            multiselect_values_to_labels: dict[str, str] | None = None
+            if input_type == "multiselect" and isinstance(meta, dict):
+                options = meta.get("options")
+                if isinstance(options, list):
+                    allowed_multiselect_labels = {}
+                    multiselect_values_to_labels = {}
+                    for option in options:
+                        if not isinstance(option, dict):
+                            continue
+                        raw_label = option.get("label")
+                        if not isinstance(raw_label, str):
+                            continue
+                        trimmed_label = raw_label.strip()
+                        if not trimmed_label:
+                            continue
+                        allowed_multiselect_labels[trimmed_label] = trimmed_label
+                        if "value" in option and option["value"] not in (None, ""):
+                            value_text = str(option["value"]).strip()
+                            if value_text:
+                                multiselect_values_to_labels[value_text] = trimmed_label
             converted_value = _coerce_ai_value(ai_value, meta)
 
             for idx in row_indices:
@@ -1392,42 +1241,34 @@ def _apply_ai_suggestions_to_wide(
 
                 if input_type == "multiselect":
                     existing_list = _normalize_multiselect_list(existing_raw)
-                    ai_values_raw = _normalize_multiselect_list(converted_value)
-                    if not ai_values_raw:
+                    ai_values = _normalize_multiselect_list(converted_value)
+                    if (
+                        allowed_multiselect_labels is not None
+                        or multiselect_values_to_labels is not None
+                    ):
+                        filtered_ai_values: list[str] = []
+                        for item in ai_values:
+                            candidate = item.strip()
+                            if not candidate:
+                                continue
+                            if (
+                                allowed_multiselect_labels is not None
+                                and candidate in allowed_multiselect_labels
+                            ):
+                                filtered_ai_values.append(
+                                    allowed_multiselect_labels[candidate]
+                                )
+                                continue
+                            if (
+                                multiselect_values_to_labels is not None
+                                and candidate in multiselect_values_to_labels
+                            ):
+                                filtered_ai_values.append(
+                                    multiselect_values_to_labels[candidate]
+                                )
+                        ai_values = filtered_ai_values
+                    if not ai_values:
                         continue
-                    if not (labels_lookup or values_lookup):
-                        _record_skipped_invalid(sku_value, code_key, ai_values_raw)
-                        continue
-                    resolved_ai_values: list[str] = []
-                    invalid_tokens: list[str] = []
-                    for item in ai_values_raw:
-                        candidate = item.strip()
-                        if not candidate:
-                            continue
-                        canonical = (
-                            labels_lookup.get(candidate)
-                            or labels_lookup.get(candidate.casefold())
-                        )
-                        if canonical is None:
-                            canonical = (
-                                values_lookup.get(candidate)
-                                or values_lookup.get(candidate.casefold())
-                            )
-                        if canonical is None:
-                            invalid_tokens.append(candidate)
-                            continue
-                        resolved_ai_values.append(canonical)
-                    if invalid_tokens:
-                        _record_skipped_invalid(
-                            sku_value,
-                            code_key,
-                            ai_values_raw,
-                            details=invalid_tokens,
-                        )
-                        continue
-                    if not resolved_ai_values:
-                        continue
-                    ai_values = resolved_ai_values
                     existing_normalized = [item.strip() for item in existing_list]
                     seen = set(existing_normalized)
                     new_items: list[str] = []
@@ -1482,185 +1323,20 @@ def _apply_ai_suggestions_to_wide(
                         )
                     continue
 
-                no_strings_label: str | None = None
-                no_strings_option_id: str | None = None
-
-                if input_type in {"select", "dropdown", "boolean"}:
-                    if not (labels_lookup or values_lookup):
-                        tokens = _normalize_multiselect_list(converted_value)
-                        fallback_tokens: list[str] = []
-                        if not tokens and ai_value not in (None, ""):
-                            fallback_tokens = _normalize_multiselect_list(ai_value)
-                        payload_tokens = tokens or fallback_tokens
-                        if not payload_tokens and ai_value not in (None, ""):
-                            payload_tokens = [ai_value]
-                        _record_skipped_invalid(
-                            sku_value,
-                            code_key,
-                            payload_tokens,
-                        )
-                        continue
-
-                    raw_candidates: list[object] = []
-                    if code_key == "no_strings":
-                        normalized_candidate = normalize_no_strings(converted_value, meta)
-                        if normalized_candidate is None:
-                            normalized_candidate = normalize_no_strings(ai_value, meta)
-                        if normalized_candidate is not None:
-                            converted_value = normalized_candidate
-                            raw_candidates.append(normalized_candidate)
-                    if isinstance(ai_value, str):
-                        raw_candidates.append(ai_value)
-                    elif isinstance(ai_value, (list, tuple, set)):
-                        raw_candidates.extend(ai_value)
-                    elif isinstance(ai_value, Mapping):
-                        label_hint = ai_value.get("label")
-                        if isinstance(label_hint, str):
-                            raw_candidates.append(label_hint)
-                        else:
-                            value_hint = ai_value.get("value")
-                            if isinstance(value_hint, str):
-                                raw_candidates.append(value_hint)
-                    if isinstance(converted_value, str):
-                        raw_candidates.append(converted_value)
-                    elif isinstance(converted_value, bool):
-                        raw_candidates.append("1" if converted_value else "0")
-                    elif converted_value not in (None, ""):
-                        raw_candidates.append(converted_value)
-
-                    cleaned_tokens: list[str] = []
-                    seen_tokens: set[str] = set()
-                    for token in raw_candidates:
-                        if isinstance(token, (list, tuple, set)):
-                            iterable = token
-                        else:
-                            iterable = [token]
-                        for item in iterable:
-                            if item in (None, ""):
-                                continue
-                            if isinstance(item, bool):
-                                text = "1" if item else "0"
-                            else:
-                                text = str(item).strip()
-                            if not text:
-                                continue
-                            key = text.casefold()
-                            if key in seen_tokens:
-                                continue
-                            seen_tokens.add(key)
-                            cleaned_tokens.append(text)
-
-                    if not cleaned_tokens:
-                        continue
-
-                    invalid_tokens: list[str] = []
-                    resolved_tokens: list[str] = []
-                    for token in cleaned_tokens:
-                        canonical = (
-                            labels_lookup.get(token)
-                            or labels_lookup.get(token.casefold())
-                            or values_lookup.get(token)
-                            or values_lookup.get(token.casefold())
-                        )
-                        if canonical is None:
-                            invalid_tokens.append(token)
-                            continue
-                        resolved_tokens.append(canonical)
-
-                    if invalid_tokens or not resolved_tokens:
-                        _record_skipped_invalid(
-                            sku_value,
-                            code_key,
-                            cleaned_tokens,
-                            details=invalid_tokens or cleaned_tokens,
-                        )
-                        continue
-
-                    converted_value = resolved_tokens[0]
-                    if code_key == "no_strings":
-                        normalized_label = normalize_no_strings(converted_value, meta)
-                        if normalized_label is not None:
-                            converted_value = normalized_label
-                        if isinstance(converted_value, str):
-                            no_strings_label = converted_value
-                            no_strings_option_id = _lookup_option_id_by_label(
-                                meta, converted_value
-                            )
-
                 if not _is_blank_value(existing_raw):
                     continue
 
                 updated.at[idx, code_key] = converted_value
-                mark_log_entry: dict[str, object] | None = None
-                if pass_through_attr:
-                    mark_log_entry = {"pass_through": True}
-                if code_key == "no_strings":
-                    mark_log_entry = dict(mark_log_entry or {})
-                    before_label = ""
-                    if isinstance(existing_raw, str):
-                        before_label = existing_raw.strip()
-                    elif existing_raw not in (None, ""):
-                        before_label = str(existing_raw).strip()
-                    after_label = (
-                        converted_value.strip()
-                        if isinstance(converted_value, str)
-                        else str(converted_value)
-                        if converted_value not in (None, "")
-                        else ""
-                    )
-                    if before_label:
-                        mark_log_entry["no_strings_before"] = before_label
-                    if after_label:
-                        mark_log_entry["no_strings_after"] = after_label
-                    if no_strings_label:
-                        mark_log_entry["no_strings_normalized_label"] = no_strings_label
-                    if no_strings_option_id:
-                        mark_log_entry["no_strings_option_id"] = no_strings_option_id
-                    mark_log_entry = mark_log_entry or None
-
                 _mark_ai_filled(
                     ai_cells,
                     row_idx=row_position,
                     col_key=code_key,
                     sku_value=sku_value,
                     value=converted_value,
-                    log_entry=mark_log_entry,
+                    log_entry=None,
                 )
-                if pass_through_attr:
-                    ai_log.append(
-                        {
-                            "sku": sku_value,
-                            "code": code_key,
-                            "value": converted_value,
-                            "pass_through": True,
-                        }
-                    )
-                if code_key == "no_strings":
-                    log_entry: dict[str, object] = {"sku": sku_value, "code": code_key}
-                    if isinstance(existing_raw, str) and existing_raw.strip():
-                        log_entry["no_strings_before"] = existing_raw.strip()
-                    elif existing_raw not in (None, ""):
-                        text_before = str(existing_raw).strip()
-                        if text_before:
-                            log_entry["no_strings_before"] = text_before
-                    if isinstance(converted_value, str) and converted_value.strip():
-                        log_entry["no_strings_after"] = converted_value.strip()
-                        log_entry["no_strings_normalized_label"] = converted_value.strip()
-                    if no_strings_option_id:
-                        log_entry["no_strings_option_id"] = no_strings_option_id
-                    reason_text = suggestion_payload.get("reason")
-                    if reason_text not in (None, ""):
-                        log_entry["reason"] = reason_text
-                    ai_log.append(log_entry)
-                    if str(suggestion_payload.get("reason") or "") == "enriched_bass_default":
-                        _force_mark(sku_value, "no_strings")
 
-    normalized_skipped = {
-        sku: {code: values[:] for code, values in per_code.items()}
-        for sku, per_code in skipped_invalid.items()
-    }
-
-    return updated, list(ai_cells.values()), ai_log, normalized_skipped
+    return updated, list(ai_cells.values()), ai_log
 
 def _render_ai_highlight(
     df_view: pd.DataFrame,
@@ -1813,8 +1489,6 @@ def _collect_ai_suggestions_log(
     ai_suggestions: dict | None,
     ai_cells: dict | None,
     applied_logs: dict | None = None,
-    invalid_logs: dict | None = None,
-    save_skipped: dict | None = None,
 ) -> dict[str, object]:
     if not isinstance(ai_suggestions, dict):
         ai_suggestions = {}
@@ -1834,48 +1508,34 @@ def _collect_ai_suggestions_log(
                 valid_cells.add((str(set_id), str(sku_value), str(code_value)))
 
     suggestions_log: dict[str, dict[str, object]] = {}
-    meta_entries: list[dict[str, object]] = []
     for set_id, per_sku in ai_suggestions.items():
         if not isinstance(per_sku, dict):
             continue
         for raw_sku, attrs in per_sku.items():
             sku_key = str(raw_sku)
+            if valid_cells and all(
+                (str(set_id), sku_key, str(code)) not in valid_cells
+                for code in (attrs or {}).keys()
+            ):
+                continue
             if not isinstance(attrs, dict):
                 continue
-            meta_payload = attrs.get("__meta__")
-            if isinstance(meta_payload, Mapping):
-                meta_entry: dict[str, object] = {
-                    "set_id": str(set_id),
-                    "sku": sku_key,
-                    "bass_hint": bool(meta_payload.get("bass_hint")),
-                }
-                if "no_strings_auto" in meta_payload:
-                    meta_entry["no_strings_auto"] = meta_payload.get("no_strings_auto")
-                meta_entries.append(meta_entry)
             for code, payload in attrs.items():
-                if code == "__meta__":
-                    continue
                 normalized_key = str(code)
-                value = payload.get("value") if isinstance(payload, dict) else payload
+                if valid_cells and (
+                    str(set_id), sku_key, normalized_key
+                ) not in valid_cells:
+                    continue
+                value = (
+                    payload.get("value")
+                    if isinstance(payload, dict)
+                    else payload
+                )
                 if value in (None, ""):
                     continue
                 if isinstance(value, (list, tuple, set)) and not value:
                     continue
-                entry: dict[str, object] = {
-                    "value": value,
-                    "applied": (
-                        str(set_id), sku_key, normalized_key
-                    )
-                    in valid_cells,
-                }
-                if isinstance(payload, dict):
-                    reason = payload.get("reason")
-                    if reason not in (None, ""):
-                        entry["reason"] = reason
-                    evidence = payload.get("evidence")
-                    if evidence not in (None, ""):
-                        entry["evidence"] = evidence
-                suggestions_log.setdefault(sku_key, {})[normalized_key] = entry
+                suggestions_log.setdefault(sku_key, {})[normalized_key] = value
 
     if suggestions_log:
         suggestions_log = dict(sorted(suggestions_log.items(), key=lambda item: item[0]))
@@ -1889,59 +1549,11 @@ def _collect_ai_suggestions_log(
                 if isinstance(entry, dict):
                     applied_entries.append(entry)
 
-    def _aggregate_skipped(
-        data: Mapping | None,
-    ) -> dict[str, dict[str, object]]:
-        aggregated: dict[str, dict[str, object]] = {}
-        if not isinstance(data, Mapping):
-            return aggregated
-        for outer_key, value in data.items():
-            if not isinstance(value, Mapping):
-                continue
-            if value and all(isinstance(v, Mapping) for v in value.values()):
-                for sku_key, per_codes in value.items():
-                    if not isinstance(per_codes, Mapping):
-                        continue
-                    target = aggregated.setdefault(str(sku_key), {})
-                    for code_key, raw_val in per_codes.items():
-                        target[str(code_key)] = raw_val
-            else:
-                target = aggregated.setdefault(str(outer_key), {})
-                for code_key, raw_val in value.items():
-                    target[str(code_key)] = raw_val
-        return aggregated
-
-    def _normalize_simple_skipped(
-        data: Mapping | None,
-    ) -> dict[str, dict[str, object]]:
-        if not isinstance(data, Mapping):
-            return {}
-        normalized: dict[str, dict[str, object]] = {}
-        for sku_key, per_codes in data.items():
-            if not isinstance(per_codes, Mapping):
-                continue
-            normalized[str(sku_key)] = {
-                str(code_key): raw_val for code_key, raw_val in per_codes.items()
-            }
-        return normalized
-
     result: dict[str, object] = {}
     if suggestions_log:
         result["suggestions"] = suggestions_log
     if applied_entries:
         result["applied"] = applied_entries
-    if meta_entries:
-        result["meta"] = meta_entries
-
-    skipped_apply = _aggregate_skipped(invalid_logs)
-    skipped_save = _normalize_simple_skipped(save_skipped)
-    if skipped_apply or skipped_save:
-        skipped_block: dict[str, object] = {}
-        if skipped_apply:
-            skipped_block["apply"] = skipped_apply
-        if skipped_save:
-            skipped_block["save"] = skipped_save
-        result["skipped_invalid"] = skipped_block
 
     return result
 
@@ -2249,19 +1861,6 @@ def _build_ai_hints(
     style_hints = derive_styles_from_texts(style_texts)
     if style_hints:
         hints["style_hint"] = style_hints
-
-    is_bass = False
-    set_name_cf = set_name_clean.casefold()
-    if "bass" in set_name_cf:
-        is_bass = True
-    else:
-        product_name_text = ""
-        if isinstance(product, Mapping):
-            product_name_text = str(product.get("name", ""))
-        if "bass" in product_name_text.casefold():
-            is_bass = True
-    if is_bass:
-        hints["bass_hint"] = True
 
     return hints
 
@@ -2637,7 +2236,6 @@ def build_attributes_df(
                     categories_meta_for_ai,
                     attribute_set_label,
                     set_id,
-                    product_data,
                 )
 
                 sku_key = str(sku_value)
@@ -2660,13 +2258,10 @@ def build_attributes_df(
                     if isinstance(value, str) and not value.strip():
                         continue
                     reason = suggestion.get("reason")
-                    evidence = suggestion.get("evidence")
-                    entry_payload: dict[str, object] = {"value": value}
-                    if reason not in (None, ""):
-                        entry_payload["reason"] = reason
-                    if evidence not in (None, ""):
-                        entry_payload["evidence"] = evidence
-                    per_sku[str(code)] = entry_payload
+                    per_sku[str(code)] = {
+                        "value": value,
+                        "reason": reason,
+                    }
 
     return (
         dfs,
@@ -2902,11 +2497,7 @@ def save_step2_to_magento():
         return
 
     staged_map = (step2_state.get("staged") or {}).copy()
-    editor_sources: dict[int, pd.DataFrame] = {}
     if staged_map:
-        for set_id, draft in staged_map.items():
-            if isinstance(draft, pd.DataFrame):
-                editor_sources[set_id] = draft.copy(deep=True)
         for set_id, draft in staged_map.items():
             if not isinstance(draft, pd.DataFrame):
                 continue
@@ -2943,102 +2534,10 @@ def save_step2_to_magento():
         st.info("No changes to save.")
         return
 
-    source_map: dict[int, pd.DataFrame] = (
-        editor_sources if editor_sources else wide_map
-    )
-
     payload_by_sku: dict[str, dict[str, object]] = {}
     errors: list[dict[str, object]] = []
-    applied_summary: dict[str, dict[str, object]] = {}
-    skipped_invalid: dict[str, dict[str, object]] = {}
 
-    def _record_applied(sku: str, code: str, value: object) -> None:
-        if code == "attribute_set_id":
-            return
-        applied_summary.setdefault(sku, {})[code] = value
-
-    def _record_skipped_invalid(sku: str, code: str, value: object) -> None:
-        skipped_invalid.setdefault(sku, {})[code] = value
-
-    step2_state["save_skipped_invalid"] = {}
-
-    def _format_summary_values(values_map: Mapping[str, object] | None) -> str:
-        if not isinstance(values_map, Mapping) or not values_map:
-            return ""
-        parts: list[str] = []
-        for code, raw_value in sorted(values_map.items(), key=lambda item: item[0]):
-            if isinstance(raw_value, (list, tuple, set)):
-                seq = [
-                    str(item)
-                    for item in raw_value
-                    if item not in (None, "")
-                ]
-                value_text = ", ".join(seq)
-            else:
-                value_text = str(raw_value)
-            parts.append(f"{code}={value_text}")
-        return "; ".join(parts)
-
-    def _build_summary_rows() -> list[dict[str, str]]:
-        rows: list[dict[str, str]] = []
-        all_skus = sorted(
-            set(applied_summary.keys()) | set(skipped_invalid.keys())
-        )
-        for sku in all_skus:
-            applied_text = _format_summary_values(applied_summary.get(sku))
-            skipped_text = _format_summary_values(skipped_invalid.get(sku))
-            if not applied_text and not skipped_text:
-                continue
-            rows.append(
-                {
-                    "sku": sku,
-                    "applied": applied_text,
-                    "skipped_invalid": skipped_text,
-                }
-            )
-        return rows
-
-    def _build_label_value_map(meta_entry: Mapping | None) -> dict[str, object]:
-        mapping: dict[str, object] = {}
-        if not isinstance(meta_entry, Mapping):
-            return mapping
-
-        options_map = meta_entry.get("options_map")
-        if isinstance(options_map, Mapping):
-            for key, target in options_map.items():
-                if key in (None, ""):
-                    continue
-                key_text = str(key).strip()
-                if not key_text:
-                    continue
-                mapping.setdefault(key_text, target)
-                mapping.setdefault(key_text.casefold(), target)
-
-        labels_to_values = meta_entry.get("labels_to_values")
-        if isinstance(labels_to_values, Mapping):
-            for label_key, mapped_value in labels_to_values.items():
-                if label_key in (None, ""):
-                    continue
-                label_text = str(label_key).strip()
-                if not label_text:
-                    continue
-                mapping.setdefault(label_text, mapped_value)
-                mapping.setdefault(label_text.casefold(), mapped_value)
-
-        values_to_labels = meta_entry.get("values_to_labels")
-        if isinstance(values_to_labels, Mapping):
-            for value_key in values_to_labels.keys():
-                if value_key in (None, ""):
-                    continue
-                value_text = str(value_key).strip()
-                if not value_text:
-                    continue
-                mapping.setdefault(value_text, value_key)
-                mapping.setdefault(value_text.casefold(), value_key)
-
-        return mapping
-
-    for set_id, wide_df in source_map.items():
+    for set_id, wide_df in wide_map.items():
         if not isinstance(wide_df, pd.DataFrame) or wide_df.empty:
             continue
 
@@ -3128,121 +2627,98 @@ def save_step2_to_magento():
                     or ""
                 )
                 input_type = str(input_type).lower()
-                if attr_code in TEXT_PASS_THROUGH:
-                    input_type = "text"
-
-                lookup_source = meta_info if meta_info else meta
-                labels_lookup_meta, values_lookup_meta = _collect_meta_option_lookups(
-                    lookup_source
-                )
 
                 prepared_value = new_raw
-                original_no_strings_value = new_raw
-                if attr_code == "no_strings":
-                    label_source = meta_info if meta_info else meta
-                    normalized_label = normalize_no_strings(new_raw, label_source)
-                    if normalized_label is None:
-                        _record_skipped_invalid(
-                            sku_value,
-                            attr_code,
-                            original_no_strings_value,
-                        )
-                        continue
-                    new_raw = normalized_label
-                    prepared_value = normalized_label
                 if (
                     attr_code != "categories"
                     and input_type == "multiselect"
                 ):
                     labels = _split_multiselect_input(new_raw)
-                    if not labels:
-                        prepared_value = []
-                    else:
-                        label_to_value = _build_label_value_map(meta_info or meta)
-                        if not label_to_value:
-                            _record_skipped_invalid(sku_value, attr_code, labels)
-                            continue
-                        mapped_ids: list[str] = []
-                        invalid_labels: list[str] = []
-                        for label in labels:
-                            candidate = str(label).strip()
-                            if not candidate:
-                                continue
-                            mapped = (
-                                label_to_value.get(candidate)
-                                or label_to_value.get(candidate.casefold())
-                            )
-                            if mapped is None:
-                                invalid_labels.append(candidate)
-                                continue
-                            mapped_text = str(mapped).strip()
-                            if not mapped_text:
-                                invalid_labels.append(candidate)
-                                continue
-                            if mapped_text not in mapped_ids:
-                                mapped_ids.append(mapped_text)
-                        if invalid_labels or not mapped_ids:
-                            _record_skipped_invalid(sku_value, attr_code, labels)
-                            continue
-                        prepared_value = mapped_ids
+                    label_to_value: dict[str, object] = {}
 
-                if (
-                    attr_code != "categories"
-                    and input_type in {"select", "dropdown", "boolean"}
-                ):
-                    label_to_value = _build_label_value_map(meta_info or meta)
-                    if not label_to_value:
-                        tokens = _split_multiselect_input(new_raw)
-                        _record_skipped_invalid(sku_value, attr_code, tokens or [new_raw])
-                        continue
-                    tokens: list[str] = []
-                    if isinstance(new_raw, str):
-                        tokens = [new_raw]
-                    elif isinstance(new_raw, (list, tuple, set)):
-                        tokens = [str(item) for item in new_raw]
-                    elif isinstance(new_raw, Mapping):
-                        label_hint = new_raw.get("label")
-                        if isinstance(label_hint, str):
-                            tokens = [label_hint]
+                    options_map = meta_info.get("options_map") if isinstance(meta_info, dict) else {}
+                    if isinstance(options_map, dict):
+                        for key, target in options_map.items():
+                            if isinstance(key, str):
+                                cleaned_key = key.strip()
+                                if not cleaned_key:
+                                    continue
+                                label_to_value.setdefault(cleaned_key, target)
+                                label_to_value.setdefault(cleaned_key.casefold(), target)
+                            else:
+                                key_str = str(key).strip()
+                                if not key_str:
+                                    continue
+                                label_to_value.setdefault(key_str, target)
+
+                    labels_to_values = meta_info.get("labels_to_values") if isinstance(meta_info, dict) else {}
+                    if not isinstance(labels_to_values, dict):
+                        labels_to_values = {}
+
+                    if not labels_to_values:
+                        values_to_labels = meta_info.get("values_to_labels") if isinstance(meta_info, dict) else {}
+                        if isinstance(values_to_labels, dict):
+                            for value_key, label in values_to_labels.items():
+                                if not isinstance(label, str):
+                                    continue
+                                cleaned_label = label.strip()
+                                if not cleaned_label:
+                                    continue
+                                labels_to_values.setdefault(cleaned_label, value_key)
+                                labels_to_values.setdefault(cleaned_label.casefold(), value_key)
+                    else:
+                        normalized_labels_to_values: dict[str, object] = {}
+                        for label_key, mapped_value in labels_to_values.items():
+                            if not isinstance(label_key, str):
+                                continue
+                            cleaned_label = label_key.strip()
+                            if not cleaned_label:
+                                continue
+                            normalized_labels_to_values.setdefault(cleaned_label, mapped_value)
+                            normalized_labels_to_values.setdefault(cleaned_label.casefold(), mapped_value)
+                        labels_to_values = normalized_labels_to_values
+
+                    for label_key, mapped_value in labels_to_values.items():
+                        label_to_value.setdefault(label_key, mapped_value)
+
+                    mapped_ids: list[object] = []
+                    for label in labels:
+                        if not isinstance(label, str):
+                            text_label = str(label).strip()
                         else:
-                            value_hint = new_raw.get("value")
-                            if isinstance(value_hint, str):
-                                tokens = [value_hint]
-                    if not tokens and isinstance(prepared_value, str):
-                        tokens = [prepared_value]
-                    if not tokens and isinstance(prepared_value, bool):
-                        tokens = ["1" if prepared_value else "0"]
-                    if not tokens and prepared_value not in (None, ""):
-                        tokens = [str(prepared_value)]
-                    cleaned_tokens = [
-                        str(token).strip() for token in tokens if str(token).strip()
-                    ]
-                    if not cleaned_tokens:
-                        _record_skipped_invalid(sku_value, attr_code, tokens)
-                        continue
-                    invalid_labels: list[str] = []
-                    mapped_values: list[str] = []
-                    for token in cleaned_tokens:
-                        mapped = (
-                            label_to_value.get(token)
-                            or label_to_value.get(token.casefold())
-                        )
-                        if mapped is None:
-                            invalid_labels.append(token)
+                            text_label = label.strip()
+                        if not text_label:
                             continue
-                        mapped_text = str(mapped).strip()
-                        if not mapped_text:
-                            invalid_labels.append(token)
+
+                        candidate = label_to_value.get(text_label)
+                        if candidate is None:
+                            candidate = label_to_value.get(text_label.casefold())
+                        if candidate is None:
+                            candidate = label_to_value.get(text_label.lower())
+                        if candidate is None:
+                            try:
+                                candidate = int(text_label)
+                            except (TypeError, ValueError):
+                                candidate = text_label
+
+                        if candidate in (None, ""):
                             continue
-                        mapped_values.append(mapped_text)
-                    if invalid_labels or not mapped_values:
-                        _record_skipped_invalid(
-                            sku_value,
-                            attr_code,
-                            cleaned_tokens,
-                        )
-                        continue
-                    prepared_value = mapped_values[0]
+
+                        if isinstance(candidate, str):
+                            candidate_str = candidate.strip()
+                            if not candidate_str:
+                                continue
+                            try:
+                                candidate_val: object = int(candidate_str)
+                            except (TypeError, ValueError):
+                                candidate_val = candidate_str
+                        else:
+                            candidate_val = candidate
+
+                        if candidate_val not in mapped_ids:
+                            mapped_ids.append(candidate_val)
+
+                    prepared_value = mapped_ids
 
                 try:
                     normalized = normalize_for_magento(attr_code, prepared_value, meta_cache)
@@ -3296,27 +2772,13 @@ def save_step2_to_magento():
                     continue
 
                 payload_by_sku.setdefault(sku_value, {})[attr_code] = normalized
-                _record_applied(sku_value, attr_code, normalized)
 
             entry = payload_by_sku.get(sku_value)
             if entry and set(entry.keys()) == {"attribute_set_id"}:
                 payload_by_sku.pop(sku_value, None)
 
-    step2_state["save_skipped_invalid"] = {
-        sku: dict(values)
-        for sku, values in skipped_invalid.items()
-    }
-
     if not payload_by_sku and not errors:
-        summary_rows = _build_summary_rows()
-        if summary_rows:
-            st.info("No valid attributes to save; some values were skipped.")
-            st.dataframe(
-                pd.DataFrame(summary_rows),
-                use_container_width=True,
-            )
-        else:
-            st.info("No changes to save.")
+        st.info("No changes to save.")
         return
 
     api_base = st.session_state.get("ai_api_base")
@@ -3339,13 +2801,6 @@ def save_step2_to_magento():
                     "expected_codes": "",
                 }
             )
-
-    summary_rows = _build_summary_rows()
-    if summary_rows:
-        st.dataframe(
-            pd.DataFrame(summary_rows, columns=["sku", "applied", "skipped_invalid"]),
-            use_container_width=True,
-        )
 
     if ok_skus:
         st.success("Updated SKUs:")
@@ -4570,19 +4025,10 @@ if df_original_key in st.session_state:
                                                     "✅ DF BEFORE AI",
                                                     df_before_ai[["sku", "categories"]].head(5),
                                                 )
-                                            if isinstance(meta_cache, AttributeMetaCache):
-                                                meta_cache.build_and_set_static_for(
-                                                    [
-                                                        "brand",
-                                                        "country_of_manufacture",
-                                                    ],
-                                                    store_id=0,
-                                                )
                                             (
                                                 updated_df,
                                                 filled_cells,
                                                 ai_log_entries,
-                                                skipped_invalid_attrs,
                                             ) = (
                                                 _apply_ai_suggestions_to_wide(
                                                     step2_state["wide"].get(set_id),
@@ -4609,15 +4055,6 @@ if df_original_key in st.session_state:
                                                     ai_logs_map[set_id] = ai_log_entries
                                                 else:
                                                     ai_logs_map.pop(set_id, None)
-                                                invalid_map = step2_state.setdefault(
-                                                    "ai_invalid_suggestions", {}
-                                                )
-                                                if skipped_invalid_attrs:
-                                                    invalid_map[set_id] = (
-                                                        skipped_invalid_attrs
-                                                    )
-                                                else:
-                                                    invalid_map.pop(set_id, None)
                                         _ensure_wide_meta_options(
                                             meta_map,
                                             step2_state["wide"].get(set_id),
@@ -4803,7 +4240,6 @@ if df_original_key in st.session_state:
                                                 updated_df,
                                                 filled_cells,
                                                 ai_log_entries,
-                                                invalid_options,
                                             ) = (
                                                 _apply_ai_suggestions_to_wide(
                                                     step2_state["wide"].get(set_id),
@@ -4825,13 +4261,6 @@ if df_original_key in st.session_state:
                                                     ai_logs_map[set_id] = ai_log_entries
                                                 else:
                                                     ai_logs_map.pop(set_id, None)
-                                                invalid_map = step2_state.setdefault(
-                                                    "ai_invalid_suggestions", {}
-                                                )
-                                                if invalid_options:
-                                                    invalid_map[set_id] = invalid_options
-                                                else:
-                                                    invalid_map.pop(set_id, None)
                                         _ensure_wide_meta_options(
                                             meta_map,
                                             step2_state["wide"].get(set_id),
@@ -5195,8 +4624,6 @@ if df_original_key in st.session_state:
                                         step2_state.get("ai_suggestions"),
                                         step2_state.get("ai_cells"),
                                         step2_state.get("ai_logs"),
-                                        step2_state.get("ai_invalid_suggestions"),
-                                        step2_state.get("save_skipped_invalid"),
                                     )
                                     with st.expander("🧠 AI suggestions log"):
                                         if ai_log_payload:
