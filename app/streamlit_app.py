@@ -928,6 +928,8 @@ def _apply_ai_suggestions_to_wide(
     if not isinstance(suggestions, dict):
         return wide_df, [], []
 
+    DEBUG = bool(st.session_state.get("debug_ai", True))
+
     def is_empty(v: object) -> bool:
         if v is None:
             return True
@@ -951,6 +953,27 @@ def _apply_ai_suggestions_to_wide(
         if len(text) <= limit:
             return text
         return text[: limit - 1] + "…"
+
+    def _preview_existing(mask: pd.Series, column: str) -> list:
+        if column not in updated.columns:
+            return []
+        try:
+            series = updated.loc[mask, column]
+        except Exception:
+            return []
+        try:
+            unique_values = pd.unique(series)
+        except Exception:
+            try:
+                unique_values = series.unique()
+            except Exception:
+                return []
+        preview: list = []
+        for item in unique_values:
+            preview.append(item)
+            if len(preview) >= 3:
+                break
+        return preview
 
     def _mark_ai_filled(
         container: dict[tuple[str, str], dict[str, object]],
@@ -1028,7 +1051,16 @@ def _apply_ai_suggestions_to_wide(
         if not row_mask.any():
             continue
         row_indices = updated.index[row_mask]
-        for code, payload in attrs_payload.items():
+        ai_suggested = attrs_payload if isinstance(attrs_payload, Mapping) else {}
+        if DEBUG:
+            try:
+                suggested_len = len(ai_suggested)
+            except Exception:
+                suggested_len = 0
+            print(
+                f"[DEBUG AI APPLY] SKU={sku_value} → AI suggested {suggested_len} attrs"
+            )
+        for code, payload in ai_suggested.items():
             code_key = str(code)
             if code_key not in updated.columns:
                 try:
@@ -1075,6 +1107,12 @@ def _apply_ai_suggestions_to_wide(
                 meta = meta_candidate
             else:
                 meta = {"code": code_key, "frontend_input": "text"}
+            allowed_for_set_info = suggestion_payload.get("allowed_for_set")
+            allowed_for_set_map = (
+                allowed_for_set_info
+                if isinstance(allowed_for_set_info, Mapping)
+                else {}
+            )
             input_type_source = (
                 meta.get("frontend_input")
                 if isinstance(meta, Mapping)
@@ -1083,18 +1121,30 @@ def _apply_ai_suggestions_to_wide(
             if isinstance(meta, Mapping) and not input_type_source:
                 input_type_source = meta.get("backend_type")
             input_type = str(input_type_source or "text").lower()
-            allowed_for_set = True
-            if input_type in {"multiselect", "select"}:
-                allowed_for_set_flag = suggestion_payload.get("allowed_for_set")
-                if isinstance(allowed_for_set_flag, Mapping):
-                    allowed_for_set = bool(allowed_for_set_flag.get("value", True))
-                elif allowed_for_set_flag is None:
-                    allowed_for_set = True
-                else:
-                    try:
-                        allowed_for_set = bool(allowed_for_set_flag)
-                    except Exception:
-                        allowed_for_set = True
+            if isinstance(allowed_for_set_info, Mapping):
+                allowed_for_set_value = bool(allowed_for_set_info.get("value", True))
+            elif allowed_for_set_info is None:
+                allowed_for_set_value = True
+            else:
+                try:
+                    allowed_for_set_value = bool(allowed_for_set_info)
+                except Exception:
+                    allowed_for_set_value = True
+            if DEBUG:
+                options_count = (
+                    len(meta.get("options", []))
+                    if isinstance(meta, Mapping)
+                    else "N/A"
+                )
+                allowed_debug = None
+                if isinstance(allowed_for_set_map, Mapping):
+                    allowed_debug = allowed_for_set_map.get(code_key)
+                    if allowed_debug is None:
+                        allowed_debug = allowed_for_set_map.get("value")
+                print(
+                    f"[DEBUG META] {code_key}: type={meta.get('frontend_input') if isinstance(meta, Mapping) else None} "
+                    f"options={options_count} allowed_for_set={allowed_debug}"
+                )
             allowed_multiselect_labels: dict[str, str] | None = None
             multiselect_values_to_labels: dict[str, str] | None = None
             allowed_select_labels: dict[str, str] | None = None
@@ -1152,7 +1202,13 @@ def _apply_ai_suggestions_to_wide(
                             int_value = int(value_text)
                             select_values_to_labels.setdefault(str(int_value), canonical_label)
                             select_values_to_labels.setdefault(int_value, canonical_label)
-            if input_type in {"multiselect", "select"} and not allowed_for_set:
+            if input_type in {"multiselect", "select"} and not allowed_for_set_value:
+                skip_reason = "not-applicable-for-set"
+                if DEBUG:
+                    print(
+                        f"[DEBUG SKIP] {code_key} skipped — reason={skip_reason} "
+                        f"existing={_preview_existing(row_mask, code_key)}"
+                    )
                 ai_log.append(
                     {
                         "sku": sku_value,
@@ -1163,10 +1219,21 @@ def _apply_ai_suggestions_to_wide(
                 )
                 continue
 
-            converted_value = _coerce_ai_value(ai_value, meta)
+            coerced_value = _coerce_ai_value(ai_value, meta)
+            if DEBUG:
+                print(
+                    f"[DEBUG VALUE] {code_key}: ai_raw={ai_value!r}, coerced={coerced_value!r}"
+                )
+            converted_value = coerced_value
 
             if input_type in TEXT_INPUT_TYPES:
                 if converted_value in (None, ""):
+                    skip_reason = "empty-after-coerce"
+                    if DEBUG:
+                        print(
+                            f"[DEBUG SKIP] {code_key} skipped — reason={skip_reason} "
+                            f"existing={_preview_existing(row_mask, code_key)}"
+                        )
                     ai_log.append(
                         {
                             "sku": sku_value,
@@ -1181,6 +1248,12 @@ def _apply_ai_suggestions_to_wide(
                 else:
                     trimmed_value = str(converted_value).strip()
                 if not trimmed_value:
+                    skip_reason = "empty-after-coerce"
+                    if DEBUG:
+                        print(
+                            f"[DEBUG SKIP] {code_key} skipped — reason={skip_reason} "
+                            f"existing={_preview_existing(row_mask, code_key)}"
+                        )
                     ai_log.append(
                         {
                             "sku": sku_value,
@@ -1316,6 +1389,10 @@ def _apply_ai_suggestions_to_wide(
                     ]
 
                     if combined_ids != existing_ids:
+                        if DEBUG:
+                            print(
+                                f"[DEBUG APPLY] Writing {code_key}={combined_ids!r} for {row_mask.sum()} rows"
+                            )
                         updated.at[idx, code_key] = combined_ids
                         if column_empty_mask is not None:
                             column_empty_mask.at[idx] = is_empty(combined_ids)
@@ -1345,6 +1422,14 @@ def _apply_ai_suggestions_to_wide(
                             }
                         )
                     else:
+                        skip_reason = (
+                            "non-empty" if existing_ids else "not-applicable-for-set"
+                        )
+                        if DEBUG:
+                            print(
+                                f"[DEBUG SKIP] {code_key} skipped — reason={skip_reason} "
+                                f"existing={existing_ids[:3]}"
+                            )
                         ai_log.append(
                             {
                                 "sku": sku_value,
@@ -1399,6 +1484,11 @@ def _apply_ai_suggestions_to_wide(
                             )
                         ai_values = filtered_ai_values
                     if not ai_values:
+                        if DEBUG:
+                            print(
+                                f"[DEBUG SKIP] {code_key} skipped — reason=not-applicable-for-set "
+                                f"existing={_preview_existing(row_mask, code_key)}"
+                            )
                         ai_log.append(
                             {
                                 "sku": sku_value,
@@ -1421,6 +1511,10 @@ def _apply_ai_suggestions_to_wide(
                         new_items.append(item)
                     if new_items:
                         combined = existing_list + new_items
+                        if DEBUG:
+                            print(
+                                f"[DEBUG APPLY] Writing {code_key}={combined!r} for {row_mask.sum()} rows"
+                            )
                         updated.at[idx, code_key] = combined
                         if column_empty_mask is not None:
                             column_empty_mask.at[idx] = is_empty(combined)
@@ -1454,6 +1548,11 @@ def _apply_ai_suggestions_to_wide(
                             }
                         )
                     elif skipped_duplicates:
+                        if DEBUG:
+                            print(
+                                f"[DEBUG SKIP] {code_key} skipped — reason=duplicates "
+                                f"existing={existing_list[:3]}"
+                            )
                         ai_log.append(
                             {
                                 "sku": sku_value,
@@ -1463,6 +1562,11 @@ def _apply_ai_suggestions_to_wide(
                             }
                         )
                     else:
+                        if DEBUG:
+                            print(
+                                f"[DEBUG SKIP] {code_key} skipped — reason=not-applicable-for-set "
+                                f"existing={existing_list[:3]}"
+                            )
                         ai_log.append(
                             {
                                 "sku": sku_value,
@@ -1488,6 +1592,11 @@ def _apply_ai_suggestions_to_wide(
                         candidate_text = str(candidate_raw).strip()
 
                     if not candidate_text:
+                        if DEBUG:
+                            print(
+                                f"[DEBUG SKIP] {code_key} skipped — reason=not-applicable-for-set "
+                                f"existing={_preview_existing(row_mask, code_key)}"
+                            )
                         ai_log.append(
                             {
                                 "sku": sku_value,
@@ -1518,6 +1627,11 @@ def _apply_ai_suggestions_to_wide(
                     converted_value = canonical_label
 
                 if not is_empty(existing_raw):
+                    if DEBUG:
+                        print(
+                            f"[DEBUG SKIP] {code_key} skipped — reason=non-empty "
+                            f"existing={_preview_existing(row_mask, code_key)}"
+                        )
                     ai_log.append(
                         {
                             "sku": sku_value,
@@ -1530,6 +1644,10 @@ def _apply_ai_suggestions_to_wide(
 
                 converted_value = normalize_units(code_key, converted_value)
 
+                if DEBUG:
+                    print(
+                        f"[DEBUG APPLY] Writing {code_key}={converted_value!r} for {row_mask.sum()} rows"
+                    )
                 updated.at[idx, code_key] = converted_value
                 if column_empty_mask is not None:
                     column_empty_mask.at[idx] = is_empty(converted_value)
