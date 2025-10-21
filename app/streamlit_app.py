@@ -48,6 +48,7 @@ from services.ai_fill import (
     normalize_category_label,
     probe_api_base,
 )
+from services.llm_extract import is_numeric_spec
 from services.inventory import (
     get_attr_set_id,
     get_backorders_parallel,
@@ -56,7 +57,7 @@ from services.inventory import (
     iter_products_by_attr_set,
     list_attribute_sets,
 )
-from services.normalizers import _coerce_ai_value, normalize_for_magento
+from services.normalizers import _coerce_ai_value, normalize_for_magento, normalize_units
 from utils.http import build_magento_headers, get_session
 
 
@@ -989,13 +990,26 @@ def _apply_ai_suggestions_to_wide(
         sku_value = str(raw_sku)
         attrs_payload = dict(attrs)
         meta_payload = attrs_payload.pop("__meta__", None)
+        regex_hint_map: Mapping[str, object] | dict[str, object] = {}
         if isinstance(meta_payload, Mapping):
             meta_entry = {"sku": sku_value}
             for key, value in meta_payload.items():
                 if value is None:
                     continue
                 meta_entry[key] = value
+            regex_hints_candidate = meta_payload.get("regex_hints")
+            if isinstance(regex_hints_candidate, Mapping):
+                regex_hint_map = dict(regex_hints_candidate)
             ai_log.append(meta_entry)
+        else:
+            regex_hint_map = {}
+        if isinstance(regex_hint_map, Mapping):
+            for regex_code, regex_value in list(regex_hint_map.items()):
+                if regex_code not in attrs_payload and not is_empty(regex_value):
+                    attrs_payload[regex_code] = {
+                        "value": regex_value,
+                        "reason": "Regex pre-extract",
+                    }
         row_mask = updated[sku_col].astype(str) == sku_value
         if not row_mask.any():
             continue
@@ -1006,6 +1020,26 @@ def _apply_ai_suggestions_to_wide(
                 continue
             suggestion_payload = payload if isinstance(payload, dict) else {"value": payload}
             ai_value = suggestion_payload.get("value")
+            regex_candidate = None
+            if isinstance(regex_hint_map, Mapping):
+                regex_candidate = regex_hint_map.get(code_key)
+            use_regex = False
+            if not is_empty(regex_candidate):
+                if is_empty(ai_value):
+                    use_regex = True
+                elif is_numeric_spec(code_key):
+                    regex_text = str(regex_candidate).strip()
+                    ai_text = str(ai_value).strip()
+                    if regex_text and ai_text and regex_text != ai_text:
+                        use_regex = True
+            log_details: dict[str, object] | None = None
+            if use_regex:
+                ai_value = regex_candidate
+                suggestion_payload = dict(suggestion_payload)
+                suggestion_payload["value"] = ai_value
+                if not suggestion_payload.get("reason"):
+                    suggestion_payload["reason"] = "Regex pre-extract"
+                log_details = {"used_regex": True, "value": ai_value}
             if is_empty(ai_value):
                 continue
             meta = meta_map.get(code_key, {}) if isinstance(meta_map, dict) else {}
@@ -1338,14 +1372,14 @@ def _apply_ai_suggestions_to_wide(
                             )
 
                     if canonical_label is None:
-                        if allowed_select_labels or select_values_to_labels:
-                            continue
                         canonical_label = candidate_text
 
                     converted_value = canonical_label
 
                 if not is_empty(existing_raw):
                     continue
+
+                converted_value = normalize_units(code_key, converted_value)
 
                 updated.at[idx, code_key] = converted_value
                 _mark_ai_filled(
@@ -1354,7 +1388,7 @@ def _apply_ai_suggestions_to_wide(
                     col_key=code_key,
                     sku_value=sku_value,
                     value=converted_value,
-                    log_entry=None,
+                    log_entry=log_details,
                 )
 
     return updated, list(ai_cells.values()), ai_log

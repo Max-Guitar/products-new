@@ -1,7 +1,67 @@
 """Normalization helpers for Magento attribute payloads."""
 from __future__ import annotations
 
+import math
+import re
 from typing import Any
+
+
+INCH_PER_MM = 1 / 25.4
+
+MEASURE_ATTRS = {
+    "scale_mensur",
+    "neck_radius",
+    "neck_nutwidth",
+    "nut_width",
+}
+
+
+def _format_inch_value(value: float) -> str:
+    rounded = round(value, 2)
+    if math.isclose(rounded, int(round(rounded))):
+        return f"{int(round(rounded))}\""
+    text = f"{rounded:.2f}".rstrip("0").rstrip(".")
+    return f"{text}\""
+
+
+def normalize_units(attr: str, value: Any) -> Any:
+    """Normalize unit-based attributes to inches with two decimals."""
+
+    if attr not in MEASURE_ATTRS:
+        return value
+    if value in (None, ""):
+        return value
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return _format_inch_value(float(value))
+
+    text = str(value).strip()
+    if not text:
+        return value
+
+    mm_match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*mm", text, re.IGNORECASE)
+    if mm_match:
+        try:
+            numeric = float(mm_match.group(1))
+        except ValueError:
+            return value
+        inches = numeric * INCH_PER_MM
+        return _format_inch_value(inches)
+
+    inch_match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(?:in|inch|\")", text, re.IGNORECASE)
+    if inch_match:
+        try:
+            numeric = float(inch_match.group(1))
+        except ValueError:
+            return value
+        return _format_inch_value(numeric)
+
+    # Plain numeric string without unit
+    try:
+        numeric = float(text)
+    except ValueError:
+        return value
+    return _format_inch_value(numeric)
 
 
 def _coerce_ai_value(value: object, meta: dict | None) -> object:
@@ -156,6 +216,8 @@ def normalize_for_magento(code: str, val: Any, meta: AttributeMetaCache | None):
 
     if _is_blank(val):
         return None
+
+    val = normalize_units(code, val)
 
     info: dict[str, Any] | None = None
     if isinstance(meta, AttributeMetaCache):

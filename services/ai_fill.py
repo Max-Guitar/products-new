@@ -17,6 +17,14 @@ import streamlit as st
 
 from utils.http import MAGENTO_REST_PATH_CANDIDATES, build_magento_headers
 
+from services.llm_extract import (
+    RegexExtraction,
+    build_retry_questions,
+    is_numeric_spec,
+    regex_extract,
+    shortlist_allowed_values,
+)
+
 
 ALWAYS_ATTRS: Set[str] = {"brand", "country_of_manufacture", "short_description"}
 
@@ -153,7 +161,17 @@ AI_RULES_TEXT = (
     "- Значения мультиселектов представляй как массив строк, без дублей.\n"
     "- Булевы значения задавай как true/false.\n"
     "- Для категорий используй текстовые лейблы.\n"
-    "- Если данных недостаточно — возвращай пустое значение."
+    "- Если данных недостаточно — возвращай пустое значение.\n"
+    "\n"
+    "Примеры:\n"
+    "Вход: {\"sku\":\"ACOUSTIC-1\",\"name\":\"Taylor GS Mini\",\"attribute_set_name\":\"Acoustic guitar\","
+    "\"known_values\":{},\"missing\":[{\"code\":\"scale_mensur\"},{\"code\":\"amount_of_frets\"}] }\n"
+    "Выход: {\"attributes\":[{\"code\":\"scale_mensur\",\"value\":\"23.5\"\",\"reason\":\"spec sheet\"},{\"code\":\"amount_of_frets\",\"value\":\"20\",\"reason\":\"product description\"}]}\n"
+    "Вход: {\"sku\":\"ELECTRIC-1\",\"name\":\"Fender Player Stratocaster\",\"attribute_set_name\":\"Electric guitar\","
+    "\"current_attributes\":{\"guitarstylemultiplechoice\":[\"S-Style\"]},\"missing\":[{\"code\":\"neck_radius\"}]}\n"
+    "Выход: {\"attributes\":[{\"code\":\"neck_radius\",\"value\":\"9.5\"\",\"reason\":\"spec sheet\"}]}\n"
+    "Вход: {\"sku\":\"BASS-1\",\"name\":\"Ibanez SR500 Bass Guitar\",\"missing\":[{\"code\":\"body_material\"},{\"code\":\"scale_mensur\"}]}\n"
+    "Выход: {\"attributes\":[{\"code\":\"body_material\",\"value\":\"mahogany\",\"reason\":\"product description\"},{\"code\":\"scale_mensur\",\"value\":\"34\"\",\"reason\":\"spec sheet\"}]}"
 )
 
 AI_RULES_HASH = hashlib.sha256(AI_RULES_TEXT.encode("utf-8")).hexdigest()
@@ -168,6 +186,19 @@ STYLE_KEYWORDS: Tuple[Tuple[str, str], ...] = (
 STYLE_CASCADE: Mapping[str, str] = {
     "T-Style": "Single cut",
     "S-Style": "Double cut",
+}
+
+BRAND_EXTRA_ALIASES: Mapping[str, tuple[str, ...]] = {
+    "Fender": ("fender", "squier"),
+    "Gibson": ("gibson", "epiphone"),
+    "Ibanez": ("ibanez",),
+    "Yamaha": ("yamaha",),
+    "Taylor": ("taylor",),
+    "Martin": ("martin", "martin & co", "c.f. martin"),
+    "PRS": ("prs", "paul reed smith"),
+    "Gretsch": ("gretsch",),
+    "Jackson": ("jackson",),
+    "ESP": ("esp", "esp ltd", "ltd"),
 }
 
 
@@ -343,9 +374,40 @@ def _normalize_category_candidate(
     return normalize_category_label(text, categories_meta)
 
 
+def _collect_brand_aliases(
+    brand_meta: Mapping[str, object] | None,
+) -> dict[str, set[str]]:
+    aliases: dict[str, set[str]] = {}
+    if isinstance(brand_meta, Mapping):
+        options = brand_meta.get("options")
+        if isinstance(options, Iterable):
+            for option in options:
+                if not isinstance(option, Mapping):
+                    continue
+                label = option.get("label")
+                if not isinstance(label, str):
+                    continue
+                canonical = label.strip()
+                if not canonical:
+                    continue
+                alias_set = aliases.setdefault(canonical, set())
+                alias_set.add(canonical.casefold())
+                for part in re.split(r"[\s/&-]+", canonical.lower()):
+                    cleaned = part.strip()
+                    if cleaned:
+                        alias_set.add(cleaned)
+
+    for canonical, extra in BRAND_EXTRA_ALIASES.items():
+        alias_set = aliases.setdefault(canonical, set())
+        for token in extra:
+            alias_set.add(token.casefold())
+
+    return aliases
+
+
 def _guess_brand_from_name(
     product_name: object,
-    categories_meta: Mapping[str, object] | None,
+    brand_meta: Mapping[str, object] | None,
 ) -> str | None:
     """Heuristically detect a brand hint from the product name using known brands."""
 
@@ -356,28 +418,23 @@ def _guess_brand_from_name(
     if not name_text:
         return None
 
-    categories_meta = categories_meta if isinstance(categories_meta, Mapping) else {}
-    labels_to_values = categories_meta.get("labels_to_values")
-    if not isinstance(labels_to_values, Mapping) or not labels_to_values:
+    aliases = _collect_brand_aliases(brand_meta)
+    if not aliases:
         return None
 
-    seen: Set[str] = set()
-    sorted_labels = sorted(
-        (
-            str(label).strip()
-            for label in labels_to_values.keys()
-            if str(label or "").strip()
-        ),
-        key=lambda value: (-len(value), value.casefold()),
-    )
+    lowered = name_text.casefold()
+    sorted_aliases: list[tuple[str, str]] = []
+    for canonical, variants in aliases.items():
+        for variant in variants:
+            if not variant:
+                continue
+            sorted_aliases.append((canonical, variant))
+    sorted_aliases.sort(key=lambda item: (-len(item[1]), item[1]))
 
-    for label in sorted_labels:
-        if label in seen:
-            continue
-        seen.add(label)
-        pattern = re.compile(rf"(?<!\w){re.escape(label)}(?!\w)", re.IGNORECASE)
-        if pattern.search(name_text):
-            return label
+    for canonical, alias in sorted_aliases:
+        pattern = re.compile(rf"(?<!\w){re.escape(alias)}(?!\w)", re.IGNORECASE)
+        if pattern.search(lowered):
+            return canonical
 
     return None
 
@@ -420,6 +477,20 @@ def _sanitize_hints(hints: Mapping[str, object] | None) -> dict[str, object]:
                 sanitized[key] = normalized
             continue
         if _is_blank(value):
+            continue
+        if isinstance(value, Mapping):
+            nested: dict[str, object] = {}
+            for nested_key, nested_value in value.items():
+                if not isinstance(nested_key, str):
+                    continue
+                if _is_blank(nested_value):
+                    continue
+                if isinstance(nested_value, (str, bool, int, float)):
+                    nested[nested_key] = nested_value
+                else:
+                    nested[nested_key] = str(nested_value)
+            if nested:
+                sanitized[key] = nested
             continue
         if isinstance(value, (str, bool, int, float)):
             sanitized[key] = value
@@ -597,6 +668,7 @@ def get_attribute_sets_map(session: requests.Session, api_base: str) -> Dict[int
 
 
 _meta_cache: MutableMapping[str, dict] = {}
+_options_cache: MutableMapping[str, list] = {}
 _CATEGORIES_CACHE: Optional[List[str]] = None
 
 
@@ -614,6 +686,33 @@ def get_attribute_meta(session: requests.Session, api_base: str, code: str) -> d
         _meta_cache[code] = resp.json()
     else:
         _meta_cache[code] = {}
+
+    if code not in _options_cache:
+        options_url = _build_url(
+            api_base,
+            f"/products/attributes/{quote(code, safe='')}/options?storeId=0",
+        )
+        try:
+            opts_resp = session.get(
+                options_url, headers=_magento_headers(session), timeout=15
+            )
+        except requests.RequestException:
+            _options_cache[code] = []
+        else:
+            content_type = opts_resp.headers.get("Content-Type", "").lower()
+            if opts_resp.ok and ("json" in content_type or _looks_like_json(opts_resp.text)):
+                data = opts_resp.json()
+                if isinstance(data, list):
+                    _options_cache[code] = data
+                else:
+                    _options_cache[code] = []
+            else:
+                _options_cache[code] = []
+
+    if code in _options_cache and _options_cache[code]:
+        meta_with_options = dict(_meta_cache[code])
+        meta_with_options["options"] = _options_cache[code]
+        _meta_cache[code] = meta_with_options
     return _meta_cache[code]
 
 
@@ -762,7 +861,7 @@ def _openai_complete(
     kwargs = {
         "model": model,
         "input": messages_payload,
-        "temperature": 0,
+        "temperature": 0.1,
         "timeout": timeout,
     }
     if isinstance(conv, AiConversation) and conv.conversation_id:
@@ -776,7 +875,7 @@ def _openai_complete(
             chat_response = client.chat.completions.create(
                 model=model,
                 messages=messages_payload,
-                temperature=0,
+                temperature=0.1,
                 timeout=timeout,
             )
         except Exception as exc:  # pragma: no cover - network error handling
@@ -892,6 +991,9 @@ def enrich_ai_suggestions(
     brand_hint_values = _ensure_list_of_strings(normalized_hints.get("brand_hint"))
     set_hint_values = _ensure_list_of_strings(normalized_hints.get("set_hint"))
     brand_attr_values = _ensure_list_of_strings((by_code.get("brand") or {}).get("value"))
+    brand_hint_reason_text = str(
+        normalized_hints.get("brand_hint_reason") or ""
+    ).strip()
     attribute_set_candidates: list[str] = []
     if attribute_set_name and not _is_blank(attribute_set_name):
         attribute_set_candidates.append(str(attribute_set_name).strip())
@@ -970,6 +1072,15 @@ def enrich_ai_suggestions(
             category_entry["unmatched_labels"] = list(combined_ignored)
             if "categories" not in order:
                 order.append("categories")
+
+    if not brand_attr_values and brand_hint_values:
+        brand_entry = by_code.setdefault("brand", {"code": "brand"})
+        brand_entry["value"] = brand_hint_values[0]
+        brand_entry["reason"] = (
+            brand_hint_reason_text or brand_entry.get("reason") or "Brand found in product name"
+        )
+        if "brand" not in order:
+            order.append("brand")
 
     # Style enrichment using hints and detected model/series
     existing_styles = _ensure_list_of_strings(
@@ -1082,6 +1193,10 @@ def infer_missing(
     bool_codes: Set[str] = set()
     missing_codes: Set[str] = set()
     force_codes: Set[str] = {"categories", "guitarstylemultiplechoice"}
+    meta_by_code: Dict[str, dict] = {}
+    brand_meta = get_attribute_meta(session, api_base, "brand")
+    regex_info: RegexExtraction | None = None
+    brand_hint_reason: str | None = None
     global _CATEGORIES_CACHE
 
     for raw_code, row in df_full.iterrows():
@@ -1135,6 +1250,7 @@ def infer_missing(
         current_value = label if not _is_blank(label) else raw_value
         if code in allowed_set and _is_blank(current_value):
             meta = get_attribute_meta(session, api_base, code)
+            meta_by_code[code] = meta
             missing.append(
                 {
                     "code": code,
@@ -1149,6 +1265,8 @@ def infer_missing(
             missing_codes.add(code)
         elif code in allowed_set and not _is_blank(current_value):
             known[code] = str(current_value)
+            if code not in meta_by_code:
+                meta_by_code[code] = get_attribute_meta(session, api_base, code)
 
     ai_codes = sorted(
         {
@@ -1161,12 +1279,45 @@ def infer_missing(
     )
 
     short_desc = ""
+    long_desc = ""
+    extra_texts: list[str] = []
     for attr in product.get("custom_attributes", []) or []:
-        if attr.get("attribute_code") == "short_description":
-            short_desc = _strip_html(attr.get("value"))
-            break
+        code_value = attr.get("attribute_code")
+        cleaned = _strip_html(attr.get("value"))
+        if not cleaned:
+            continue
+        if code_value == "short_description" and not short_desc:
+            short_desc = cleaned
+        elif code_value == "description" and not long_desc:
+            long_desc = cleaned
+        else:
+            extra_texts.append(cleaned)
 
-    sanitized_hints = _sanitize_hints(hints)
+    base_hints: dict[str, object] = dict(hints or {}) if isinstance(hints, Mapping) else {}
+    text_candidates = [
+        product.get("name"),
+        short_desc,
+        long_desc,
+        product.get("description"),
+        product.get("meta_description"),
+    ]
+    text_candidates.extend(extra_texts)
+    normalized_texts = [
+        _strip_html(item) if item not in (None, "") else ""
+        for item in text_candidates
+    ]
+    regex_source = "\n".join(text for text in normalized_texts if text)
+    regex_info = regex_extract(regex_source)
+    if isinstance(base_hints.get("regex_hints"), Mapping):
+        combined_regex = dict(base_hints.get("regex_hints"))
+    else:
+        combined_regex = {}
+    if regex_info.values:
+        combined_regex.update(regex_info.values)
+    if combined_regex:
+        base_hints["regex_hints"] = combined_regex
+
+    sanitized_hints = _sanitize_hints(base_hints)
     attribute_set_name = sanitized_hints.get("attribute_set_name") or sanitized_hints.get(
         "set_hint"
     )
@@ -1178,10 +1329,12 @@ def infer_missing(
     if _is_blank(sanitized_hints.get("brand_hint")) and _is_blank(brand_current):
         guessed_brand = _guess_brand_from_name(
             (product or {}).get("name") if isinstance(product, Mapping) else None,
-            categories_meta_for_hints,
+            brand_meta,
         )
         if guessed_brand:
             sanitized_hints["brand_hint"] = guessed_brand
+            brand_hint_reason = "Brand found in product name"
+            sanitized_hints["brand_hint_reason"] = brand_hint_reason
 
     user_payload = {
         "sku": product.get("sku"),
@@ -1194,6 +1347,38 @@ def infer_missing(
         "known_values": known,
         "missing": missing,
     }
+
+    regex_hint_map = (
+        sanitized_hints.get("regex_hints")
+        if isinstance(sanitized_hints.get("regex_hints"), Mapping)
+        else {}
+    )
+    for entry in missing:
+        code_value = entry.get("code")
+        if not code_value:
+            continue
+        code_key = str(code_value)
+        meta = meta_by_code.get(code_key, {})
+        input_type = str((meta or {}).get("frontend_input") or "").lower()
+        if input_type not in {"select", "multiselect"}:
+            continue
+        current_values = _ensure_list_of_strings(current_attributes.get(code_key))
+        hint_candidates: list[str] = []
+        if isinstance(regex_hint_map, Mapping):
+            hint_value = regex_hint_map.get(code_key)
+            if not _is_blank(hint_value):
+                hint_candidates.append(str(hint_value))
+        shortlist = shortlist_allowed_values(
+            code_key,
+            meta,
+            current=current_values,
+            hints=hint_candidates,
+        )
+        if shortlist:
+            entry["allowed_values"] = shortlist
+
+    user_payload["regex_hints"] = regex_info.values if regex_info else {}
+    user_payload["retry_questions"] = build_retry_questions(ai_codes)
 
     payload_json = json.dumps(user_payload, ensure_ascii=False)
     completion, raw_content = _openai_complete(conv, payload_json, api_key, model=model)
@@ -1243,6 +1428,7 @@ def infer_missing(
         retry_payload = dict(user_payload)
         retry_payload["context_already_found"] = context_already_found
         retry_payload["remaining_codes"] = remaining_before_retry
+        retry_payload["retry_questions"] = build_retry_questions(remaining_before_retry)
         retry_json = json.dumps(retry_payload, ensure_ascii=False)
         completion_retry, raw_retry = _openai_complete(conv, retry_json, api_key, model=model)
         retry_attributes = (
@@ -1300,6 +1486,11 @@ def infer_missing(
         "remaining_before_retry": remaining_before_retry,
         "raw_response_preview": "\n".join(previews_for_log),
     }
+    if regex_info:
+        metadata["regex_hits"] = list(regex_info.hits)
+        metadata["regex_hints"] = dict(regex_info.values)
+    if brand_hint_reason:
+        metadata["brand_hint_reason"] = brand_hint_reason
     result_df.attrs["meta"] = metadata
     return result_df
 
