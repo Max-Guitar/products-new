@@ -946,7 +946,34 @@ def _apply_ai_suggestions_to_wide(
 
     ai_cells: dict[tuple[str, str], dict[str, object]] = {}
     ai_log: list[dict[str, object]] = []
-    empty_mask_cache: dict[str, pd.Series] = {}
+    empty_mask_cache: dict[tuple[str, str], pd.Series] = {}
+
+    def _clear_empty_mask_cache_for(code_key: str) -> None:
+        if not empty_mask_cache:
+            return
+        keys_to_remove = [
+            cache_key for cache_key in empty_mask_cache if cache_key[0] == code_key
+        ]
+        for cache_key in keys_to_remove:
+            empty_mask_cache.pop(cache_key, None)
+
+    def _get_empty_mask_for(code_key: str, sku_value: str) -> pd.Series | None:
+        cache_key = (code_key, sku_value)
+        cached = empty_mask_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        if code_key not in updated.columns:
+            return None
+        try:
+            empties = updated[code_key].map(is_empty)
+        except Exception:
+            return None
+        try:
+            mask = (updated[sku_col].astype(str) == sku_value) & empties
+        except Exception:
+            return None
+        empty_mask_cache[cache_key] = mask
+        return mask
 
     def _shorten_value(value: object, limit: int = 120) -> str:
         text = str(value)
@@ -1021,6 +1048,8 @@ def _apply_ai_suggestions_to_wide(
     if not sku_col:
         return updated, [], []
 
+    sku_series = updated[sku_col].astype(str)
+
     for raw_sku, attrs in suggestions.items():
         if not isinstance(attrs, dict):
             continue
@@ -1047,7 +1076,7 @@ def _apply_ai_suggestions_to_wide(
                         "value": regex_value,
                         "reason": "Regex pre-extract",
                     }
-        row_mask = updated[sku_col].astype(str) == sku_value
+        row_mask = sku_series == sku_value
         if not row_mask.any():
             continue
         row_indices = updated.index[row_mask]
@@ -1067,15 +1096,8 @@ def _apply_ai_suggestions_to_wide(
                     updated[code_key] = pd.NA
                 except Exception:
                     updated[code_key] = pd.Series(pd.NA, index=updated.index)
-                empty_mask_cache.pop(code_key, None)
-            column_empty_mask = empty_mask_cache.get(code_key)
-            if column_empty_mask is None:
-                try:
-                    column_empty_mask = updated[code_key].apply(is_empty)
-                except Exception:
-                    column_empty_mask = None
-                else:
-                    empty_mask_cache[code_key] = column_empty_mask
+                _clear_empty_mask_cache_for(code_key)
+            column_empty_mask = _get_empty_mask_for(code_key, sku_value)
             suggestion_payload = payload if isinstance(payload, dict) else {"value": payload}
             ai_value = suggestion_payload.get("value")
             regex_candidate = None
@@ -1263,7 +1285,58 @@ def _apply_ai_suggestions_to_wide(
                         }
                     )
                     continue
-                converted_value = trimmed_value
+                if code_key not in updated.columns:
+                    updated[code_key] = pd.NA
+                mask = _get_empty_mask_for(code_key, sku_value)
+                if mask is None:
+                    try:
+                        empties = updated[code_key].map(is_empty)
+                        mask = (sku_series == sku_value) & empties
+                        empty_mask_cache[(code_key, sku_value)] = mask
+                    except Exception:
+                        mask = pd.Series(False, index=updated.index)
+                if not mask.any():
+                    existing_series = updated.loc[row_mask, code_key]
+                    existing_value = None
+                    if isinstance(existing_series, pd.Series) and not existing_series.empty:
+                        existing_value = existing_series.iloc[0]
+                    if DEBUG:
+                        print(
+                            f"[DEBUG SKIP] {code_key} skipped — reason=non-empty "
+                            f"existing={_preview_existing(row_mask, code_key)}"
+                        )
+                    ai_log.append(
+                        {
+                            "sku": sku_value,
+                            "code": code_key,
+                            "skip_reason": "non-empty",
+                            "existing_value": existing_value,
+                        }
+                    )
+                    continue
+                if DEBUG:
+                    print(
+                        f"[DEBUG APPLY] Writing {code_key}={trimmed_value!r} for {int(mask.sum())} rows"
+                    )
+                indices_to_update = mask[mask].index.tolist()
+                updated.loc[mask, code_key] = trimmed_value
+                if isinstance(mask, pd.Series):
+                    for idx in indices_to_update:
+                        mask.at[idx] = is_empty(trimmed_value)
+                for idx in indices_to_update:
+                    row_position_arr = updated.index.get_indexer([idx])
+                    row_position: int | None = None
+                    if len(row_position_arr) == 1 and row_position_arr[0] >= 0:
+                        row_position = int(row_position_arr[0])
+                    _mark_ai_filled(
+                        ai_cells,
+                        row_idx=row_position,
+                        col_key=code_key,
+                        sku_value=sku_value,
+                        value=trimmed_value,
+                        log_entry=log_details,
+                    )
+                continue
 
             for idx in row_indices:
                 existing_raw = updated.at[idx, code_key]
