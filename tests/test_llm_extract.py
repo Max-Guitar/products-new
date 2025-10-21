@@ -15,7 +15,7 @@ class DummyChatCompletions:
     def __init__(self, outer):
         self._outer = outer
 
-    def create(self, *, model, messages, temperature):  # noqa: D401 - test stub
+    def create(self, *, model, **kwargs):  # noqa: D401 - test stub
         self._outer.called_models.append(model)
         return {
             "choices": [

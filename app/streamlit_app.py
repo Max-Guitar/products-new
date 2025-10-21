@@ -2089,6 +2089,7 @@ def _collect_ai_suggestions_log(
     ai_suggestions: dict | None,
     ai_cells: dict | None,
     applied_logs: dict | None = None,
+    extra_log: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     if not isinstance(ai_suggestions, dict):
         ai_suggestions = {}
@@ -2154,6 +2155,10 @@ def _collect_ai_suggestions_log(
         result["suggestions"] = suggestions_log
     if applied_entries:
         result["applied"] = applied_entries
+    if isinstance(extra_log, Mapping):
+        errors = extra_log.get("errors")
+        if isinstance(errors, list) and errors:
+            result["errors"] = errors
 
     return result
 
@@ -2569,6 +2574,7 @@ def build_attributes_df(
     ] = []
     ai_results: dict[int, dict[str, dict[str, dict[str, object]]]] = defaultdict(dict)
     ai_errors: list[str] = []
+    ai_log_data: dict[str, list[dict[str, object]]] = {"errors": []}
     ai_model_name = ai_model or "gpt-5-mini"
     ai_conv = get_ai_conversation(ai_model_name) if ai_enabled else None
 
@@ -2797,7 +2803,7 @@ def build_attributes_df(
         )
 
     if not rows_by_set:
-        return {}, {}, {}, meta_cache, {}, {}, {}, []
+        return {}, {}, {}, meta_cache, {}, {}, {}, [], ai_log_data
 
     dfs: dict[int, pd.DataFrame] = {}
     column_configs: dict[int, dict] = {}
@@ -2846,6 +2852,25 @@ def build_attributes_df(
                         model=ai_model_name,
                     )
                 except Exception as exc:  # pragma: no cover - network error handling
+                    raw_resp = getattr(exc, "raw_response", None)
+                    if raw_resp is None:
+                        raw_resp = getattr(exc, "raw_response_retry", None)
+                    trace(
+                        {
+                            "where": "ai:json_error",
+                            "sku": sku_value,
+                            "err": str(exc),
+                            "raw_preview": (raw_resp or "")[:400],
+                        }
+                    )
+                    if "json" in str(exc).lower():
+                        ai_log_data.setdefault("errors", []).append(
+                            {
+                                "sku": sku_value,
+                                "reason": "json-parse-failed",
+                                "model": ai_model_name,
+                            }
+                        )
                     error_message = f"AI suggestion failed for {sku_value}: {exc}"
                     st.warning(error_message)
                     ai_errors.append(error_message)
@@ -2930,6 +2955,7 @@ def build_attributes_df(
         set_names,
         {key: value for key, value in ai_results.items()},
         ai_errors,
+        ai_log_data,
     )
 
 def _is_blank_value(value) -> bool:
@@ -4576,6 +4602,7 @@ if df_original_key in st.session_state:
                                         set_names,
                                         ai_suggestions_map,
                                         ai_errors,
+                                        ai_log_data,
                                     ) = build_attributes_df(
                                         df_changed,
                                         session,
@@ -4590,6 +4617,7 @@ if df_original_key in st.session_state:
                                         ai_suggestions_map or {}
                                     )
                                     step2_state["ai_errors"] = ai_errors
+                                    step2_state["ai_log_data"] = ai_log_data or {"errors": []}
                                     if ai_errors:
                                         preview = "\n".join(
                                             f"- {msg}" for msg in ai_errors[:5]
@@ -5519,6 +5547,7 @@ if df_original_key in st.session_state:
                                         step2_state.get("ai_suggestions"),
                                         step2_state.get("ai_cells"),
                                         step2_state.get("ai_logs"),
+                                        step2_state.get("ai_log_data"),
                                     )
                                     with st.expander("🧠 AI suggestions log"):
                                         if ai_log_payload:
