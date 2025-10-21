@@ -82,8 +82,6 @@ def test_enrich_ai_suggestions_merges_category_and_style_hints():
     meta = enriched.attrs.get("meta", {})
     assert meta.get("brand_hint") == "Electric Guitar"
     assert meta.get("normalized_categories_added") == ["Electric Guitar"]
-    assert meta.get("bass_hint") is False
-    assert "no_strings_auto" not in meta
 
 
 def test_enrich_ai_suggestions_creates_entries_from_hints():
@@ -125,79 +123,3 @@ def test_enrich_ai_suggestions_creates_entries_from_hints():
         "Fender",
         "Electric Guitar",
     ]
-    assert meta.get("bass_hint") is False
-    assert "no_strings_auto" not in meta
-
-
-def test_enrich_ai_suggestions_skips_styles_for_bass_items():
-    base_df = pd.DataFrame(
-        [
-            {"code": "model", "value": "Precision"},
-        ]
-    )
-
-    hints = {"style_hint": ["P-Style"]}
-
-    enriched = enrich_ai_suggestions(
-        base_df,
-        hints,
-        CATEGORIES_META,
-        "Bass Guitar",
-        42,
-        {"name": "Fender Precision Bass"},
-    )
-
-    assert enriched[enriched["code"] == "guitarstylemultiplechoice"].empty
-
-
-def test_enrich_ai_suggestions_sets_default_no_strings_for_bass_product():
-    base_df = pd.DataFrame(
-        [
-            {"code": "model", "value": "SR505"},
-            {"code": "no_strings", "value": ""},
-        ]
-    )
-
-    enriched = enrich_ai_suggestions(
-        base_df,
-        {},
-        CATEGORIES_META,
-        "Bass Guitar",
-        42,
-        {"name": "Ibanez SR505 Bass Guitar"},
-    )
-
-    strings_entry = _get_entry(enriched, "no_strings")
-    assert strings_entry["value"] == "5"
-    assert strings_entry["reason"] == "enriched_bass_default"
-
-    meta = enriched.attrs.get("meta", {})
-    assert meta.get("bass_hint") is True
-    assert meta.get("no_strings_auto") == "5"
-
-
-def test_enrich_ai_suggestions_overrides_six_string_when_bass_hint():
-    base_df = pd.DataFrame(
-        [
-            {"code": "no_strings", "value": "6", "reason": "ai"},
-        ]
-    )
-
-    hints = {"bass_hint": True}
-
-    enriched = enrich_ai_suggestions(
-        base_df,
-        hints,
-        CATEGORIES_META,
-        "Electric guitar",
-        12,
-        {"name": "Fender Jazz Bass"},
-    )
-
-    strings_entry = _get_entry(enriched, "no_strings")
-    assert strings_entry["value"] == "4"
-    assert strings_entry["reason"] == "enriched_bass_default"
-
-    meta = enriched.attrs.get("meta", {})
-    assert meta.get("bass_hint") is True
-    assert meta.get("no_strings_auto") == "4"
