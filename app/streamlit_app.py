@@ -56,7 +56,7 @@ from services.inventory import (
     iter_products_by_attr_set,
     list_attribute_sets,
 )
-from services.normalizers import normalize_for_magento
+from services.normalizers import _coerce_ai_value, normalize_for_magento
 from utils.http import build_magento_headers, get_session
 
 
@@ -909,64 +909,6 @@ def _coerce_for_ui(df: pd.DataFrame, meta_map: dict[str, dict]) -> pd.DataFrame:
     return out
 
 
-def _coerce_ai_value(value: object, meta: dict | None) -> object:
-    meta = meta or {}
-    input_type = (
-        meta.get("frontend_input")
-        or meta.get("backend_type")
-        or "text"
-    )
-    input_type = str(input_type).lower()
-
-    if isinstance(value, dict) and "value" in value:
-        value = value.get("value")
-
-    if input_type == "boolean":
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, (int, float)):
-            return bool(value)
-        if isinstance(value, str):
-            lowered = value.strip().lower()
-            if lowered in {"1", "true", "yes", "y", "on"}:
-                return True
-            if lowered in {"0", "false", "no", "n", "off"}:
-                return False
-        return None
-
-    if input_type in {"int", "integer"}:
-        try:
-            return int(value)
-        except Exception:
-            try:
-                return int(float(value))
-            except Exception:
-                return value
-
-    if input_type in {"decimal", "price", "float"}:
-        try:
-            return float(value)
-        except Exception:
-            return value
-
-    if input_type == "multiselect":
-        if isinstance(value, (list, tuple, set)):
-            normalized = [
-                str(item).strip()
-                for item in value
-                if item not in (None, "") and str(item).strip()
-            ]
-            return normalized
-        if isinstance(value, str):
-            return [part.strip() for part in value.split(",") if part.strip()]
-        return []
-
-    if value is None:
-        return ""
-
-    return value
-
-
 def _apply_ai_suggestions_to_wide(
     wide_df: pd.DataFrame,
     suggestions: dict[str, dict[str, dict]],
@@ -979,6 +921,16 @@ def _apply_ai_suggestions_to_wide(
         return wide_df, [], []
     if not isinstance(suggestions, dict):
         return wide_df, [], []
+
+    def is_empty(v: object) -> bool:
+        if v is None:
+            return True
+        if isinstance(v, str):
+            return v.strip() == ""
+        try:
+            return bool(pd.isna(v))
+        except (TypeError, ValueError):
+            return False
 
     updated = wide_df.copy(deep=True)
 
@@ -1054,7 +1006,7 @@ def _apply_ai_suggestions_to_wide(
                 continue
             suggestion_payload = payload if isinstance(payload, dict) else {"value": payload}
             ai_value = suggestion_payload.get("value")
-            if ai_value in (None, ""):
+            if is_empty(ai_value):
                 continue
             meta = meta_map.get(code_key, {}) if isinstance(meta_map, dict) else {}
             input_type = str(
@@ -1392,7 +1344,7 @@ def _apply_ai_suggestions_to_wide(
 
                     converted_value = canonical_label
 
-                if not _is_blank_value(existing_raw):
+                if not is_empty(existing_raw):
                     continue
 
                 updated.at[idx, code_key] = converted_value

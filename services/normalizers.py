@@ -3,6 +3,66 @@ from __future__ import annotations
 
 from typing import Any
 
+
+def _coerce_ai_value(value: object, meta: dict | None) -> object:
+    """Coerce an AI suggestion based on Magento attribute metadata."""
+
+    meta = meta or {}
+    input_type = (
+        meta.get("frontend_input")
+        or meta.get("backend_type")
+        or "text"
+    )
+    input_type = str(input_type).lower()
+
+    if isinstance(value, dict) and "value" in value:
+        value = value.get("value")
+
+    if input_type == "boolean":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"1", "true", "yes", "y", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "n", "off"}:
+                return False
+        return None
+
+    if input_type in {"int", "integer"}:
+        try:
+            return int(value)
+        except Exception:
+            try:
+                return int(float(value))
+            except Exception:
+                return value
+
+    if input_type in {"decimal", "price", "float"}:
+        try:
+            return float(value)
+        except Exception:
+            return value
+
+    if input_type == "multiselect":
+        if isinstance(value, (list, tuple, set)):
+            normalized = [
+                str(item).strip()
+                for item in value
+                if item not in (None, "") and str(item).strip()
+            ]
+            return normalized
+        if isinstance(value, str):
+            return [part.strip() for part in value.split(",") if part.strip()]
+        return []
+
+    if value is None:
+        return None
+
+    return value
+
 from connectors.magento.attributes import AttributeMetaCache
 
 
