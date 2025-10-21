@@ -6,6 +6,18 @@ from typing import Any
 from connectors.magento.attributes import AttributeMetaCache
 
 
+def _is_blank(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, float):  # pragma: no cover - defensive NaN handling
+        return str(value) == "nan"
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value) == 0
+    return False
+
+
 def _sanitize_target(target: Any) -> Any:
     if target is None:
         return None
@@ -79,9 +91,10 @@ def _to_iterable(value: Any) -> list[Any]:
 
 def normalize_for_magento(code: str, val: Any, meta: AttributeMetaCache | None):
     """Normalize ``val`` for the Magento attribute identified by ``code``."""
-    if val is None:
+    if code == "no_strings" and _is_blank(val):
         return None
-    if isinstance(val, str) and not val.strip():
+
+    if _is_blank(val):
         return None
 
     info: dict[str, Any] | None = None

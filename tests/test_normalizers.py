@@ -35,6 +35,12 @@ def meta_cache():
                 "options_map": {"New": "new"},
                 "values_to_labels": {"new": "New"},
             },
+            "no_strings": {
+                "attribute_code": "no_strings",
+                "frontend_input": "select",
+                "options_map": {"4": 4, "6": 6},
+                "values_to_labels": {"4": "4 strings", "6": "6 strings"},
+            },
         }
     )
 
@@ -58,3 +64,9 @@ def test_brand_label_and_code(meta_cache):
 
 def test_condition_label_to_value(meta_cache):
     assert normalize_for_magento("product_condition", "New", meta_cache) == "new"
+
+
+def test_no_strings_blank_returns_none(meta_cache):
+    assert normalize_for_magento("no_strings", None, meta_cache) is None
+    assert normalize_for_magento("no_strings", "", meta_cache) is None
+    assert normalize_for_magento("no_strings", "4", meta_cache) == 4

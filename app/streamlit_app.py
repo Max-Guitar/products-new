@@ -1064,6 +1064,8 @@ def _apply_ai_suggestions_to_wide(
             ).lower()
             allowed_multiselect_labels: dict[str, str] | None = None
             multiselect_values_to_labels: dict[str, str] | None = None
+            allowed_select_labels: dict[str, str] | None = None
+            select_values_to_labels: dict[str, str] | None = None
             if input_type == "multiselect" and isinstance(meta, dict):
                 options = meta.get("options")
                 if isinstance(options, list):
@@ -1083,6 +1085,40 @@ def _apply_ai_suggestions_to_wide(
                             value_text = str(option["value"]).strip()
                             if value_text:
                                 multiselect_values_to_labels[value_text] = trimmed_label
+            elif input_type == "select" and isinstance(meta, dict):
+                options = meta.get("options")
+                if isinstance(options, list):
+                    allowed_select_labels = {}
+                    select_values_to_labels = {}
+                    for option in options:
+                        if not isinstance(option, dict):
+                            continue
+                        raw_label = option.get("label")
+                        canonical_label: str | None = None
+                        if isinstance(raw_label, str):
+                            trimmed_label = raw_label.strip()
+                            if trimmed_label:
+                                canonical_label = trimmed_label
+                                allowed_select_labels.setdefault(trimmed_label, trimmed_label)
+                                allowed_select_labels.setdefault(
+                                    trimmed_label.casefold(), trimmed_label
+                                )
+                        raw_value = option.get("value")
+                        if raw_value in (None, ""):
+                            continue
+                        value_text = str(raw_value).strip()
+                        if not value_text:
+                            continue
+                        if canonical_label is None:
+                            canonical_label = value_text
+                        select_values_to_labels.setdefault(value_text, canonical_label)
+                        select_values_to_labels.setdefault(
+                            value_text.casefold(), canonical_label
+                        )
+                        if value_text.isdigit():
+                            int_value = int(value_text)
+                            select_values_to_labels.setdefault(str(int_value), canonical_label)
+                            select_values_to_labels.setdefault(int_value, canonical_label)
             converted_value = _coerce_ai_value(ai_value, meta)
 
             for idx in row_indices:
@@ -1322,6 +1358,39 @@ def _apply_ai_suggestions_to_wide(
                             }
                         )
                     continue
+
+                if input_type == "select":
+                    candidate_raw = converted_value
+                    if isinstance(candidate_raw, str):
+                        candidate_text = candidate_raw.strip()
+                    elif candidate_raw in (None, ""):
+                        candidate_text = ""
+                    else:
+                        candidate_text = str(candidate_raw).strip()
+
+                    if not candidate_text:
+                        continue
+
+                    canonical_label: str | None = None
+                    if allowed_select_labels:
+                        canonical_label = allowed_select_labels.get(candidate_text)
+                        if canonical_label is None:
+                            canonical_label = allowed_select_labels.get(
+                                candidate_text.casefold()
+                            )
+                    if canonical_label is None and select_values_to_labels:
+                        canonical_label = select_values_to_labels.get(candidate_text)
+                        if canonical_label is None:
+                            canonical_label = select_values_to_labels.get(
+                                candidate_text.casefold()
+                            )
+
+                    if canonical_label is None:
+                        if allowed_select_labels or select_values_to_labels:
+                            continue
+                        canonical_label = candidate_text
+
+                    converted_value = canonical_label
 
                 if not _is_blank_value(existing_raw):
                     continue
