@@ -1032,16 +1032,9 @@ def _apply_ai_suggestions_to_wide(
             code_key = str(code)
             if code_key not in updated.columns:
                 try:
-                    updated[code_key] = pd.Series(pd.NA, index=updated.index)
+                    updated[code_key] = pd.NA
                 except Exception:
-                    ai_log.append(
-                        {
-                            "sku": sku_value,
-                            "code": code_key,
-                            "skip_reason": "column-missing",
-                        }
-                    )
-                    continue
+                    updated[code_key] = pd.Series(pd.NA, index=updated.index)
                 empty_mask_cache.pop(code_key, None)
             column_empty_mask = empty_mask_cache.get(code_key)
             if column_empty_mask is None:
@@ -1075,17 +1068,27 @@ def _apply_ai_suggestions_to_wide(
                 log_details = {"used_regex": True, "value": ai_value}
             if is_empty(ai_value):
                 continue
-            meta = meta_map.get(code_key, {}) if isinstance(meta_map, dict) else {}
-            input_type = str(
-                meta.get("frontend_input")
-                or meta.get("backend_type")
-                or ""
-            ).lower()
-            allowed_for_set_flag = suggestion_payload.get("allowed_for_set")
-            if isinstance(allowed_for_set_flag, Mapping):
-                allowed_for_set = bool(allowed_for_set_flag.get("value", True))
+            meta_candidate = meta_map.get(code_key) if isinstance(meta_map, dict) else {}
+            if meta_candidate is None:
+                meta = {"code": code_key, "frontend_input": "text"}
+            elif isinstance(meta_candidate, Mapping):
+                meta = meta_candidate
             else:
-                if allowed_for_set_flag is None:
+                meta = {"code": code_key, "frontend_input": "text"}
+            input_type_source = (
+                meta.get("frontend_input")
+                if isinstance(meta, Mapping)
+                else "text"
+            )
+            if isinstance(meta, Mapping) and not input_type_source:
+                input_type_source = meta.get("backend_type")
+            input_type = str(input_type_source or "text").lower()
+            allowed_for_set = True
+            if input_type in {"multiselect", "select"}:
+                allowed_for_set_flag = suggestion_payload.get("allowed_for_set")
+                if isinstance(allowed_for_set_flag, Mapping):
+                    allowed_for_set = bool(allowed_for_set_flag.get("value", True))
+                elif allowed_for_set_flag is None:
                     allowed_for_set = True
                 else:
                     try:

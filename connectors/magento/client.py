@@ -18,6 +18,11 @@ MAGENTO_ADMIN_TOKEN: str = os.environ.get("MAGENTO_ADMIN_TOKEN", "")
 _LOGGER = logging.getLogger(__name__)
 
 
+_ALL_ATTRIBUTES_CACHE: Dict[tuple[str, int], Dict[str, Dict[str, Any]]] = {}
+_ATTRIBUTE_SET_CACHE: Dict[tuple[str, int], List[Dict[str, Any]]] = {}
+_ATTRIBUTE_META_CACHE: Dict[tuple[str, Optional[int], str], Dict[str, Any]] = {}
+
+
 def _with_query(path: str, params: Optional[Dict[str, Any]] = None) -> str:
     if not params:
         return path
@@ -75,6 +80,222 @@ def magento_get_logged(
         timeout=timeout,
         token=_token_value(),
     )
+
+
+def _cache_base_key(base_url: str) -> str:
+    return (base_url or "").rstrip("/")
+
+
+def _normalize_code(code: object) -> Optional[str]:
+    if not isinstance(code, str):
+        if code in (None, ""):
+            return None
+        code = str(code)
+    cleaned = code.strip()
+    return cleaned or None
+
+
+def _safe_options(
+    session: requests.Session,
+    base_url: str,
+    code: str,
+    *,
+    store_id: int = 0,
+) -> List[Dict[str, Any]]:
+    for path in (
+        f"/products/attributes/{quote(code, safe='')}/options?storeId={store_id}",
+        f"/products/attributes/{quote(code, safe='')}/options",
+    ):
+        try:
+            data = magento_get(session, base_url, path) or []
+        except RuntimeError:
+            raise
+        except Exception:
+            continue
+        if isinstance(data, list):
+            return data
+    return []
+
+
+def get_all_attributes(
+    session: requests.Session,
+    base_url: str,
+    *,
+    store_id: int = 0,
+    use_cache: bool = True,
+) -> Dict[str, Dict[str, Any]]:
+    """Return a mapping of attribute code to global metadata with options."""
+
+    cache_key = (_cache_base_key(base_url), store_id)
+    if use_cache and cache_key in _ALL_ATTRIBUTES_CACHE:
+        return _ALL_ATTRIBUTES_CACHE[cache_key]
+
+    collected: Dict[str, Dict[str, Any]] = {}
+    page = 1
+    page_size = 200
+
+    while True:
+        params: Dict[str, Any] = {
+            "searchCriteria[currentPage]": page,
+            "searchCriteria[pageSize]": page_size,
+            "fields": "items[attribute_code,frontend_input,backend_type,"
+            "frontend_label,is_required,options],total_count",
+        }
+        path = _with_query("/products/attributes", params)
+        try:
+            payload = magento_get(session, base_url, path)
+        except RuntimeError:
+            raise
+        except Exception:
+            payload = {}
+
+        if isinstance(payload, dict):
+            items = payload.get("items") or payload.get("attributes") or []
+        else:
+            items = payload or []
+
+        if not isinstance(items, list):
+            items = []
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            code = _normalize_code(item.get("attribute_code"))
+            if not code:
+                continue
+            meta = dict(item)
+            options = meta.get("options")
+            if not isinstance(options, list):
+                options = _safe_options(session, base_url, code, store_id=store_id)
+            meta["attribute_code"] = code
+            meta.setdefault("code", code)
+            meta["options"] = options or []
+            collected[code] = meta
+
+        if len(items) < page_size:
+            break
+        page += 1
+
+    if use_cache:
+        _ALL_ATTRIBUTES_CACHE[cache_key] = collected
+
+    return collected
+
+
+def get_attribute_set_attributes(
+    session: requests.Session,
+    base_url: str,
+    set_id: int,
+    *,
+    use_cache: bool = True,
+) -> List[Dict[str, Any]]:
+    """Return attribute metadata for the specified set."""
+
+    try:
+        set_key = int(set_id)
+    except (TypeError, ValueError):
+        return []
+
+    cache_key = (_cache_base_key(base_url), set_key)
+    if use_cache and cache_key in _ATTRIBUTE_SET_CACHE:
+        return _ATTRIBUTE_SET_CACHE[cache_key]
+
+    path = f"/products/attribute-sets/{set_key}/attributes"
+    try:
+        payload = magento_get(session, base_url, path)
+    except RuntimeError:
+        raise
+    except Exception:
+        payload = {}
+
+    if isinstance(payload, dict):
+        items = payload.get("items") or payload.get("attributes") or []
+    else:
+        items = payload or []
+
+    if not isinstance(items, list):
+        items = []
+
+    if use_cache:
+        _ATTRIBUTE_SET_CACHE[cache_key] = items
+
+    return items
+
+
+def get_attribute_meta(
+    session: requests.Session,
+    base_url: str,
+    code: str,
+    set_id: Optional[int] = None,
+    *,
+    store_id: int = 0,
+    use_cache: bool = True,
+) -> Dict[str, Any]:
+    """Return attribute metadata with per-set fallback to global."""
+
+    normalized_code = _normalize_code(code)
+    if not normalized_code:
+        return {}
+
+    normalized_set_id: Optional[int]
+    if set_id is None:
+        normalized_set_id = None
+    else:
+        try:
+            normalized_set_id = int(set_id)
+        except (TypeError, ValueError):
+            normalized_set_id = None
+
+    cache_key = (_cache_base_key(base_url), normalized_set_id, normalized_code)
+    if use_cache and cache_key in _ATTRIBUTE_META_CACHE:
+        return _ATTRIBUTE_META_CACHE[cache_key]
+
+    set_meta: Dict[str, Any] | None = None
+    if normalized_set_id is not None:
+        for attr in get_attribute_set_attributes(
+            session,
+            base_url,
+            normalized_set_id,
+            use_cache=use_cache,
+        ):
+            if not isinstance(attr, dict):
+                continue
+            code_candidate = _normalize_code(attr.get("attribute_code"))
+            if code_candidate == normalized_code:
+                set_meta = dict(attr)
+                break
+
+    global_meta = get_all_attributes(
+        session,
+        base_url,
+        store_id=store_id,
+        use_cache=use_cache,
+    ).get(normalized_code)
+
+    if set_meta:
+        result: Dict[str, Any] = dict(global_meta or {})
+        result.update(set_meta)
+    else:
+        result = dict(global_meta or {})
+
+    if not result:
+        result = {"code": normalized_code, "attribute_code": normalized_code}
+    else:
+        result.setdefault("code", normalized_code)
+        result.setdefault("attribute_code", normalized_code)
+
+    global_options = []
+    if isinstance(global_meta, dict):
+        global_options = global_meta.get("options") or []
+
+    options = result.get("options")
+    if not isinstance(options, list) or not options:
+        result["options"] = list(global_options) if isinstance(global_options, list) else []
+
+    if use_cache:
+        _ATTRIBUTE_META_CACHE[cache_key] = result
+
+    return result
 
 
 def get_default_products(
