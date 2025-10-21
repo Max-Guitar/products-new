@@ -130,6 +130,80 @@ _NUMERIC_CODES = {
 }
 
 
+SERIES_RULES = [
+    {
+        "when": [r"\bFender\b", r"\bVintera\s*II\b", r"\bP[- ]?Bass\b"],
+        "defaults": {
+            "scale_mensur": '34"',
+            "no_strings": "4",
+            "pickup_config": "P",
+            "bridge": "Vintage-Style 4-Saddle",
+            "tuning_machines": "Vintage-Style Open-Gear",
+            "body_material": "Alder",
+            "fretboard_material": "Rosewood",
+            "neck_profile": "C Shape",
+            "country_of_manufacture": "Mexico",
+        },
+    },
+]
+
+
+def apply_series_defaults(title: str | None, attrs: dict[str, object]) -> dict[str, object]:
+    import re
+
+    text = title or ""
+    for rule in SERIES_RULES:
+        conditions = rule.get("when", [])
+        defaults = rule.get("defaults", {})
+        if not isinstance(conditions, Sequence) or not isinstance(defaults, Mapping):
+            continue
+        if all(re.search(pattern, text, flags=re.IGNORECASE) for pattern in conditions):
+            for key, value in defaults.items():
+                attrs.setdefault(key, value)
+    return attrs
+
+
+COLOR_CODES = {
+    "FRD": "Fiesta Red",
+    "LPB": "Lake Placid Blue",
+    "OWT": "Olympic White",
+    "CAR": "Candy Apple Red",
+    "3TS": "3-Color Sunburst",
+    "BLK": "Black",
+}
+
+
+def color_from_title(title: str | None) -> str | None:
+    for token in re.findall(r"\b[A-Z0-9]{2,4}\b", title or ""):
+        if token in COLOR_CODES:
+            return COLOR_CODES[token]
+    return None
+
+
+BRIDGE_PATTERNS = [
+    r"(Floyd Rose)",
+    r"(Tune-?O-?Matic)",
+    r"(Hardtail|Fixed)",
+    r"(Vintage-Style 4-Saddle)",
+    r"(2-Point Tremolo)",
+]
+
+
+PICKUP_CFG_PATTERNS = [r"\b(HH|HSS|HSH|SS|P|PJ)\b"]
+
+
+PROFILE_PATTERNS = [r"\b(C Shape|Slim C|Modern C|U Shape|V Shape)\b"]
+
+
+SHORTLIST_TARGET_CODES = {
+    "bridge",
+    "pickup_config",
+    "neck_profile",
+    "tuning_machines",
+    "finish",
+}
+
+
 @dataclass
 class RegexExtraction:
     """Container for regex extraction results and metadata."""
@@ -300,6 +374,7 @@ def regex_preextract(title: str | None, description: str | None) -> dict[str, st
             "finish": None,
             "bridge": None,
             "pickup_config": None,
+            "neck_profile": None,
         }
 
     combined = f"{title or ''}\n{description or ''}"
@@ -332,46 +407,32 @@ def regex_preextract(title: str | None, description: str | None) -> dict[str, st
 
     frets = _re_first(combined, [r"\b(20|21|22|24)\s*frets?\b"])
 
-    color_map = {
-        "FRD": "Fiesta Red",
-        "LPB": "Lake Placid Blue",
-        "OWT": "Olympic White",
-        "CAR": "Candy Apple Red",
-        "3TS": "3-Color Sunburst",
-        "BLK": "Black",
-    }
-    finish = None
-    for token in re.findall(r"\b[A-Z0-9]{2,4}\b", title or ""):
-        if token in color_map:
-            finish = color_map[token]
-            break
-
-    bridge = _re_first(
-        combined,
-        [
-            r"(Floyd Rose)",
-            r"(Tune-?O-?Matic)",
-            r"(Hardtail|Fixed)",
-            r"(Vintage-Style 4-Saddle)",
-            r"(2-Point Tremolo)",
-        ],
-    )
-
-    pickup_cfg = _re_first(combined, [r"\b(HH|HSS|HSH|SS)\b"])
-    if not pickup_cfg:
-        if re.search(r"\bP[- ]?Bass\b", combined, flags=re.IGNORECASE):
-            pickup_cfg = "P"
-        elif re.search(r"\bPJ\b", combined, flags=re.IGNORECASE):
-            pickup_cfg = "PJ"
-
-    return {
+    attrs: dict[str, str | None] = {
         "scale_mensur": f"{scale_in}\"" if scale_in else None,
         "neck_radius": f"{radius_in}\"" if radius_in else None,
         "amount_of_frets": frets,
-        "finish": finish,
-        "bridge": bridge,
-        "pickup_config": pickup_cfg,
+        "finish": color_from_title(title),
+        "bridge": None,
+        "pickup_config": None,
+        "neck_profile": None,
     }
+
+    bridge = _re_first(combined, BRIDGE_PATTERNS)
+    cfg = _re_first(combined, PICKUP_CFG_PATTERNS)
+    if not cfg:
+        if re.search(r"\bP[- ]?Bass\b", combined, flags=re.IGNORECASE):
+            cfg = "P"
+        elif re.search(r"\bPJ\b", combined, flags=re.IGNORECASE):
+            cfg = "PJ"
+    prof = _re_first(combined, PROFILE_PATTERNS)
+
+    attrs.update({
+        "bridge": bridge,
+        "pickup_config": cfg,
+        "neck_profile": prof,
+    })
+
+    return attrs
 
 
 def build_retry_questions(codes: Sequence[str]) -> dict[str, str]:
@@ -379,13 +440,13 @@ def build_retry_questions(codes: Sequence[str]) -> dict[str, str]:
 
     predefined = {
         "bridge": (
-            "Return bridge hardware name only (e.g., 'Tune-O-Matic', 'Floyd Rose', 'Hardtail', 'Vintage-Style 4-Saddle'). If not present, return empty."
+            "Return only one bridge name (e.g., 'Vintage-Style 4-Saddle', 'Floyd Rose', 'Tune-O-Matic', 'Hardtail'). If unknown, return empty."
         ),
         "bridge_pickup": (
             "Return the bridge pickup model only (e.g., 'Seymour Duncan JB', 'EMG 81'). If not present, return empty."
         ),
         "neck_profile": (
-            "Return just a short profile label (e.g., 'C Shape', 'Slim C'). If absent, return empty."
+            "Return one short label: 'C Shape', 'Slim C', 'Modern C', 'V Shape', 'U Shape'. If unknown, return empty."
         ),
         "scale_mensur": (
             "Return just the scale length in inches, like 34\" or 25.5\". If absent, return empty."
@@ -394,9 +455,9 @@ def build_retry_questions(codes: Sequence[str]) -> dict[str, str]:
             "Return just the fretboard radius in inches (e.g., 9.5\"). If absent, return empty."
         ),
         "pickup_config": (
-            "Return pickup layout like HH, HSS, HSH, SS, P, PJ. If unclear, return empty."
+            "Return exactly one of: HH, HSS, HSH, SS, P, PJ. If unclear, return empty."
         ),
-        "finish": "Return color name (e.g., 'Fiesta Red'). If absent, return empty.",
+        "finish": "Return color name (e.g., 'Fiesta Red'). If unknown, return empty.",
         "neck_nutwidth": (
             "Return just the nut width in inches (e.g., 1.69\"). If absent, return empty."
         ),
@@ -495,10 +556,14 @@ def _build_attribute_instruction(
     label = (meta or {}).get("frontend_label") if isinstance(meta, Mapping) else None
     label_text = str(label).strip() if isinstance(label, str) else code
     shortlist = shortlist_allowed_values(code, meta, title, hints)
-    allowed_line = ""
-    if shortlist:
-        allowed_line = f"\nAllowed values (if any): {', '.join(shortlist)}"
-    return f"- {code} ({label_text}){allowed_line}"
+    lines = [f"- {code} ({label_text})"]
+    if code in SHORTLIST_TARGET_CODES:
+        allowed_values = ", ".join(shortlist) if shortlist else ""
+        lines.append(f"Allowed values (if any): {allowed_values}")
+        lines.append("Return exactly one of the allowed values if relevant.")
+    elif shortlist:
+        lines.append(f"Allowed values (if any): {', '.join(shortlist)}")
+    return "\n".join(lines)
 
 
 def _build_messages(
@@ -624,25 +689,56 @@ def extract_attributes(
         parsed, raw_content = _invoke(MODEL_FALLBACK)
         used_model = MODEL_FALLBACK
 
+    llm_out: dict[str, object] = {}
+    if isinstance(parsed, Mapping):
+        llm_out = dict(parsed)
+
+    defaults_seed: dict[str, object] = {
+        key: value for key, value in pre.items() if not _is_blank(value)
+    }
+    for key, value in llm_out.items():
+        if not _is_blank(value):
+            defaults_seed[key] = value
+    defaults_with_series = apply_series_defaults(title, defaults_seed)
+
+    default_candidates: dict[str, object] = {}
+    for key, value in defaults_with_series.items():
+        if _is_blank(llm_out.get(key)) and _is_blank(pre.get(key)) and not _is_blank(value):
+            default_candidates[key] = value
+
+    finish_guess = color_from_title(title)
+    if finish_guess and _is_blank(llm_out.get("finish")) and _is_blank(pre.get("finish")):
+        default_candidates.setdefault("finish", finish_guess)
+
     final: dict[str, object] = {}
     for task in attribute_tasks:
         code = str(task.get("code"))
-        llm_value = parsed.get(code) if isinstance(parsed, Mapping) else None
+        llm_value = llm_out.get(code)
         pre_value = pre.get(code)
         if _is_blank(llm_value):
             llm_value = None
         if _is_blank(pre_value):
             pre_value = None
 
-        if llm_value is None and pre_value is not None:
-            final[code] = pre_value
-        elif llm_value is not None and pre_value is None:
-            final[code] = llm_value
-        elif llm_value is not None and pre_value is not None:
-            if is_numeric_spec(code):
+        default_value = default_candidates.get(code)
+
+        if is_numeric_spec(code):
+            if pre_value is not None:
                 final[code] = pre_value
-            else:
+            elif llm_value is not None:
                 final[code] = llm_value
+            elif default_value is not None:
+                final[code] = default_value
+            else:
+                final[code] = None
+            continue
+
+        if llm_value is not None:
+            final[code] = llm_value
+        elif pre_value is not None:
+            final[code] = pre_value
+        elif default_value is not None:
+            final[code] = default_value
         else:
             final[code] = None
 
