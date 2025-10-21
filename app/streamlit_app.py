@@ -30,6 +30,23 @@ st.set_page_config(
 )
 st.title("🤖 Peter v.1.0 (AI Content Manager)")
 
+# --- DEBUG UI PANEL ---
+if "_trace_events" not in st.session_state:
+    st.session_state["_trace_events"] = []
+
+
+def trace(event: dict):
+    # дублируем в session_state и в консоль
+    st.session_state["_trace_events"].append(event)
+    try:
+        print("[TRACE]", event)
+    except Exception:
+        pass
+
+
+with st.expander("🧪 Debug trace", expanded=False):
+    st.json(st.session_state["_trace_events"][-500:])  # последние 500 событий
+
 from connectors.magento.attributes import AttributeMetaCache
 from connectors.magento.categories import ensure_categories_meta
 from connectors.magento.client import get_default_products, get_api_base
@@ -1098,6 +1115,18 @@ def _apply_ai_suggestions_to_wide(
                     updated[code_key] = pd.Series(pd.NA, index=updated.index)
                 _clear_empty_mask_cache_for(code_key)
             column_empty_mask = _get_empty_mask_for(code_key, sku_value)
+            
+            def _trace_skip(reason: str, extra: dict[str, object] | None = None) -> None:
+                event = {
+                    "where": "apply_ai:skip",
+                    "sku": sku_value,
+                    "code": code_key,
+                    "reason": reason,
+                    "existing_preview": _preview_existing(row_mask, code_key),
+                }
+                if isinstance(extra, Mapping):
+                    event.update(extra)
+                trace(event)
             suggestion_payload = payload if isinstance(payload, dict) else {"value": payload}
             ai_value = suggestion_payload.get("value")
             regex_candidate = None
@@ -1121,6 +1150,10 @@ def _apply_ai_suggestions_to_wide(
                     suggestion_payload["reason"] = "Regex pre-extract"
                 log_details = {"used_regex": True, "value": ai_value}
             if is_empty(ai_value):
+                _trace_skip(
+                    "empty-suggestion",
+                    {"ai_preview": None if ai_value is None else str(ai_value)[:120]},
+                )
                 continue
             meta_candidate = meta_map.get(code_key) if isinstance(meta_map, dict) else {}
             if meta_candidate is None:
@@ -1152,6 +1185,18 @@ def _apply_ai_suggestions_to_wide(
                     allowed_for_set_value = bool(allowed_for_set_info)
                 except Exception:
                     allowed_for_set_value = True
+            trace(
+                {
+                    "where": "apply_ai:meta",
+                    "sku": sku_value,
+                    "code": code_key,
+                    "input_type": input_type,
+                    "options_count": len(meta.get("options", []))
+                    if isinstance(meta, Mapping)
+                    else None,
+                    "allowed_for_set": bool(allowed_for_set_value),
+                }
+            )
             if DEBUG:
                 options_count = (
                     len(meta.get("options", []))
@@ -1231,6 +1276,7 @@ def _apply_ai_suggestions_to_wide(
                         f"[DEBUG SKIP] {code_key} skipped — reason={skip_reason} "
                         f"existing={_preview_existing(row_mask, code_key)}"
                     )
+                _trace_skip(skip_reason)
                 ai_log.append(
                     {
                         "sku": sku_value,
@@ -1242,6 +1288,15 @@ def _apply_ai_suggestions_to_wide(
                 continue
 
             coerced_value = _coerce_ai_value(ai_value, meta)
+            trace(
+                {
+                    "where": "apply_ai:coerce",
+                    "sku": sku_value,
+                    "code": code_key,
+                    "ai_raw_preview": str(ai_value)[:120],
+                    "coerced_preview": str(coerced_value)[:120],
+                }
+            )
             if DEBUG:
                 print(
                     f"[DEBUG VALUE] {code_key}: ai_raw={ai_value!r}, coerced={coerced_value!r}"
@@ -1256,6 +1311,7 @@ def _apply_ai_suggestions_to_wide(
                             f"[DEBUG SKIP] {code_key} skipped — reason={skip_reason} "
                             f"existing={_preview_existing(row_mask, code_key)}"
                         )
+                    _trace_skip(skip_reason)
                     ai_log.append(
                         {
                             "sku": sku_value,
@@ -1276,6 +1332,7 @@ def _apply_ai_suggestions_to_wide(
                             f"[DEBUG SKIP] {code_key} skipped — reason={skip_reason} "
                             f"existing={_preview_existing(row_mask, code_key)}"
                         )
+                    _trace_skip(skip_reason)
                     ai_log.append(
                         {
                             "sku": sku_value,
@@ -1305,6 +1362,7 @@ def _apply_ai_suggestions_to_wide(
                             f"[DEBUG SKIP] {code_key} skipped — reason=non-empty "
                             f"existing={_preview_existing(row_mask, code_key)}"
                         )
+                    _trace_skip("non-empty")
                     ai_log.append(
                         {
                             "sku": sku_value,
@@ -1318,6 +1376,14 @@ def _apply_ai_suggestions_to_wide(
                     print(
                         f"[DEBUG APPLY] Writing {code_key}={trimmed_value!r} for {int(mask.sum())} rows"
                     )
+                trace(
+                    {
+                        "where": "apply_ai:apply",
+                        "sku": sku_value,
+                        "code": code_key,
+                        "value_preview": str(trimmed_value)[:200],
+                    }
+                )
                 indices_to_update = mask[mask].index.tolist()
                 updated.loc[mask, code_key] = trimmed_value
                 if isinstance(mask, pd.Series):
@@ -1461,11 +1527,31 @@ def _apply_ai_suggestions_to_wide(
                         cid for cid in found_ids if cid not in existing_ids
                     ]
 
+                    trace(
+                        {
+                            "where": "apply_ai:categories_map",
+                            "sku": sku_value,
+                            "suggested": normalized_ai,
+                            "found_ids": found_ids,
+                            "existing_ids": existing_ids,
+                            "combined_after": combined_ids,
+                            "ignored_tokens": ignored_tokens,
+                        }
+                    )
+
                     if combined_ids != existing_ids:
                         if DEBUG:
                             print(
                                 f"[DEBUG APPLY] Writing {code_key}={combined_ids!r} for {row_mask.sum()} rows"
                             )
+                        trace(
+                            {
+                                "where": "apply_ai:apply",
+                                "sku": sku_value,
+                                "code": code_key,
+                                "value_preview": str(combined_ids)[:200],
+                            }
+                        )
                         updated.at[idx, code_key] = combined_ids
                         if column_empty_mask is not None:
                             column_empty_mask.at[idx] = is_empty(combined_ids)
@@ -1503,6 +1589,14 @@ def _apply_ai_suggestions_to_wide(
                                 f"[DEBUG SKIP] {code_key} skipped — reason={skip_reason} "
                                 f"existing={existing_ids[:3]}"
                             )
+                        _trace_skip(
+                            skip_reason,
+                            {
+                                "found_ids": found_ids,
+                                "ignored_tokens": ignored_tokens,
+                                "suggested": normalized_ai,
+                            },
+                        )
                         ai_log.append(
                             {
                                 "sku": sku_value,
@@ -1562,6 +1656,10 @@ def _apply_ai_suggestions_to_wide(
                                 f"[DEBUG SKIP] {code_key} skipped — reason=not-applicable-for-set "
                                 f"existing={_preview_existing(row_mask, code_key)}"
                             )
+                        _trace_skip(
+                            "not-applicable-for-set",
+                            {"suggested": ai_value, "ignored_tokens": ignored_tokens},
+                        )
                         ai_log.append(
                             {
                                 "sku": sku_value,
@@ -1588,6 +1686,14 @@ def _apply_ai_suggestions_to_wide(
                             print(
                                 f"[DEBUG APPLY] Writing {code_key}={combined!r} for {row_mask.sum()} rows"
                             )
+                        trace(
+                            {
+                                "where": "apply_ai:apply",
+                                "sku": sku_value,
+                                "code": code_key,
+                                "value_preview": str(combined)[:200],
+                            }
+                        )
                         updated.at[idx, code_key] = combined
                         if column_empty_mask is not None:
                             column_empty_mask.at[idx] = is_empty(combined)
@@ -1626,6 +1732,13 @@ def _apply_ai_suggestions_to_wide(
                                 f"[DEBUG SKIP] {code_key} skipped — reason=duplicates "
                                 f"existing={existing_list[:3]}"
                             )
+                        _trace_skip(
+                            "duplicates",
+                            {
+                                "suggested": ai_value,
+                                "skipped_duplicates": skipped_duplicates,
+                            },
+                        )
                         ai_log.append(
                             {
                                 "sku": sku_value,
@@ -1640,6 +1753,13 @@ def _apply_ai_suggestions_to_wide(
                                 f"[DEBUG SKIP] {code_key} skipped — reason=not-applicable-for-set "
                                 f"existing={existing_list[:3]}"
                             )
+                        _trace_skip(
+                            "not-applicable-for-set",
+                            {
+                                "suggested": ai_value,
+                                "ignored_tokens": ignored_tokens,
+                            },
+                        )
                         ai_log.append(
                             {
                                 "sku": sku_value,
@@ -1647,7 +1767,7 @@ def _apply_ai_suggestions_to_wide(
                                 "skip_reason": "not-applicable-for-set",
                                 "suggested": ai_value,
                                 **(
-                                    {"ignored": ignored_tokens}
+                                    {"ignored_tokens": ignored_tokens}
                                     if ignored_tokens
                                     else {}
                                 ),
@@ -1670,6 +1790,10 @@ def _apply_ai_suggestions_to_wide(
                                 f"[DEBUG SKIP] {code_key} skipped — reason=not-applicable-for-set "
                                 f"existing={_preview_existing(row_mask, code_key)}"
                             )
+                        _trace_skip(
+                            "not-applicable-for-set",
+                            {"suggested": candidate_raw},
+                        )
                         ai_log.append(
                             {
                                 "sku": sku_value,
@@ -1705,6 +1829,10 @@ def _apply_ai_suggestions_to_wide(
                             f"[DEBUG SKIP] {code_key} skipped — reason=non-empty "
                             f"existing={_preview_existing(row_mask, code_key)}"
                         )
+                    _trace_skip(
+                        "non-empty",
+                        {"existing_value": existing_raw},
+                    )
                     ai_log.append(
                         {
                             "sku": sku_value,
@@ -1721,6 +1849,14 @@ def _apply_ai_suggestions_to_wide(
                     print(
                         f"[DEBUG APPLY] Writing {code_key}={converted_value!r} for {row_mask.sum()} rows"
                     )
+                trace(
+                    {
+                        "where": "apply_ai:apply",
+                        "sku": sku_value,
+                        "code": code_key,
+                        "value_preview": str(converted_value)[:200],
+                    }
+                )
                 updated.at[idx, code_key] = converted_value
                 if column_empty_mask is not None:
                     column_empty_mask.at[idx] = is_empty(converted_value)
@@ -2869,6 +3005,22 @@ def apply_product_update(session, api_base: str, sku: str, attributes: dict):
             ",".join(code for code in attr_codes if code),
             payload_preview,
         )
+    _dbg = {
+        "where": "save:http_put",
+        "sku": sku,
+        "url": url,
+        "custom_attr_codes": [
+            a.get("attribute_code") for a in custom_attributes if isinstance(a, dict)
+        ],
+        "ext_categories": [
+            l.get("category_id")
+            for l in extension_attributes.get("category_links", [])
+        ],
+    }
+    try:
+        trace(_dbg)
+    except Exception:
+        pass
     resp = session.put(
         url,
         json={"product": payload},
@@ -3117,6 +3269,15 @@ def save_step2_to_magento():
 
                     prepared_value = mapped_ids
 
+                trace(
+                    {
+                        "where": "save:pre-normalize",
+                        "sku": sku_value,
+                        "code": attr_code,
+                        "input_type": input_type,
+                        "prepared_preview": str(prepared_value)[:200],
+                    }
+                )
                 try:
                     normalized = normalize_for_magento(attr_code, prepared_value, meta_cache)
                 except Exception as exc:  # pragma: no cover - safety guard
@@ -3130,6 +3291,15 @@ def save_step2_to_magento():
                         }
                     )
                     continue
+
+                trace(
+                    {
+                        "where": "save:post-normalize",
+                        "sku": sku_value,
+                        "code": attr_code,
+                        "normalized_preview": str(normalized)[:200],
+                    }
+                )
 
                 if normalized is None:
                     if _is_blank_value(new_raw):
@@ -3185,6 +3355,17 @@ def save_step2_to_magento():
 
     ok_skus: set[str] = set()
     for sku, attrs in payload_by_sku.items():
+        trace(
+            {
+                "where": "save:payload",
+                "sku": sku,
+                "keys": sorted(attrs.keys()),
+                "payload_preview": {
+                    k: (str(v)[:120] if k != "categories" else v)
+                    for k, v in attrs.items()
+                },
+            }
+        )
         try:
             apply_product_update(session, api_base, sku, attrs)
             ok_skus.add(sku)

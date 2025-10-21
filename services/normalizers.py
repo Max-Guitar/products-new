@@ -5,6 +5,23 @@ import math
 import re
 from typing import Any
 
+# DEBUG TRACE SUPPORT (safe no-op if Streamlit not loaded)
+try:
+    import streamlit as _st  # type: ignore
+except Exception:  # pragma: no cover
+    _st = None
+
+
+def _dbg_push(event: dict):
+    try:
+        if _st is not None:
+            state = getattr(_st, "session_state", None)
+            if isinstance(state, dict):
+                buf = state.setdefault("_trace_events", [])
+                buf.append(event)
+    except Exception:
+        pass
+
 
 INCH_PER_MM = 1 / 25.4
 
@@ -253,6 +270,15 @@ def normalize_for_magento(code: str, val: Any, meta: AttributeMetaCache | None):
     ftype = info.get("frontend_input") or info.get("backend_type") or "text"
     ftype = str(ftype).lower()
 
+    _dbg_push(
+        {
+            "where": "normalize_for_magento:meta",
+            "code": code,
+            "ftype": ftype,
+            "raw_val_preview": (str(val)[:120] if val is not None else None),
+        }
+    )
+
     def to_id(value: Any):
         if value is None:
             return None
@@ -266,6 +292,14 @@ def normalize_for_magento(code: str, val: Any, meta: AttributeMetaCache | None):
             return None
         matched = _match_option_value(value, info)
         if matched is not None:
+            _dbg_push(
+                {
+                    "where": "normalize_for_magento:select_to_id",
+                    "code": code,
+                    "candidate": value,
+                    "matched": matched,
+                }
+            )
             return matched
         s = str(value).strip()
         if not s:
@@ -277,9 +311,20 @@ def normalize_for_magento(code: str, val: Any, meta: AttributeMetaCache | None):
 
     if ftype in TEXT_INPUT_TYPES:
         if val in (None, ""):
-            return ""
-        text_value = str(val).strip()
-        return text_value if text_value else ""
+            text_value = ""
+        else:
+            text_value = str(val).strip()
+        out = text_value if text_value else ""
+        _dbg_push(
+            {
+                "where": "normalize_for_magento:text",
+                "code": code,
+                "ftype": ftype,
+                "in": val,
+                "out": out,
+            }
+        )
+        return out
 
     if was_blank:
         return None
@@ -311,6 +356,16 @@ def normalize_for_magento(code: str, val: Any, meta: AttributeMetaCache | None):
             if matched is not None:
                 ids.append(matched)
         cleaned = [item for item in ids if item is not None]
+        _dbg_push(
+            {
+                "where": "normalize_for_magento:multiselect",
+                "code": code,
+                "in": val,
+                "ids": cleaned,
+                "info_has_maps": bool(info.get("options_map"))
+                and bool(info.get("values_to_labels")),
+            }
+        )
         return cleaned or None
 
     if isinstance(val, str):
