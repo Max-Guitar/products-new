@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from services.normalizers import normalize_for_magento
+from services.normalizers import normalize_for_magento, normalize_units
 
 
 @dataclass
@@ -70,3 +70,12 @@ def test_no_strings_blank_returns_none(meta_cache):
     assert normalize_for_magento("no_strings", None, meta_cache) is None
     assert normalize_for_magento("no_strings", "", meta_cache) is None
     assert normalize_for_magento("no_strings", "4", meta_cache) == 4
+
+
+def test_normalize_units_mm_to_inches():
+    assert normalize_units("scale_mensur", "648 mm") == '25.51"'
+
+
+def test_normalize_units_formats_inches():
+    assert normalize_units("neck_radius", "9.5 in") == '9.5"'
+    assert normalize_units("neck_nutwidth", 1.6875) == '1.69"'
