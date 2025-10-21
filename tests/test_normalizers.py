@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from services.normalizers import normalize_for_magento, normalize_units
+from services.normalizers import _coerce_ai_value, normalize_for_magento, normalize_units
 
 
 @dataclass
@@ -22,6 +22,10 @@ def meta_cache():
                 "frontend_input": "select",
                 "options_map": {"China": "CN"},
                 "values_to_labels": {"CN": "China"},
+            },
+            "description": {
+                "attribute_code": "description",
+                "frontend_input": "textarea",
             },
             "manufacturer": {
                 "attribute_code": "manufacturer",
@@ -79,3 +83,18 @@ def test_normalize_units_mm_to_inches():
 def test_normalize_units_formats_inches():
     assert normalize_units("neck_radius", "9.5 in") == '9.5"'
     assert normalize_units("neck_nutwidth", 1.6875) == '1.69"'
+
+
+def test_coerce_text_values_trim_and_preserve():
+    meta = {"frontend_input": "text"}
+    assert _coerce_ai_value("  Hello  ", meta) == "Hello"
+    assert _coerce_ai_value("   ", meta) == ""
+    assert _coerce_ai_value(42, meta) == "42"
+    assert _coerce_ai_value(None, meta) == ""
+
+
+def test_normalize_text_attribute_to_string(meta_cache):
+    assert normalize_for_magento("description", "  Test  ", meta_cache) == "Test"
+    assert normalize_for_magento("description", 123, meta_cache) == "123"
+    assert normalize_for_magento("description", "", meta_cache) == ""
+    assert normalize_for_magento("description", "   ", meta_cache) == ""

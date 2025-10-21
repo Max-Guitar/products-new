@@ -15,6 +15,15 @@ MEASURE_ATTRS = {
     "nut_width",
 }
 
+TEXT_INPUT_TYPES = {
+    "text",
+    "textarea",
+    "varchar",
+    "string",
+    "date",
+    "datetime",
+}
+
 
 def _format_inch_value(value: float) -> str:
     rounded = round(value, 2)
@@ -77,6 +86,12 @@ def _coerce_ai_value(value: object, meta: dict | None) -> object:
 
     if isinstance(value, dict) and "value" in value:
         value = value.get("value")
+
+    if input_type in TEXT_INPUT_TYPES:
+        if value in (None, ""):
+            return ""
+        text_value = str(value).strip()
+        return text_value if text_value else ""
 
     if input_type == "boolean":
         if isinstance(value, bool):
@@ -214,8 +229,7 @@ def normalize_for_magento(code: str, val: Any, meta: AttributeMetaCache | None):
     if code == "no_strings" and _is_blank(val):
         return None
 
-    if _is_blank(val):
-        return None
+    was_blank = _is_blank(val)
 
     val = normalize_units(code, val)
 
@@ -260,6 +274,15 @@ def normalize_for_magento(code: str, val: Any, meta: AttributeMetaCache | None):
             return int(s)
         except (TypeError, ValueError):
             return _sanitize_target(s)
+
+    if ftype in TEXT_INPUT_TYPES:
+        if val in (None, ""):
+            return ""
+        text_value = str(val).strip()
+        return text_value if text_value else ""
+
+    if was_blank:
+        return None
 
     if ftype in {"select", "boolean", "int"}:
         if ftype == "boolean":

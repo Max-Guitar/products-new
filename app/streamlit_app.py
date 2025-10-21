@@ -57,7 +57,12 @@ from services.inventory import (
     iter_products_by_attr_set,
     list_attribute_sets,
 )
-from services.normalizers import _coerce_ai_value, normalize_for_magento, normalize_units
+from services.normalizers import (
+    TEXT_INPUT_TYPES,
+    _coerce_ai_value,
+    normalize_for_magento,
+    normalize_units,
+)
 from utils.http import build_magento_headers, get_session
 
 
@@ -941,6 +946,12 @@ def _apply_ai_suggestions_to_wide(
     ai_log: list[dict[str, object]] = []
     empty_mask_cache: dict[str, pd.Series] = {}
 
+    def _shorten_value(value: object, limit: int = 120) -> str:
+        text = str(value)
+        if len(text) <= limit:
+            return text
+        return text[: limit - 1] + "…"
+
     def _mark_ai_filled(
         container: dict[tuple[str, str], dict[str, object]],
         *,
@@ -1150,6 +1161,33 @@ def _apply_ai_suggestions_to_wide(
                 continue
 
             converted_value = _coerce_ai_value(ai_value, meta)
+
+            if input_type in TEXT_INPUT_TYPES:
+                if converted_value in (None, ""):
+                    ai_log.append(
+                        {
+                            "sku": sku_value,
+                            "code": code_key,
+                            "skip_reason": "empty-after-coerce",
+                            "suggested": _shorten_value(ai_value),
+                        }
+                    )
+                    continue
+                if isinstance(converted_value, str):
+                    trimmed_value = converted_value.strip()
+                else:
+                    trimmed_value = str(converted_value).strip()
+                if not trimmed_value:
+                    ai_log.append(
+                        {
+                            "sku": sku_value,
+                            "code": code_key,
+                            "skip_reason": "empty-after-coerce",
+                            "suggested": _shorten_value(ai_value),
+                        }
+                    )
+                    continue
+                converted_value = trimmed_value
 
             for idx in row_indices:
                 existing_raw = updated.at[idx, code_key]
