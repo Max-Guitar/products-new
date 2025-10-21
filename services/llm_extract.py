@@ -36,6 +36,9 @@ If metric given, convert mm -> inches (25.4 mm = 1").
 
 Return only normalized attribute values, not sentences.
 If value is unclear — leave empty.
+
+Return a SINGLE valid JSON object. No markdown, no extra text, no comments.
+Use plain ASCII quotes (") in values like 25.5". Do not escape with backticks.
 """
 
 FEW_SHOT_EXAMPLES: Sequence[dict[str, str]] = (
@@ -87,6 +90,79 @@ FEW_SHOT_EXAMPLES: Sequence[dict[str, str]] = (
 
 
 logger = logging.getLogger(__name__)
+
+try:
+    import streamlit as _st  # type: ignore
+except Exception:  # pragma: no cover - streamlit optional
+    _st = None
+
+
+def _trace(event: Mapping[str, object]) -> None:
+    if not isinstance(event, Mapping):
+        return
+    try:
+        if _st is not None:
+            state = getattr(_st, "session_state", None)
+            if isinstance(state, dict):
+                buf = state.setdefault("_trace_events", [])
+                buf.append(dict(event))
+    except Exception:
+        pass
+    try:
+        logger.debug("TRACE %s", event)
+    except Exception:
+        pass
+
+
+def _try_parse_json(txt: str):
+    try:
+        return json.loads(txt), None
+    except Exception as exc:  # pragma: no cover - json failure branch exercised in tests
+        return None, exc
+
+
+def _sanitize_llm_json(txt: str) -> str:
+    s = txt.strip()
+
+    s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s, flags=re.IGNORECASE | re.DOTALL)
+
+    m = re.search(r"\{.*\}\s*$", s, flags=re.DOTALL)
+    if m:
+        s = m.group(0)
+
+    s = s.replace("“", '"').replace("”", '"').replace("’", "'")
+
+    s = re.sub(r",(\s*[}\]])", r"\1", s)
+
+    return s
+
+
+def _extract_response_content(response: object) -> str:
+    content = ""
+    if isinstance(response, Mapping):
+        choices = response.get("choices")
+        if isinstance(choices, Sequence) and choices:
+            message = choices[0]
+            if isinstance(message, Mapping):
+                msg_payload = message.get("message") or {}
+                if isinstance(msg_payload, Mapping):
+                    content = str(msg_payload.get("content") or "")
+                elif isinstance(message.get("content"), str):
+                    content = str(message.get("content"))
+    else:
+        choices = getattr(response, "choices", None)
+        if isinstance(choices, Sequence) and choices:
+            first = choices[0]
+            message = getattr(first, "message", None)
+            if isinstance(message, Mapping):
+                content = str(message.get("content") or "")
+            else:
+                content = str(getattr(message, "content", ""))
+
+    if not content and isinstance(response, Mapping):
+        content = str(response.get("content") or "")
+
+    return content or ""
 
 
 INCH_PER_MM = 1 / 25.4
@@ -613,45 +689,13 @@ def _build_messages(
     return messages
 
 
-def _parse_chat_response(response: object) -> tuple[dict[str, object], str]:
-    content = ""
-    if isinstance(response, Mapping):
-        choices = response.get("choices")
-        if isinstance(choices, Sequence) and choices:
-            message = choices[0]
-            if isinstance(message, Mapping):
-                msg_payload = message.get("message") or {}
-                if isinstance(msg_payload, Mapping):
-                    content = str(msg_payload.get("content") or "")
-                elif isinstance(message.get("content"), str):
-                    content = str(message.get("content"))
-    else:
-        choices = getattr(response, "choices", None)
-        if isinstance(choices, Sequence) and choices:
-            first = choices[0]
-            message = getattr(first, "message", None)
-            if isinstance(message, Mapping):
-                content = str(message.get("content") or "")
-            else:
-                content = str(getattr(message, "content", ""))
-
-    if not content and isinstance(response, Mapping):
-        content = str(response.get("content") or "")
-
-    if not content:
-        return {}, ""
-
-    try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError:
-        return {}, content
-
+def _payload_to_attributes(parsed: object) -> dict[str, object]:
     if isinstance(parsed, Mapping):
         attributes = parsed.get("attributes")
         if isinstance(attributes, Mapping):
-            return dict(attributes), content
-        return dict(parsed), content
-    return {}, content
+            return dict(attributes)
+        return dict(parsed)
+    return {}
 
 
 def extract_attributes(
@@ -672,26 +716,77 @@ def extract_attributes(
     kwargs = {
         "messages": messages,
         "temperature": temperature,
+        "top_p": 1,
+        "response_format": {"type": "json_object"},
     }
 
-    def _invoke(current_model: str) -> tuple[dict[str, object], str]:
+    def _invoke(current_model: str) -> str:
         try:
             response = client.chat.completions.create(model=current_model, **kwargs)
-            parsed, raw = _parse_chat_response(response)
-            return parsed, raw
         except Exception as exc:  # pragma: no cover - network failure handling
             logger.warning("LLM extraction failed with %s: %s", current_model, exc)
-            return {}, ""
+            return ""
+        return _extract_response_content(response)
 
-    parsed, raw_content = _invoke(model)
+    raw_primary = _invoke(model)
     used_model = model
-    if not parsed and MODEL_FALLBACK and MODEL_FALLBACK != model:
-        parsed, raw_content = _invoke(MODEL_FALLBACK)
-        used_model = MODEL_FALLBACK
+    parsed_payload: object | None = None
+    raw_content = raw_primary
 
-    llm_out: dict[str, object] = {}
-    if isinstance(parsed, Mapping):
-        llm_out = dict(parsed)
+    data_primary, err_primary = _try_parse_json(raw_primary)
+    err_sanitized = None
+    err_retry = None
+    sanitized = raw_primary
+
+    if data_primary is not None:
+        parsed_payload = data_primary
+    else:
+        sanitized = _sanitize_llm_json(raw_primary)
+        data_sanitized, err_sanitized = _try_parse_json(sanitized)
+        if data_sanitized is not None:
+            parsed_payload = data_sanitized
+            raw_content = sanitized
+        else:
+            retry_model = MODEL_FALLBACK or model
+            raw_retry = _invoke(retry_model)
+            raw_content = raw_retry or raw_primary
+            data_retry, err_retry = _try_parse_json(raw_retry)
+            if data_retry is not None:
+                parsed_payload = data_retry
+                used_model = retry_model
+            else:
+                _trace(
+                    {
+                        "where": "llm:json_fail",
+                        "raw": (raw_primary or "")[:500],
+                        "err": str(err_primary) if err_primary else None,
+                        "sanitized": (sanitized or "")[:500],
+                        "err2": str(err_sanitized) if err_sanitized else None,
+                        "raw2": (raw_retry or "")[:500],
+                        "err3": str(err_retry) if err_retry else None,
+                    }
+                )
+                failure = ValueError("LLM JSON parse failed after sanitize+retry")
+                setattr(failure, "raw_response", raw_primary)
+                setattr(failure, "raw_response_retry", raw_retry)
+                setattr(failure, "raw_response_sanitized", sanitized)
+                raise failure
+
+    llm_out = _payload_to_attributes(parsed_payload)
+
+    if not llm_out and MODEL_FALLBACK and MODEL_FALLBACK != used_model:
+        raw_fallback = _invoke(MODEL_FALLBACK)
+        raw_content = raw_fallback or raw_content
+        fallback_payload, err_fallback = _try_parse_json(raw_fallback)
+        if fallback_payload is not None:
+            llm_out = _payload_to_attributes(fallback_payload)
+            used_model = MODEL_FALLBACK
+        else:
+            logger.warning(
+                "Fallback model %s returned non-JSON payload: %s",
+                MODEL_FALLBACK,
+                str(err_fallback),
+            )
 
     defaults_seed: dict[str, object] = {
         key: value for key, value in pre.items() if not _is_blank(value)
