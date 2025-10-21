@@ -14,7 +14,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from collections import defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from urllib.parse import quote
 import re
 
@@ -65,7 +65,7 @@ from services.ai_fill import (
     normalize_category_label,
     probe_api_base,
 )
-from services.llm_extract import is_numeric_spec
+from services.llm_extract import brand_from_title, is_numeric_spec
 from services.inventory import (
     get_attr_set_id,
     get_backorders_parallel,
@@ -1269,6 +1269,19 @@ def _apply_ai_suggestions_to_wide(
                             int_value = int(value_text)
                             select_values_to_labels.setdefault(str(int_value), canonical_label)
                             select_values_to_labels.setdefault(int_value, canonical_label)
+            if input_type in {"multiselect", "select"}:
+                options_list = meta.get("options") if isinstance(meta, Mapping) else None
+                if not options_list:
+                    _trace_skip("no-options")
+                    ai_log.append(
+                        {
+                            "sku": sku_value,
+                            "code": code_key,
+                            "skip_reason": "no-options",
+                            "suggested": _shorten_value(ai_value),
+                        }
+                    )
+                    continue
             if input_type in {"multiselect", "select"} and not allowed_for_set_value:
                 skip_reason = "not-applicable-for-set"
                 if DEBUG:
@@ -1321,10 +1334,7 @@ def _apply_ai_suggestions_to_wide(
                         }
                     )
                     continue
-                if isinstance(converted_value, str):
-                    trimmed_value = converted_value.strip()
-                else:
-                    trimmed_value = str(converted_value).strip()
+                trimmed_value = str(converted_value).strip()
                 if not trimmed_value:
                     skip_reason = "empty-after-coerce"
                     if DEBUG:
@@ -1344,14 +1354,11 @@ def _apply_ai_suggestions_to_wide(
                     continue
                 if code_key not in updated.columns:
                     updated[code_key] = pd.NA
-                mask = _get_empty_mask_for(code_key, sku_value)
-                if mask is None:
-                    try:
-                        empties = updated[code_key].map(is_empty)
-                        mask = (sku_series == sku_value) & empties
-                        empty_mask_cache[(code_key, sku_value)] = mask
-                    except Exception:
-                        mask = pd.Series(False, index=updated.index)
+                try:
+                    empties = updated[code_key].map(is_empty)
+                except Exception:
+                    empties = pd.Series(False, index=updated.index)
+                mask = (sku_series == sku_value) & empties
                 if not mask.any():
                     existing_series = updated.loc[row_mask, code_key]
                     existing_value = None
@@ -1384,11 +1391,9 @@ def _apply_ai_suggestions_to_wide(
                         "value_preview": str(trimmed_value)[:200],
                     }
                 )
-                indices_to_update = mask[mask].index.tolist()
                 updated.loc[mask, code_key] = trimmed_value
-                if isinstance(mask, pd.Series):
-                    for idx in indices_to_update:
-                        mask.at[idx] = is_empty(trimmed_value)
+                _clear_empty_mask_cache_for(code_key)
+                indices_to_update = mask[mask].index.tolist()
                 for idx in indices_to_update:
                     row_position_arr = updated.index.get_indexer([idx])
                     row_position: int | None = None
@@ -2352,6 +2357,7 @@ def _build_ai_hints(
     product: Mapping[str, object],
     labels_to_values: Mapping[str, object],
     values_to_labels: Mapping[str, str],
+    meta_cache: AttributeMetaCache | Mapping[str, object] | None,
 ) -> dict[str, object]:
     hints: dict[str, object] = {}
     set_name_clean = str(set_name).strip() if isinstance(set_name, str) else ""
@@ -2368,6 +2374,29 @@ def _build_ai_hints(
             if key_text.casefold() == brand_lookup:
                 hints["brand_hint"] = brand_label
                 break
+
+    if "brand_hint" not in hints:
+        brand_meta: Mapping[str, object] | None = None
+        if isinstance(meta_cache, AttributeMetaCache):
+            brand_meta = meta_cache.get("brand")
+        elif isinstance(meta_cache, Mapping):
+            brand_meta = meta_cache.get("brand")
+        brand_options = []
+        if isinstance(brand_meta, Mapping):
+            options = brand_meta.get("options")
+            if isinstance(options, Sequence):
+                brand_options = [
+                    option
+                    for option in options
+                    if isinstance(option, Mapping)
+                ]
+        guessed_brand = brand_from_title(
+            product.get("name") if isinstance(product, Mapping) else None,
+            brand_options,
+        )
+        if guessed_brand:
+            hints["brand_hint"] = guessed_brand
+            hints["brand_hint_reason"] = "Brand found in product name"
 
     set_hint = _match_category_hint(set_name_clean, labels_to_values, values_to_labels)
     if set_hint:
@@ -2575,6 +2604,7 @@ def build_attributes_df(
                 product,
                 labels_to_values_map,
                 cat_values_to_labels,
+                meta_cache,
             )
 
         force_codes = {"categories", "guitarstylemultiplechoice"}
