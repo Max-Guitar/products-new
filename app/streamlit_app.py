@@ -924,10 +924,10 @@ def _apply_ai_suggestions_to_wide(
         return wide_df, [], []
 
     def is_empty(v: object) -> bool:
-        if v is None:
+        if v is None or (isinstance(v, str) and v.strip() == ""):
             return True
-        if isinstance(v, str):
-            return v.strip() == ""
+        if isinstance(v, (list, tuple, set, dict)):
+            return len(v) == 0
         try:
             return bool(pd.isna(v))
         except (TypeError, ValueError):
@@ -937,6 +937,7 @@ def _apply_ai_suggestions_to_wide(
 
     ai_cells: dict[tuple[str, str], dict[str, object]] = {}
     ai_log: list[dict[str, object]] = []
+    empty_mask_cache: dict[str, pd.Series] = {}
 
     def _mark_ai_filled(
         container: dict[tuple[str, str], dict[str, object]],
@@ -1018,6 +1019,14 @@ def _apply_ai_suggestions_to_wide(
             code_key = str(code)
             if code_key not in updated.columns:
                 continue
+            column_empty_mask = empty_mask_cache.get(code_key)
+            if column_empty_mask is None:
+                try:
+                    column_empty_mask = updated[code_key].apply(is_empty)
+                except Exception:
+                    column_empty_mask = None
+                else:
+                    empty_mask_cache[code_key] = column_empty_mask
             suggestion_payload = payload if isinstance(payload, dict) else {"value": payload}
             ai_value = suggestion_payload.get("value")
             regex_candidate = None
@@ -1109,6 +1118,14 @@ def _apply_ai_suggestions_to_wide(
 
             for idx in row_indices:
                 existing_raw = updated.at[idx, code_key]
+                is_cell_empty = True
+                if column_empty_mask is not None:
+                    try:
+                        is_cell_empty = bool(column_empty_mask.at[idx])
+                    except Exception:
+                        is_cell_empty = is_empty(existing_raw)
+                else:
+                    is_cell_empty = is_empty(existing_raw)
                 row_position_arr = updated.index.get_indexer([idx])
                 row_position: int | None = None
                 if len(row_position_arr) == 1 and row_position_arr[0] >= 0:
@@ -1224,6 +1241,8 @@ def _apply_ai_suggestions_to_wide(
 
                     if combined_ids != existing_ids:
                         updated.at[idx, code_key] = combined_ids
+                        if column_empty_mask is not None:
+                            column_empty_mask.at[idx] = is_empty(combined_ids)
                         log_entry = {
                             "applied": found_ids,
                             "existing_before": existing_ids,
@@ -1247,6 +1266,18 @@ def _apply_ai_suggestions_to_wide(
                                 "existing_before": existing_ids,
                                 "combined_after": combined_ids,
                                 "normalized_categories_added": normalized_added,
+                            }
+                        )
+                    else:
+                        ai_log.append(
+                            {
+                                "sku": sku_value,
+                                "code": "categories",
+                                "skip_reason": (
+                                    "non-empty" if existing_ids else "not applicable"
+                                ),
+                                "suggested": normalized_ai or ai_raw,
+                                "existing_before": existing_ids,
                             }
                         )
 
@@ -1287,9 +1318,17 @@ def _apply_ai_suggestions_to_wide(
                             ):
                                 filtered_ai_values.append(
                                     multiselect_values_to_labels[candidate]
-                                )
+                            )
                         ai_values = filtered_ai_values
                     if not ai_values:
+                        ai_log.append(
+                            {
+                                "sku": sku_value,
+                                "code": code_key,
+                                "skip_reason": "not applicable",
+                                "suggested": ai_value,
+                            }
+                        )
                         continue
                     existing_normalized = [item.strip() for item in existing_list]
                     seen = set(existing_normalized)
@@ -1305,6 +1344,8 @@ def _apply_ai_suggestions_to_wide(
                     if new_items:
                         combined = existing_list + new_items
                         updated.at[idx, code_key] = combined
+                        if column_empty_mask is not None:
+                            column_empty_mask.at[idx] = is_empty(combined)
                         log_entry = {
                             "applied": new_items,
                             "existing_before": existing_list,
@@ -1343,6 +1384,20 @@ def _apply_ai_suggestions_to_wide(
                                 "skipped_duplicates": skipped_duplicates,
                             }
                         )
+                    else:
+                        ai_log.append(
+                            {
+                                "sku": sku_value,
+                                "code": code_key,
+                                "skip_reason": "not applicable",
+                                "suggested": ai_value,
+                                **(
+                                    {"ignored": ignored_tokens}
+                                    if ignored_tokens
+                                    else {}
+                                ),
+                            }
+                        )
                     continue
 
                 if input_type == "select":
@@ -1355,6 +1410,14 @@ def _apply_ai_suggestions_to_wide(
                         candidate_text = str(candidate_raw).strip()
 
                     if not candidate_text:
+                        ai_log.append(
+                            {
+                                "sku": sku_value,
+                                "code": code_key,
+                                "skip_reason": "not applicable",
+                                "suggested": candidate_raw,
+                            }
+                        )
                         continue
 
                     canonical_label: str | None = None
@@ -1377,11 +1440,21 @@ def _apply_ai_suggestions_to_wide(
                     converted_value = canonical_label
 
                 if not is_empty(existing_raw):
+                    ai_log.append(
+                        {
+                            "sku": sku_value,
+                            "code": code_key,
+                            "skip_reason": "non-empty",
+                            "existing_value": existing_raw,
+                        }
+                    )
                     continue
 
                 converted_value = normalize_units(code_key, converted_value)
 
                 updated.at[idx, code_key] = converted_value
+                if column_empty_mask is not None:
+                    column_empty_mask.at[idx] = is_empty(converted_value)
                 _mark_ai_filled(
                     ai_cells,
                     row_idx=row_position,

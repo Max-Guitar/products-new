@@ -26,7 +26,14 @@ from services.llm_extract import (
 )
 
 
-ALWAYS_ATTRS: Set[str] = {"brand", "country_of_manufacture", "short_description"}
+ALWAYS_ATTRS: Set[str] = {
+    "brand",
+    "series",
+    "condition",
+    "categories",
+    "country_of_manufacture",
+    "guitarstylemultiplechoice",
+}
 
 ELECTRIC_SET_IDS: Set[int] = {12, 16}
 
