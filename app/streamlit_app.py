@@ -924,8 +924,10 @@ def _apply_ai_suggestions_to_wide(
         return wide_df, [], []
 
     def is_empty(v: object) -> bool:
-        if v is None or (isinstance(v, str) and v.strip() == ""):
+        if v is None:
             return True
+        if isinstance(v, str):
+            return v.strip() == ""
         if isinstance(v, (list, tuple, set, dict)):
             return len(v) == 0
         try:
@@ -1018,7 +1020,18 @@ def _apply_ai_suggestions_to_wide(
         for code, payload in attrs_payload.items():
             code_key = str(code)
             if code_key not in updated.columns:
-                continue
+                try:
+                    updated[code_key] = pd.Series(pd.NA, index=updated.index)
+                except Exception:
+                    ai_log.append(
+                        {
+                            "sku": sku_value,
+                            "code": code_key,
+                            "skip_reason": "column-missing",
+                        }
+                    )
+                    continue
+                empty_mask_cache.pop(code_key, None)
             column_empty_mask = empty_mask_cache.get(code_key)
             if column_empty_mask is None:
                 try:
@@ -1057,6 +1070,17 @@ def _apply_ai_suggestions_to_wide(
                 or meta.get("backend_type")
                 or ""
             ).lower()
+            allowed_for_set_flag = suggestion_payload.get("allowed_for_set")
+            if isinstance(allowed_for_set_flag, Mapping):
+                allowed_for_set = bool(allowed_for_set_flag.get("value", True))
+            else:
+                if allowed_for_set_flag is None:
+                    allowed_for_set = True
+                else:
+                    try:
+                        allowed_for_set = bool(allowed_for_set_flag)
+                    except Exception:
+                        allowed_for_set = True
             allowed_multiselect_labels: dict[str, str] | None = None
             multiselect_values_to_labels: dict[str, str] | None = None
             allowed_select_labels: dict[str, str] | None = None
@@ -1114,6 +1138,17 @@ def _apply_ai_suggestions_to_wide(
                             int_value = int(value_text)
                             select_values_to_labels.setdefault(str(int_value), canonical_label)
                             select_values_to_labels.setdefault(int_value, canonical_label)
+            if input_type in {"multiselect", "select"} and not allowed_for_set:
+                ai_log.append(
+                    {
+                        "sku": sku_value,
+                        "code": code_key,
+                        "skip_reason": "not-applicable-for-set",
+                        "suggested": ai_value,
+                    }
+                )
+                continue
+
             converted_value = _coerce_ai_value(ai_value, meta)
 
             for idx in row_indices:
@@ -1274,7 +1309,9 @@ def _apply_ai_suggestions_to_wide(
                                 "sku": sku_value,
                                 "code": "categories",
                                 "skip_reason": (
-                                    "non-empty" if existing_ids else "not applicable"
+                                    "non-empty"
+                                    if existing_ids
+                                    else "not-applicable-for-set"
                                 ),
                                 "suggested": normalized_ai or ai_raw,
                                 "existing_before": existing_ids,
@@ -1325,7 +1362,7 @@ def _apply_ai_suggestions_to_wide(
                             {
                                 "sku": sku_value,
                                 "code": code_key,
-                                "skip_reason": "not applicable",
+                                "skip_reason": "not-applicable-for-set",
                                 "suggested": ai_value,
                             }
                         )
@@ -1389,7 +1426,7 @@ def _apply_ai_suggestions_to_wide(
                             {
                                 "sku": sku_value,
                                 "code": code_key,
-                                "skip_reason": "not applicable",
+                                "skip_reason": "not-applicable-for-set",
                                 "suggested": ai_value,
                                 **(
                                     {"ignored": ignored_tokens}
@@ -1414,7 +1451,7 @@ def _apply_ai_suggestions_to_wide(
                             {
                                 "sku": sku_value,
                                 "code": code_key,
-                                "skip_reason": "not applicable",
+                                "skip_reason": "not-applicable-for-set",
                                 "suggested": candidate_raw,
                             }
                         )
