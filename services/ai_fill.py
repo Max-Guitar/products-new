@@ -1375,11 +1375,12 @@ def infer_missing(
             hint_value = regex_hint_map.get(code_key)
             if not _is_blank(hint_value):
                 hint_candidates.append(str(hint_value))
+        shortlist_seeds = list(current_values or []) + hint_candidates
         shortlist = shortlist_allowed_values(
             code_key,
             meta,
-            current=current_values,
-            hints=hint_candidates,
+            product.get("name") if isinstance(product, Mapping) else None,
+            shortlist_seeds,
         )
         if shortlist:
             entry["allowed_values"] = shortlist

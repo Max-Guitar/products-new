@@ -1,14 +1,96 @@
-"""Lightweight helpers for extracting attribute hints before LLM calls."""
+"""Helpers for deterministic spec extraction and prompt preparation."""
 
 from __future__ import annotations
 
+import json
+import logging
 import math
 import re
 from dataclasses import dataclass
-from typing import Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
+
+MODEL_STRONG = "gpt-5"
+MODEL_FALLBACK = "gpt-4o"
+
+SYSTEM_PROMPT = """
+You are a senior product data expert for guitars & basses (Fender, Gibson, Ibanez, PRS, etc.).
+Extract specs ONLY from given title/description. If absent — leave empty.
+Decode common OEM/brand patterns and color codes.
+
+Color codes (examples):
+FRD=Fiesta Red, CAR=Candy Apple Red, LPB=Lake Placid Blue, OWT=Olympic White, 3TS=3-Color Sunburst, BLK=Black,
+SB=Sunburst, VW=Vintage White, ACB=Arctic Blue, CH=Cherry, HCS=Heritage Cherry Sunburst.
+
+Fender series: Vintera / Vintera II, Player, Player Plus, American Professional, American Vintage II.
+Road Worn implies aged nitro-like finish.
+
+Short patterns:
+- P-Bass = Precision Bass, J-Bass = Jazz Bass, S-Style = Strat-style, T-Style = Tele-style, Single Cut = LP-style.
+- HH/HSS/HSH/SS are pickup configs.
+- Bridge names examples: Tune-O-Matic, Floyd Rose, Hardtail/Fixed, Vintage-Style 4-Saddle, 2-Point Tremolo.
+- Tuning machines examples: Vintage-Style Open-Gear, Gotoh, Hipshot.
+
+Units:
+- scale_mensur (inches, e.g., 34"), neck_radius (inches, e.g., 9.5"), amount_of_frets (integer).
+If metric given, convert mm -> inches (25.4 mm = 1").
+
+Return only normalized attribute values, not sentences.
+If value is unclear — leave empty.
+"""
+
+FEW_SHOT_EXAMPLES: Sequence[dict[str, str]] = (
+    {
+        "user": (
+            "Title: Yamaha AEX500 Acoustic-Electric HH - Indigo Blue\n"
+            "Description: Maple body acoustic-electric with dual humbuckers. Comfortable C shape neck, 25.5\" scale, 20 frets."
+        ),
+        "assistant": json.dumps(
+            {
+                "finish": "Indigo Blue",
+                "pickup_config": "HH",
+                "neck_profile": "C Shape",
+                "scale_mensur": "25.5\"",
+                "amount_of_frets": "20",
+            }
+        ),
+    },
+    {
+        "user": (
+            "Title: Fender Vintera II Stratocaster FRD HSS\n"
+            "Description: Road Worn alder body, Maple C Shape neck, HSS pickup set with 2-Point Tremolo."
+        ),
+        "assistant": json.dumps(
+            {
+                "brand": "Fender",
+                "series": "Vintera II",
+                "finish": "Fiesta Red",
+                "pickup_config": "HSS",
+                "neck_profile": "C Shape",
+                "bridge": "2-Point Tremolo",
+            }
+        ),
+    },
+    {
+        "user": (
+            "Title: Ibanez SR300E Bass Guitar Charcoal Brown\n"
+            "Description: 34\" scale bass with slim C profile neck, dual single-coil pickups (SS)."
+        ),
+        "assistant": json.dumps(
+            {
+                "scale_mensur": "34\"",
+                "neck_profile": "C Shape",
+                "pickup_config": "SS",
+            }
+        ),
+    },
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 INCH_PER_MM = 1 / 25.4
+IN2MM = 25.4
 
 
 _SCALE_PATTERN = re.compile(
@@ -54,6 +136,19 @@ class RegexExtraction:
 
     values: dict[str, str]
     hits: list[str]
+
+
+def _is_blank(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value) == 0
+    try:
+        return bool(math.isnan(value))  # type: ignore[arg-type]
+    except Exception:
+        return False
 
 
 def _format_inches(value: float | int | str) -> str | None:
@@ -186,62 +281,375 @@ def regex_extract(text: object) -> RegexExtraction:
     return RegexExtraction(values=values, hits=hits)
 
 
+def _re_first(text: str, patterns: Sequence[str]) -> str | None:
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return None
+
+
+def regex_preextract(title: str | None, description: str | None) -> dict[str, str | None]:
+    """Extract lightweight specs from ``title``/``description`` before LLM calls."""
+
+    if title is None and description is None:
+        return {
+            "scale_mensur": None,
+            "neck_radius": None,
+            "amount_of_frets": None,
+            "finish": None,
+            "bridge": None,
+            "pickup_config": None,
+        }
+
+    combined = f"{title or ''}\n{description or ''}"
+
+    scale_in = _re_first(
+        combined,
+        [
+            r"\b(34|30|25\.5|24\.75)(?=\s*(?:in|inch|\"))",
+            r"\b(\d{3,4})\s*mm\b",
+        ],
+    )
+    if scale_in and scale_in.isdigit() and int(scale_in) > 100:
+        try:
+            scale_in = f"{round(float(scale_in) / IN2MM, 2)}"
+        except Exception:
+            scale_in = None
+
+    radius_in = _re_first(
+        combined,
+        [
+            r"\b(7\.25|9\.5|10|12|14|16|20)(?=\s*(?:in|inch|\"))",
+            r"\b(\d{2,3})\s*mm\b",
+        ],
+    )
+    if radius_in and radius_in.isdigit():
+        try:
+            radius_in = f"{round(float(radius_in) / IN2MM, 2)}"
+        except Exception:
+            radius_in = None
+
+    frets = _re_first(combined, [r"\b(20|21|22|24)\s*frets?\b"])
+
+    color_map = {
+        "FRD": "Fiesta Red",
+        "LPB": "Lake Placid Blue",
+        "OWT": "Olympic White",
+        "CAR": "Candy Apple Red",
+        "3TS": "3-Color Sunburst",
+        "BLK": "Black",
+    }
+    finish = None
+    for token in re.findall(r"\b[A-Z0-9]{2,4}\b", title or ""):
+        if token in color_map:
+            finish = color_map[token]
+            break
+
+    bridge = _re_first(
+        combined,
+        [
+            r"(Floyd Rose)",
+            r"(Tune-?O-?Matic)",
+            r"(Hardtail|Fixed)",
+            r"(Vintage-Style 4-Saddle)",
+            r"(2-Point Tremolo)",
+        ],
+    )
+
+    pickup_cfg = _re_first(combined, [r"\b(HH|HSS|HSH|SS)\b"])
+    if not pickup_cfg:
+        if re.search(r"\bP[- ]?Bass\b", combined, flags=re.IGNORECASE):
+            pickup_cfg = "P"
+        elif re.search(r"\bPJ\b", combined, flags=re.IGNORECASE):
+            pickup_cfg = "PJ"
+
+    return {
+        "scale_mensur": f"{scale_in}\"" if scale_in else None,
+        "neck_radius": f"{radius_in}\"" if radius_in else None,
+        "amount_of_frets": frets,
+        "finish": finish,
+        "bridge": bridge,
+        "pickup_config": pickup_cfg,
+    }
+
+
 def build_retry_questions(codes: Sequence[str]) -> dict[str, str]:
-    """Return focused retry questions for numeric specs."""
+    """Return focused retry questions for spec clarification."""
+
+    predefined = {
+        "bridge": (
+            "Return bridge hardware name only (e.g., 'Tune-O-Matic', 'Floyd Rose', 'Hardtail', 'Vintage-Style 4-Saddle'). If not present, return empty."
+        ),
+        "bridge_pickup": (
+            "Return the bridge pickup model only (e.g., 'Seymour Duncan JB', 'EMG 81'). If not present, return empty."
+        ),
+        "neck_profile": (
+            "Return just a short profile label (e.g., 'C Shape', 'Slim C'). If absent, return empty."
+        ),
+        "scale_mensur": (
+            "Return just the scale length in inches, like 34\" or 25.5\". If absent, return empty."
+        ),
+        "neck_radius": (
+            "Return just the fretboard radius in inches (e.g., 9.5\"). If absent, return empty."
+        ),
+        "pickup_config": (
+            "Return pickup layout like HH, HSS, HSH, SS, P, PJ. If unclear, return empty."
+        ),
+        "finish": "Return color name (e.g., 'Fiesta Red'). If absent, return empty.",
+        "neck_nutwidth": (
+            "Return just the nut width in inches (e.g., 1.69\"). If absent, return empty."
+        ),
+        "nut_width": (
+            "Return just the nut width in inches (e.g., 1.69\"). If absent, return empty."
+        ),
+    }
 
     questions: dict[str, str] = {}
     for code in codes or []:
         code_key = str(code)
-        if code_key == "scale_mensur":
-            questions[code_key] = 'Return just a number with inches (e.g., 25.5\") if present, else empty.'
-        elif code_key == "neck_radius":
-            questions[code_key] = 'Return just a number with inches (e.g., 9.5\") if present, else empty.'
-        elif code_key in {"neck_nutwidth", "nut_width"}:
-            questions[code_key] = 'Return just a number with inches (e.g., 1.69\") if present, else empty.'
+        question = predefined.get(code_key)
+        if question:
+            questions[code_key] = question
     return questions
 
 
 def shortlist_allowed_values(
     code: str,
     meta: Mapping[str, object] | None,
-    *,
-    current: Iterable[str] | None = None,
-    hints: Iterable[str] | None = None,
+    title: str | None,
+    hint_list: Iterable[str] | None,
     limit: int = 50,
 ) -> list[str]:
-    """Return up to ``limit`` allowed option labels for prompts."""
+    """Build a shortlist of allowed option labels for prompts."""
 
     meta = meta or {}
+    seeds: list[str] = []
+    seen_seed: set[str] = set()
+    for item in hint_list or []:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        if not text or text in seen_seed:
+            continue
+        seeds.append(text)
+        seen_seed.add(text)
+
+    base: list[str] = []
     options = meta.get("options") if isinstance(meta, Mapping) else None
-    labels: list[str] = []
     if isinstance(options, Sequence):
         for option in options:
             if not isinstance(option, Mapping):
                 continue
             label = option.get("label")
-            if not isinstance(label, str):
-                continue
-            text = label.strip()
-            if text and text not in labels:
-                labels.append(text)
+            if isinstance(label, str):
+                text = label.strip()
+                if text:
+                    base.append(text)
 
-    def _extend(values: Iterable[str] | None) -> None:
-        for item in values or []:
-            if not isinstance(item, str):
-                continue
-            text = item.strip()
-            if text and text not in labels:
-                labels.insert(0, text)
+    title_lower = (title or "").lower()
+    similar = [label for label in base if label.lower() in title_lower]
 
-    _extend(current)
-    _extend(hints)
+    ordered = list(seeds) + similar + base
+    seen: set[str] = set()
+    shortlisted: list[str] = []
+    for label in ordered:
+        if not label or label in seen:
+            continue
+        shortlisted.append(label)
+        seen.add(label)
+        if len(shortlisted) >= limit:
+            break
 
-    if len(labels) > limit:
-        labels = labels[:limit]
-
-    return labels
+    return shortlisted
 
 
 def is_numeric_spec(code: str) -> bool:
     return code in _NUMERIC_CODES
 
+
+def brand_from_title(title: str | None, brand_options: Sequence[Mapping[str, Any]] | None) -> str | None:
+    """Return a brand guess from the product title using known options."""
+
+    if not title or not isinstance(title, str):
+        return None
+    lowered_title = title.lower()
+    for option in brand_options or []:
+        if not isinstance(option, Mapping):
+            continue
+        label = option.get("label")
+        if not isinstance(label, str):
+            continue
+        trimmed = label.strip()
+        if trimmed and trimmed.lower() in lowered_title:
+            return trimmed
+    return None
+
+
+def _build_attribute_instruction(
+    code: str,
+    meta: Mapping[str, object] | None,
+    title: str | None,
+    hints: Iterable[str] | None,
+) -> str:
+    label = (meta or {}).get("frontend_label") if isinstance(meta, Mapping) else None
+    label_text = str(label).strip() if isinstance(label, str) else code
+    shortlist = shortlist_allowed_values(code, meta, title, hints)
+    allowed_line = ""
+    if shortlist:
+        allowed_line = f"\nAllowed values (if any): {', '.join(shortlist)}"
+    return f"- {code} ({label_text}){allowed_line}"
+
+
+def _build_messages(
+    title: str,
+    description: str | None,
+    attribute_tasks: Sequence[dict[str, object]],
+    extra_hints: Mapping[str, object] | None = None,
+) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT.strip()}]
+    for example in FEW_SHOT_EXAMPLES:
+        user = example.get("user")
+        assistant = example.get("assistant")
+        if isinstance(user, str) and isinstance(assistant, str):
+            messages.append({"role": "user", "content": user})
+            messages.append({"role": "assistant", "content": assistant})
+
+    description_block = description or ""
+    lines = [f"Title: {title.strip()}" if title else "Title:"]
+    lines.append(f"Description: {description_block.strip()}" if description_block else "Description:")
+    if extra_hints:
+        hints_lines = []
+        for key, value in extra_hints.items():
+            if _is_blank(value):
+                continue
+            hints_lines.append(f"{key}: {value}")
+        if hints_lines:
+            lines.append("Hints:\n" + "\n".join(hints_lines))
+
+    instructions: list[str] = []
+    for task in attribute_tasks:
+        code = str(task.get("code"))
+        meta = task.get("meta") if isinstance(task, Mapping) else None
+        hint_list = task.get("hints") if isinstance(task, Mapping) else None
+        instructions.append(
+            _build_attribute_instruction(
+                code,
+                meta if isinstance(meta, Mapping) else {},
+                title,
+                hint_list if isinstance(hint_list, Iterable) else None,
+            )
+        )
+
+    if instructions:
+        lines.append("Attributes to extract:\n" + "\n".join(instructions))
+
+    messages.append({"role": "user", "content": "\n".join(lines)})
+    return messages
+
+
+def _parse_chat_response(response: object) -> tuple[dict[str, object], str]:
+    content = ""
+    if isinstance(response, Mapping):
+        choices = response.get("choices")
+        if isinstance(choices, Sequence) and choices:
+            message = choices[0]
+            if isinstance(message, Mapping):
+                msg_payload = message.get("message") or {}
+                if isinstance(msg_payload, Mapping):
+                    content = str(msg_payload.get("content") or "")
+                elif isinstance(message.get("content"), str):
+                    content = str(message.get("content"))
+    else:
+        choices = getattr(response, "choices", None)
+        if isinstance(choices, Sequence) and choices:
+            first = choices[0]
+            message = getattr(first, "message", None)
+            if isinstance(message, Mapping):
+                content = str(message.get("content") or "")
+            else:
+                content = str(getattr(message, "content", ""))
+
+    if not content and isinstance(response, Mapping):
+        content = str(response.get("content") or "")
+
+    if not content:
+        return {}, ""
+
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        return {}, content
+
+    if isinstance(parsed, Mapping):
+        attributes = parsed.get("attributes")
+        if isinstance(attributes, Mapping):
+            return dict(attributes), content
+        return dict(parsed), content
+    return {}, content
+
+
+def extract_attributes(
+    client: Any,
+    *,
+    title: str,
+    description: str | None,
+    attribute_tasks: Sequence[dict[str, object]],
+    hints: Mapping[str, object] | None = None,
+    model: str = MODEL_STRONG,
+    temperature: float = 0.0,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Call an LLM to extract attributes with deterministic pre-extraction fallback."""
+
+    pre = regex_preextract(title, description)
+    messages = _build_messages(title, description, attribute_tasks, hints)
+
+    kwargs = {
+        "messages": messages,
+        "temperature": temperature,
+    }
+
+    def _invoke(current_model: str) -> tuple[dict[str, object], str]:
+        try:
+            response = client.chat.completions.create(model=current_model, **kwargs)
+            parsed, raw = _parse_chat_response(response)
+            return parsed, raw
+        except Exception as exc:  # pragma: no cover - network failure handling
+            logger.warning("LLM extraction failed with %s: %s", current_model, exc)
+            return {}, ""
+
+    parsed, raw_content = _invoke(model)
+    used_model = model
+    if not parsed and MODEL_FALLBACK and MODEL_FALLBACK != model:
+        parsed, raw_content = _invoke(MODEL_FALLBACK)
+        used_model = MODEL_FALLBACK
+
+    final: dict[str, object] = {}
+    for task in attribute_tasks:
+        code = str(task.get("code"))
+        llm_value = parsed.get(code) if isinstance(parsed, Mapping) else None
+        pre_value = pre.get(code)
+        if _is_blank(llm_value):
+            llm_value = None
+        if _is_blank(pre_value):
+            pre_value = None
+
+        if llm_value is None and pre_value is not None:
+            final[code] = pre_value
+        elif llm_value is not None and pre_value is None:
+            final[code] = llm_value
+        elif llm_value is not None and pre_value is not None:
+            if is_numeric_spec(code):
+                final[code] = pre_value
+            else:
+                final[code] = llm_value
+        else:
+            final[code] = None
+
+    metadata = {
+        "preextract": pre,
+        "raw_response": raw_content,
+        "used_model": used_model,
+    }
+
+    return final, metadata
