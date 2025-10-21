@@ -946,6 +946,9 @@ def _apply_ai_suggestions_to_wide(
         return wide_df, [], []
 
     DEBUG = bool(st.session_state.get("debug_ai", True))
+    force_override_enabled = bool(
+        st.session_state.get("ai_force_text_override")
+    )
 
     def is_empty(v: object) -> bool:
         if v is None:
@@ -964,6 +967,7 @@ def _apply_ai_suggestions_to_wide(
     ai_cells: dict[tuple[str, str], dict[str, object]] = {}
     ai_log: list[dict[str, object]] = []
     empty_mask_cache: dict[tuple[str, str], pd.Series] = {}
+    skip_context: dict[str, object] = {}
 
     def _clear_empty_mask_cache_for(code_key: str) -> None:
         if not empty_mask_cache:
@@ -1114,6 +1118,9 @@ def _apply_ai_suggestions_to_wide(
                 except Exception:
                     updated[code_key] = pd.Series(pd.NA, index=updated.index)
                 _clear_empty_mask_cache_for(code_key)
+                trace(
+                    {"where": "apply_ai:new_col", "code": code_key, "sku": sku_value}
+                )
             column_empty_mask = _get_empty_mask_for(code_key, sku_value)
             
             def _trace_skip(reason: str, extra: dict[str, object] | None = None) -> None:
@@ -1124,6 +1131,8 @@ def _apply_ai_suggestions_to_wide(
                     "reason": reason,
                     "existing_preview": _preview_existing(row_mask, code_key),
                 }
+                if skip_context:
+                    event.update(skip_context)
                 if isinstance(extra, Mapping):
                     event.update(extra)
                 trace(event)
@@ -1149,12 +1158,6 @@ def _apply_ai_suggestions_to_wide(
                 if not suggestion_payload.get("reason"):
                     suggestion_payload["reason"] = "Regex pre-extract"
                 log_details = {"used_regex": True, "value": ai_value}
-            if is_empty(ai_value):
-                _trace_skip(
-                    "empty-suggestion",
-                    {"ai_preview": None if ai_value is None else str(ai_value)[:120]},
-                )
-                continue
             meta_candidate = meta_map.get(code_key) if isinstance(meta_map, dict) else {}
             if meta_candidate is None:
                 meta = {"code": code_key, "frontend_input": "text"}
@@ -1185,18 +1188,50 @@ def _apply_ai_suggestions_to_wide(
                     allowed_for_set_value = bool(allowed_for_set_info)
                 except Exception:
                     allowed_for_set_value = True
+            meta_options = meta.get("options") if isinstance(meta, Mapping) else None
+            options_count = len(meta_options) if isinstance(meta_options, Iterable) else None
             trace(
                 {
                     "where": "apply_ai:meta",
                     "sku": sku_value,
                     "code": code_key,
                     "input_type": input_type,
-                    "options_count": len(meta.get("options", []))
-                    if isinstance(meta, Mapping)
-                    else None,
+                    "options_count": options_count,
                     "allowed_for_set": bool(allowed_for_set_value),
                 }
             )
+            skip_context.clear()
+            skip_context.update(
+                {
+                    "suggested": _shorten_value(ai_value),
+                    "meta_frontend_input": input_type,
+                    "has_options": bool(options_count),
+                    "allowed_for_set": bool(allowed_for_set_value),
+                }
+            )
+            trace(
+                {
+                    "where": "apply_ai:plan",
+                    "sku": sku_value,
+                    "code": code_key,
+                    "ai_raw": _shorten_value(ai_value),
+                    "input_type": input_type,
+                    "allowed_for_set": bool(allowed_for_set_value),
+                    "force_text_override": force_override_enabled,
+                }
+            )
+            skip_extra_base = {
+                "allowed_for_set": bool(allowed_for_set_value),
+            }
+            if is_empty(ai_value):
+                _trace_skip(
+                    "empty-suggestion",
+                    {
+                        "ai_preview": None if ai_value is None else str(ai_value)[:120],
+                        **skip_extra_base,
+                    },
+                )
+                continue
             if DEBUG:
                 options_count = (
                     len(meta.get("options", []))
@@ -1272,7 +1307,7 @@ def _apply_ai_suggestions_to_wide(
             if input_type in {"multiselect", "select"}:
                 options_list = meta.get("options") if isinstance(meta, Mapping) else None
                 if not options_list:
-                    _trace_skip("no-options")
+                    _trace_skip("no-options", skip_extra_base)
                     ai_log.append(
                         {
                             "sku": sku_value,
@@ -1289,7 +1324,7 @@ def _apply_ai_suggestions_to_wide(
                         f"[DEBUG SKIP] {code_key} skipped — reason={skip_reason} "
                         f"existing={_preview_existing(row_mask, code_key)}"
                     )
-                _trace_skip(skip_reason)
+                _trace_skip(skip_reason, skip_extra_base)
                 ai_log.append(
                     {
                         "sku": sku_value,
@@ -1324,7 +1359,7 @@ def _apply_ai_suggestions_to_wide(
                             f"[DEBUG SKIP] {code_key} skipped — reason={skip_reason} "
                             f"existing={_preview_existing(row_mask, code_key)}"
                         )
-                    _trace_skip(skip_reason)
+                    _trace_skip(skip_reason, skip_extra_base)
                     ai_log.append(
                         {
                             "sku": sku_value,
@@ -1342,7 +1377,7 @@ def _apply_ai_suggestions_to_wide(
                             f"[DEBUG SKIP] {code_key} skipped — reason={skip_reason} "
                             f"existing={_preview_existing(row_mask, code_key)}"
                         )
-                    _trace_skip(skip_reason)
+                    _trace_skip(skip_reason, skip_extra_base)
                     ai_log.append(
                         {
                             "sku": sku_value,
@@ -1359,46 +1394,47 @@ def _apply_ai_suggestions_to_wide(
                 except Exception:
                     empties = pd.Series(False, index=updated.index)
                 mask = (sku_series == sku_value) & empties
+                force_override_applied = False
                 if not mask.any():
                     existing_series = updated.loc[row_mask, code_key]
                     existing_value = None
                     if isinstance(existing_series, pd.Series) and not existing_series.empty:
                         existing_value = existing_series.iloc[0]
-                    if DEBUG:
-                        print(
-                            f"[DEBUG SKIP] {code_key} skipped — reason=non-empty "
-                            f"existing={_preview_existing(row_mask, code_key)}"
+                    if force_override_enabled:
+                        mask = sku_series == sku_value
+                        force_override_applied = True
+                        _force_mark(sku_value, code_key)
+                    else:
+                        if DEBUG:
+                            print(
+                                f"[DEBUG SKIP] {code_key} skipped — reason=non-empty "
+                                f"existing={_preview_existing(row_mask, code_key)}"
+                            )
+                        _trace_skip(
+                            "non-empty",
+                            {"existing_value": existing_value, **skip_extra_base},
                         )
-                    _trace_skip("non-empty")
-                    ai_log.append(
-                        {
-                            "sku": sku_value,
-                            "code": code_key,
-                            "skip_reason": "non-empty",
-                            "existing_value": existing_value,
-                        }
-                    )
-                    continue
+                        ai_log.append(
+                            {
+                                "sku": sku_value,
+                                "code": code_key,
+                                "skip_reason": "non-empty",
+                                "existing_value": existing_value,
+                            }
+                        )
+                        continue
                 if DEBUG:
                     print(
                         f"[DEBUG APPLY] Writing {code_key}={trimmed_value!r} for {int(mask.sum())} rows"
                     )
-                trace(
-                    {
-                        "where": "apply_ai:apply",
-                        "sku": sku_value,
-                        "code": code_key,
-                        "value_preview": str(trimmed_value)[:200],
-                    }
-                )
-                updated.loc[mask, code_key] = trimmed_value
-                _clear_empty_mask_cache_for(code_key)
                 indices_to_update = mask[mask].index.tolist()
+                row_positions: list[int] = []
                 for idx in indices_to_update:
                     row_position_arr = updated.index.get_indexer([idx])
                     row_position: int | None = None
                     if len(row_position_arr) == 1 and row_position_arr[0] >= 0:
                         row_position = int(row_position_arr[0])
+                        row_positions.append(row_position)
                     _mark_ai_filled(
                         ai_cells,
                         row_idx=row_position,
@@ -1407,6 +1443,19 @@ def _apply_ai_suggestions_to_wide(
                         value=trimmed_value,
                         log_entry=log_details,
                     )
+                updated.loc[mask, code_key] = trimmed_value
+                _clear_empty_mask_cache_for(code_key)
+                trace(
+                    {
+                        "where": "apply_ai:apply",
+                        "sku": sku_value,
+                        "code": code_key,
+                        "value_preview": str(trimmed_value)[:200],
+                        "row_idx": row_positions[0] if row_positions else None,
+                        "rows_affected": len(indices_to_update),
+                        "force_override": force_override_applied,
+                    }
+                )
                 continue
 
             for idx in row_indices:
@@ -1555,6 +1604,9 @@ def _apply_ai_suggestions_to_wide(
                                 "sku": sku_value,
                                 "code": code_key,
                                 "value_preview": str(combined_ids)[:200],
+                                "row_idx": row_position,
+                                "rows_affected": 1,
+                                "force_override": False,
                             }
                         )
                         updated.at[idx, code_key] = combined_ids
@@ -1600,6 +1652,7 @@ def _apply_ai_suggestions_to_wide(
                                 "found_ids": found_ids,
                                 "ignored_tokens": ignored_tokens,
                                 "suggested": normalized_ai,
+                                **skip_extra_base,
                             },
                         )
                         ai_log.append(
@@ -1663,7 +1716,11 @@ def _apply_ai_suggestions_to_wide(
                             )
                         _trace_skip(
                             "not-applicable-for-set",
-                            {"suggested": ai_value, "ignored_tokens": ignored_tokens},
+                            {
+                                "suggested": ai_value,
+                                "ignored_tokens": ignored_tokens,
+                                **skip_extra_base,
+                            },
                         )
                         ai_log.append(
                             {
@@ -1697,6 +1754,9 @@ def _apply_ai_suggestions_to_wide(
                                 "sku": sku_value,
                                 "code": code_key,
                                 "value_preview": str(combined)[:200],
+                                "row_idx": row_position,
+                                "rows_affected": 1,
+                                "force_override": False,
                             }
                         )
                         updated.at[idx, code_key] = combined
@@ -1742,6 +1802,7 @@ def _apply_ai_suggestions_to_wide(
                             {
                                 "suggested": ai_value,
                                 "skipped_duplicates": skipped_duplicates,
+                                **skip_extra_base,
                             },
                         )
                         ai_log.append(
@@ -1763,6 +1824,7 @@ def _apply_ai_suggestions_to_wide(
                             {
                                 "suggested": ai_value,
                                 "ignored_tokens": ignored_tokens,
+                                **skip_extra_base,
                             },
                         )
                         ai_log.append(
@@ -1797,7 +1859,7 @@ def _apply_ai_suggestions_to_wide(
                             )
                         _trace_skip(
                             "not-applicable-for-set",
-                            {"suggested": candidate_raw},
+                            {"suggested": candidate_raw, **skip_extra_base},
                         )
                         ai_log.append(
                             {
@@ -1836,7 +1898,7 @@ def _apply_ai_suggestions_to_wide(
                         )
                     _trace_skip(
                         "non-empty",
-                        {"existing_value": existing_raw},
+                        {"existing_value": existing_raw, **skip_extra_base},
                     )
                     ai_log.append(
                         {
@@ -2789,6 +2851,30 @@ def build_attributes_df(
                     ai_errors.append(error_message)
                     continue
 
+                if isinstance(ai_df, pd.DataFrame):
+                    preview_df = ai_df.head(50)
+                    if {"code", "value"} <= set(preview_df.columns):
+                        suggested_records = preview_df[["code", "value"]].to_dict(
+                            orient="records"
+                        )
+                    else:
+                        suggested_records = preview_df.to_dict(orient="records")
+                elif hasattr(ai_df, "to_dict"):
+                    try:
+                        suggested_records = list(ai_df.to_dict().items())
+                    except Exception:
+                        suggested_records = []
+                else:
+                    suggested_records = []
+                trace(
+                    {
+                        "where": "ai:raw",
+                        "sku": sku_value,
+                        "set_id": set_id,
+                        "suggested": suggested_records,
+                    }
+                )
+
                 categories_meta_for_ai = step2_state.get("categories_meta")
                 if not isinstance(categories_meta_for_ai, Mapping):
                     categories_meta_for_ai = {}
@@ -2807,6 +2893,15 @@ def build_attributes_df(
                 metadata = getattr(ai_df, "attrs", {}).get("meta") if hasattr(ai_df, "attrs") else None
                 if isinstance(metadata, dict) and metadata:
                     per_sku["__meta__"] = metadata
+
+                trace(
+                    {
+                        "where": "ai:enriched",
+                        "sku": sku_value,
+                        "set_id": set_id,
+                        "keys": list(per_sku.keys()),
+                    }
+                )
 
                 if not isinstance(ai_df, pd.DataFrame) or ai_df.empty:
                     continue
@@ -3069,6 +3164,14 @@ def save_step2_to_magento():
         st.info("No changes to save.")
         return
 
+    def _short_preview(value: object, limit: int = 120) -> str:
+        if value in (None, ""):
+            return ""
+        text = str(value)
+        if len(text) <= limit:
+            return text
+        return text[: limit - 1] + "…"
+
     session = st.session_state.get("mg_session")
     base_url = st.session_state.get("mg_base_url")
     if not session or not base_url:
@@ -3306,6 +3409,10 @@ def save_step2_to_magento():
                         "code": attr_code,
                         "input_type": input_type,
                         "prepared_preview": str(prepared_value)[:200],
+                        "old_vs_new": {
+                            "old": _short_preview(old_raw),
+                            "new": _short_preview(prepared_value),
+                        },
                     }
                 )
                 try:
@@ -3385,28 +3492,44 @@ def save_step2_to_magento():
 
     ok_skus: set[str] = set()
     for sku, attrs in payload_by_sku.items():
+        attr_keys = [key for key in attrs.keys() if key != "attribute_set_id"]
         trace(
             {
                 "where": "save:payload",
                 "sku": sku,
                 "keys": sorted(attrs.keys()),
                 "payload_preview": {
-                    k: (str(v)[:120] if k != "categories" else v)
+                    k: (
+                        _short_preview(v)
+                        if k != "categories"
+                        else v
+                    )
                     for k, v in attrs.items()
                 },
+                "attribute_set_id": attrs.get("attribute_set_id"),
+                "count_custom_attrs": len(attr_keys),
+                "has_categories": "categories" in attr_keys,
             }
         )
         try:
             apply_product_update(session, api_base, sku, attrs)
             ok_skus.add(sku)
+            trace({"where": "save:http_ok", "sku": sku, "status": "ok"})
         except Exception as exc:  # pragma: no cover - network interaction
             errors.append(
                 {
                     "sku": sku,
                     "attribute": "*batch*",
                     "raw": repr(attrs),
-                    "hint_examples": str(exc),
+                    "hint_examples": f"{exc}\nKeys: {', '.join(sorted(attrs.keys()))}",
                     "expected_codes": "",
+                }
+            )
+            trace(
+                {
+                    "where": "save:http_err",
+                    "sku": sku,
+                    "err": _short_preview(exc, limit=200),
                 }
             )
 
@@ -3706,7 +3829,19 @@ if isinstance(ai_model_secret, str):
 else:
     ai_model_secret = "gpt-3.5-turbo"
 st.session_state["ai_api_key"] = ai_api_key_secret
-st.session_state["ai_model"] = ai_model_secret
+model_options = ["gpt-4o-mini", "gpt-4o", "o4-mini", "o4"]
+default_model = ai_model_secret if ai_model_secret in model_options else model_options[0]
+if not st.session_state.get("ai_model"):
+    st.session_state["ai_model"] = default_model
+current_model = st.session_state.get("ai_model", default_model)
+if current_model not in model_options:
+    current_model = default_model
+selected_model = st.sidebar.selectbox(
+    "AI model",
+    model_options,
+    index=model_options.index(current_model),
+)
+st.session_state["ai_model"] = selected_model
 
 if not st.session_state.get("_mg_auth_logged"):
     st.write(
@@ -4614,6 +4749,9 @@ if df_original_key in st.session_state:
                                         ai_cells_map = step2_state.setdefault(
                                             "ai_cells", {}
                                         )
+                                        pipeline_snapshots = step2_state.setdefault(
+                                            "pipeline_snapshots", {}
+                                        )
                                         suggestions_for_set = (
                                             step2_state.get("ai_suggestions") or {}
                                         ).get(set_id)
@@ -4625,14 +4763,14 @@ if df_original_key in st.session_state:
                                             )
                                         ):
                                             df_before_ai = step2_state["wide"].get(set_id)
-                                            if (
-                                                isinstance(df_before_ai, pd.DataFrame)
-                                                and "categories" in df_before_ai.columns
-                                            ):
-                                                st.write(
-                                                    "✅ DF BEFORE AI",
-                                                    df_before_ai[["sku", "categories"]].head(5),
-                                                )
+                                            snapshot_entry = pipeline_snapshots.setdefault(
+                                                set_id,
+                                                {},
+                                            )
+                                            if isinstance(df_before_ai, pd.DataFrame):
+                                                snapshot_entry[
+                                                    "wide_before_ai"
+                                                ] = df_before_ai.copy(deep=True)
                                             (
                                                 updated_df,
                                                 filled_cells,
@@ -4649,11 +4787,10 @@ if df_original_key in st.session_state:
                                             )
                                             if isinstance(updated_df, pd.DataFrame):
                                                 step2_state["wide"][set_id] = updated_df
-                                                if "categories" in updated_df.columns:
-                                                    st.write(
-                                                        "✅ DF AFTER AI",
-                                                        updated_df[["sku", "categories"]].head(5),
-                                                    )
+                                                if isinstance(updated_df, pd.DataFrame):
+                                                    snapshot_entry[
+                                                        "wide_after_ai"
+                                                    ] = updated_df.copy(deep=True)
                                                 if filled_cells:
                                                     ai_cells_map[set_id] = filled_cells
                                                 ai_logs_map = step2_state.setdefault(
@@ -4834,6 +4971,9 @@ if df_original_key in st.session_state:
                                         ai_cells_map = step2_state.setdefault(
                                             "ai_cells", {}
                                         )
+                                        pipeline_snapshots = step2_state.setdefault(
+                                            "pipeline_snapshots", {}
+                                        )
                                         suggestions_for_set = (
                                             step2_state.get("ai_suggestions") or {}
                                         ).get(set_id)
@@ -4844,6 +4984,15 @@ if df_original_key in st.session_state:
                                                 step2_state["wide"].get(set_id), pd.DataFrame
                                             )
                                         ):
+                                            snapshot_entry = pipeline_snapshots.setdefault(
+                                                set_id,
+                                                {},
+                                            )
+                                            df_before_ai = step2_state["wide"].get(set_id)
+                                            if isinstance(df_before_ai, pd.DataFrame):
+                                                snapshot_entry[
+                                                    "wide_before_ai"
+                                                ] = df_before_ai.copy(deep=True)
                                             (
                                                 updated_df,
                                                 filled_cells,
@@ -4860,6 +5009,9 @@ if df_original_key in st.session_state:
                                             )
                                             if isinstance(updated_df, pd.DataFrame):
                                                 step2_state["wide"][set_id] = updated_df
+                                                snapshot_entry["wide_after_ai"] = (
+                                                    updated_df.copy(deep=True)
+                                                )
                                                 if filled_cells:
                                                     ai_cells_map[set_id] = filled_cells
                                                 ai_logs_map = step2_state.setdefault(
@@ -4932,6 +5084,103 @@ if df_original_key in st.session_state:
                                     )
                                     completed = True
                                 elif st.session_state.get("show_attrs"):
+                                    ctrl_col1, ctrl_col2 = st.columns([1, 1])
+                                    rerun_clicked = ctrl_col1.button(
+                                        "🔁 Re-run AI for visible rows",
+                                        key="btn_step2_rerun_ai",
+                                    )
+                                    ctrl_col2.checkbox(
+                                        "🚩 Разрешить перезапись непустых текстовых атрибутов ИИ",
+                                        value=bool(
+                                            st.session_state.get("ai_force_text_override", False)
+                                        ),
+                                        key="ai_force_text_override",
+                                    )
+                                    if rerun_clicked:
+                                        suggestions_map = (
+                                            step2_state.get("ai_suggestions") or {}
+                                        )
+                                        wide_map = step2_state.get("wide", {})
+                                        wide_meta_map = step2_state.get("wide_meta", {})
+                                        ai_cells_map = step2_state.setdefault(
+                                            "ai_cells", {}
+                                        )
+                                        ai_logs_map = step2_state.setdefault(
+                                            "ai_logs", {}
+                                        )
+                                        pipeline_snapshots = step2_state.setdefault(
+                                            "pipeline_snapshots", {}
+                                        )
+                                        visible_sets = (
+                                            selected_set_ids
+                                            or sorted(step2_state.get("wide", {}).keys())
+                                        )
+                                        for current_set_id in visible_sets:
+                                            wide_current = wide_map.get(current_set_id)
+                                            suggestions_for_set = suggestions_map.get(
+                                                current_set_id
+                                            )
+                                            if not (
+                                                isinstance(wide_current, pd.DataFrame)
+                                                and suggestions_for_set
+                                            ):
+                                                continue
+                                            meta_for_set = (
+                                                wide_meta_map.get(current_set_id, {})
+                                                if isinstance(wide_meta_map, dict)
+                                                else {}
+                                            )
+                                            snapshot_entry = pipeline_snapshots.setdefault(
+                                                current_set_id,
+                                                {},
+                                            )
+                                            snapshot_entry["wide_before_ai"] = wide_current.copy(
+                                                deep=True
+                                            )
+                                            (
+                                                updated_df,
+                                                filled_cells,
+                                                ai_log_entries,
+                                            ) = _apply_ai_suggestions_to_wide(
+                                                wide_current,
+                                                suggestions_for_set,
+                                                meta_for_set,
+                                                meta_cache=meta_cache,
+                                                session=session,
+                                                api_base=api_base,
+                                            )
+                                            if not isinstance(updated_df, pd.DataFrame):
+                                                continue
+                                            step2_state["wide"][current_set_id] = updated_df
+                                            snapshot_entry["wide_after_ai"] = updated_df.copy(
+                                                deep=True
+                                            )
+                                            if filled_cells:
+                                                ai_cells_map[current_set_id] = filled_cells
+                                            else:
+                                                ai_cells_map.pop(current_set_id, None)
+                                            if ai_log_entries:
+                                                ai_logs_map[current_set_id] = ai_log_entries
+                                            else:
+                                                ai_logs_map.pop(current_set_id, None)
+                                            df_view_rerun = _coerce_for_ui(
+                                                updated_df, meta_for_set
+                                            )
+                                            if isinstance(df_view_rerun, pd.DataFrame):
+                                                snapshot_entry[
+                                                    "ui_before_editor"
+                                                ] = df_view_rerun.copy(deep=True)
+                                                display_df = df_view_rerun.copy()
+                                                if "attribute_set_id" in display_df.columns:
+                                                    display_df = display_df.drop(
+                                                        columns=["attribute_set_id"]
+                                                    )
+                                                _sync_ai_highlight_state(
+                                                    step2_state,
+                                                    current_set_id,
+                                                    display_df,
+                                                )
+                                        st.rerun()
                                     wide_meta = step2_state.setdefault("wide_meta", {})
                                     categories_meta = step2_state.get("categories_meta", {})
                                     if not isinstance(categories_meta, dict):
@@ -4978,15 +5227,25 @@ if df_original_key in st.session_state:
                                                 )
 
                                         _apply_categories_fallback(meta_map)
+                                        pipeline_snapshots = step2_state.setdefault(
+                                            "pipeline_snapshots", {}
+                                        )
                                         df_ref = _coerce_for_ui(wide_df, meta_map)
-                                        if (
-                                            isinstance(df_ref, pd.DataFrame)
-                                            and "categories" in df_ref.columns
-                                        ):
-                                            st.write(
-                                                "✅ DF BEFORE UI",
-                                                df_ref[["sku", "categories"]].head(5),
-                                            )
+                                        if isinstance(df_ref, pd.DataFrame):
+                                            missing_columns = [
+                                                col
+                                                for col in wide_df.columns
+                                                if col not in df_ref.columns
+                                                and col != "attribute_set_id"
+                                            ]
+                                            if missing_columns:
+                                                trace(
+                                                    {
+                                                        "where": "ui:missing_col",
+                                                        "set_id": set_id,
+                                                        "codes": missing_columns,
+                                                    }
+                                                )
                                         _ensure_wide_meta_options(meta_map, df_ref)
 
                                         if (
@@ -5121,6 +5380,25 @@ if df_original_key in st.session_state:
                                             )
                                             df_view = df_view[column_order]
 
+                                            snapshot_entry = pipeline_snapshots.setdefault(
+                                                current_set_id,
+                                                {},
+                                            )
+                                            if isinstance(df_view, pd.DataFrame):
+                                                snapshot_entry[
+                                                    "ui_before_editor"
+                                                ] = df_view.copy(deep=True)
+                                                trace(
+                                                    {
+                                                        "where": "ui:df_before_editor",
+                                                        "set_id": current_set_id,
+                                                        "cols": df_view.columns.tolist(),
+                                                        "sample": df_view.head(3).to_dict(
+                                                            orient="records"
+                                                        ),
+                                                    }
+                                                )
+
                                             column_config_final = dict(column_config or {})
                                             if "sku" in df_view.columns:
                                                 column_config_final[
@@ -5228,6 +5506,15 @@ if df_original_key in st.session_state:
                                     )
 
                                 if st.session_state.get("show_attrs"):
+                                    trace_events = st.session_state.get(
+                                        "_trace_events", []
+                                    )
+                                    payload_events = [
+                                        event
+                                        for event in trace_events
+                                        if isinstance(event, dict)
+                                        and event.get("where") == "save:payload"
+                                    ]
                                     ai_log_payload = _collect_ai_suggestions_log(
                                         step2_state.get("ai_suggestions"),
                                         step2_state.get("ai_cells"),
@@ -5240,6 +5527,197 @@ if df_original_key in st.session_state:
                                             st.caption(
                                                 "AI не вносил подсказки в этой сессии."
                                             )
+
+                                    with st.expander("🧬 Data pipeline snapshots"):
+                                        tab_ai, tab_stage, tab_payload = st.tabs(
+                                            [
+                                                "AI → Wide",
+                                                "Staged vs Synced",
+                                                "Payload log",
+                                            ]
+                                        )
+                                        pipeline_snapshots = step2_state.get(
+                                            "pipeline_snapshots", {}
+                                        )
+                                        set_names = step2_state.get("set_names", {})
+                                        with tab_ai:
+                                            if not pipeline_snapshots:
+                                                st.caption("Пока нет снапшотов AI.")
+                                            else:
+                                                for snap_set_id in sorted(
+                                                    pipeline_snapshots.keys()
+                                                ):
+                                                    snap_entry = pipeline_snapshots.get(
+                                                        snap_set_id, {}
+                                                    )
+                                                    set_label = set_names.get(
+                                                        snap_set_id, str(snap_set_id)
+                                                    )
+                                                    st.markdown(
+                                                        f"**Set {snap_set_id} — {set_label}**"
+                                                    )
+                                                    before_ai = snap_entry.get(
+                                                        "wide_before_ai"
+                                                    )
+                                                    after_ai = snap_entry.get(
+                                                        "wide_after_ai"
+                                                    )
+                                                    ui_before = snap_entry.get(
+                                                        "ui_before_editor"
+                                                    )
+                                                    if isinstance(before_ai, pd.DataFrame):
+                                                        st.write(
+                                                            "DF BEFORE AI",
+                                                            before_ai.head(10),
+                                                        )
+                                                    else:
+                                                        st.caption(
+                                                            "Нет данных DF BEFORE AI"
+                                                        )
+                                                    if isinstance(after_ai, pd.DataFrame):
+                                                        st.write(
+                                                            "DF AFTER AI",
+                                                            after_ai.head(10),
+                                                        )
+                                                    else:
+                                                        st.caption(
+                                                            "Нет данных DF AFTER AI"
+                                                        )
+                                                    if isinstance(ui_before, pd.DataFrame):
+                                                        st.write(
+                                                            "DF BEFORE EDITOR",
+                                                            ui_before.head(10),
+                                                        )
+                                                    st.markdown("---")
+                                        with tab_stage:
+                                            staged_map = step2_state.get("staged", {})
+                                            synced_map = step2_state.get("wide_synced", {})
+                                            all_sets = sorted(
+                                                set(staged_map.keys())
+                                                | set(synced_map.keys())
+                                            )
+                                            if not all_sets:
+                                                st.caption("Нет staged изменений.")
+                                            for snap_set_id in all_sets:
+                                                staged_df = staged_map.get(snap_set_id)
+                                                if staged_df is None:
+                                                    staged_df = step2_state.get("wide", {}).get(
+                                                        snap_set_id
+                                                    )
+                                                synced_df = synced_map.get(snap_set_id)
+                                                st.markdown(
+                                                    f"**Set {snap_set_id} — {set_names.get(snap_set_id, snap_set_id)}**"
+                                                )
+                                                col_a, col_b = st.columns(2)
+                                                with col_a:
+                                                    st.write("Staged")
+                                                    if isinstance(staged_df, pd.DataFrame):
+                                                        st.dataframe(
+                                                            staged_df,
+                                                            use_container_width=True,
+                                                        )
+                                                    else:
+                                                        st.caption("Нет данных")
+                                                with col_b:
+                                                    st.write("Synced baseline")
+                                                    if isinstance(synced_df, pd.DataFrame):
+                                                        st.dataframe(
+                                                            synced_df,
+                                                            use_container_width=True,
+                                                        )
+                                                    else:
+                                                        st.caption("Нет данных")
+
+                                                diff_columns: list[str] = []
+                                                if isinstance(
+                                                    staged_df, pd.DataFrame
+                                                ) and isinstance(
+                                                    synced_df, pd.DataFrame
+                                                ):
+                                                    all_cols = sorted(
+                                                        set(staged_df.columns)
+                                                        | set(synced_df.columns)
+                                                    )
+                                                    for col in all_cols:
+                                                        if col == "attribute_set_id":
+                                                            continue
+                                                        left_series = (
+                                                            staged_df[col]
+                                                            if col in staged_df
+                                                            else pd.Series(
+                                                                [None]
+                                                                * len(staged_df)
+                                                            )
+                                                        )
+                                                        right_series = (
+                                                            synced_df[col]
+                                                            if col in synced_df
+                                                            else pd.Series(
+                                                                [None]
+                                                                * len(synced_df)
+                                                            )
+                                                        )
+                                                        if len(left_series) != len(
+                                                            right_series
+                                                        ):
+                                                            diff_columns.append(col)
+                                                            continue
+                                                        values_differ = False
+                                                        for left_val, right_val in zip(
+                                                            left_series.astype(object),
+                                                            right_series.astype(object),
+                                                        ):
+                                                            if not _values_equal(
+                                                                left_val, right_val
+                                                            ):
+                                                                values_differ = True
+                                                                break
+                                                        if values_differ:
+                                                            diff_columns.append(col)
+                                                st.write(
+                                                    "Changed columns:",
+                                                    diff_columns
+                                                    if diff_columns
+                                                    else "Нет различий",
+                                                )
+                                                st.markdown("---")
+                                        with tab_payload:
+                                            if payload_events:
+                                                payload_df = pd.DataFrame(
+                                                    [
+                                                        {
+                                                            "sku": event.get("sku"),
+                                                            "keys": ", ".join(
+                                                                str(item)
+                                                                for item in (
+                                                                    event.get("keys", [])
+                                                                    if isinstance(
+                                                                        event.get("keys"),
+                                                                        (list, tuple, set),
+                                                                    )
+                                                                    else [
+                                                                        event.get(
+                                                                            "keys"
+                                                                        )
+                                                                    ]
+                                                                )
+                                                                if item not in (None, "")
+                                                            ),
+                                                            "preview": str(
+                                                                event.get(
+                                                                    "payload_preview"
+                                                                )
+                                                            ),
+                                                        }
+                                                        for event in payload_events
+                                                    ]
+                                                )
+                                                st.dataframe(
+                                                    payload_df,
+                                                    use_container_width=True,
+                                                )
+                                            else:
+                                                st.caption("Payload еще не собирался.")
 
                                     st.markdown("---")
                                     c1, c2 = st.columns([1, 1])
@@ -5258,3 +5736,28 @@ if df_original_key in st.session_state:
                                     if btn_reset:
                                         _reset_step2_state()
                                         st.rerun()
+
+                                    trace_json = json.dumps(
+                                        trace_events,
+                                        ensure_ascii=False,
+                                        indent=2,
+                                        default=str,
+                                    )
+                                    payload_json = json.dumps(
+                                        payload_events,
+                                        ensure_ascii=False,
+                                        indent=2,
+                                        default=str,
+                                    )
+                                    st.download_button(
+                                        "⬇️ Download trace.json",
+                                        data=trace_json,
+                                        file_name="trace.json",
+                                        mime="application/json",
+                                    )
+                                    st.download_button(
+                                        "⬇️ Download payload.json",
+                                        data=payload_json,
+                                        file_name="payload.json",
+                                        mime="application/json",
+                                    )
