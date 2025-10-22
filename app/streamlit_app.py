@@ -70,6 +70,7 @@ from services.ai_fill import (
     resolve_model_name,
     should_force_override,
 )
+from services.apply import build_magento_payload, map_value_for_magento
 from services.llm_extract import brand_from_title, is_numeric_spec
 from services.inventory import (
     get_attr_set_id,
@@ -3129,56 +3130,38 @@ def _df_differs(a: pd.DataFrame | None, b: pd.DataFrame | None) -> bool:
     return False
 
 
-def apply_product_update(session, api_base: str, sku: str, attributes: dict):
+def apply_product_update(
+    session,
+    api_base: str,
+    sku: str,
+    attributes: dict,
+    meta_by_attr: dict[str, dict[str, object]] | None = None,
+):
     if not attributes:
         return
 
     attrs = dict(attributes or {})
+    attr_set_id = attrs.get("attribute_set_id")
 
-    attr_set_id = attrs.pop("attribute_set_id", None)
-    if isinstance(attr_set_id, float) and pd.isna(attr_set_id):
-        attr_set_id = None
-    if isinstance(attr_set_id, str):
-        cleaned = attr_set_id.strip()
-        attr_set_id = cleaned or None
-
-    payload: dict[str, object] = {"sku": sku}
-    if attr_set_id is not None:
-        try:
-            payload["attribute_set_id"] = int(attr_set_id)
-        except (TypeError, ValueError):
-            payload["attribute_set_id"] = attr_set_id
-
-    custom_attributes = []
-    extension_attributes: dict[str, object] = {}
-
+    row_payload = {"sku": sku, "attribute_set_id": attr_set_id}
     for code, value in attrs.items():
-        if code == "categories":
-            category_links = [
-                {"position": idx, "category_id": str(cat_id)}
-                for idx, cat_id in enumerate(value or [])
-            ]
-            extension_attributes["category_links"] = category_links
-        else:
-            if isinstance(value, (list, tuple, set)):
-                value = ",".join(
-                    str(item).strip() for item in value if item not in (None, "")
-                )
-            custom_attributes.append({"attribute_code": code, "value": value})
+        if code == "attribute_set_id":
+            continue
+        row_payload[code] = value
 
-    if custom_attributes:
-        payload["custom_attributes"] = custom_attributes
-    if extension_attributes:
-        payload["extension_attributes"] = extension_attributes
+    payload = build_magento_payload(row_payload, meta_by_attr or {})
 
     url = f"{api_base.rstrip('/')}/products/{quote(sku, safe='')}"
+    product_payload = payload.get("product", {}) if isinstance(payload, dict) else {}
+    custom_attributes = product_payload.get("custom_attributes", [])
+    extension_attributes = product_payload.get("extension_attributes", {})
     if logger.isEnabledFor(logging.INFO):
         attr_codes = [
             item.get("attribute_code")
             for item in custom_attributes
             if isinstance(item, dict)
         ]
-        payload_preview = json.dumps({"product": payload}, ensure_ascii=False)[:200]
+        payload_preview = json.dumps(payload, ensure_ascii=False)[:200]
         logger.info(
             "Magento PUT %s attrs=%s payload=%s",
             sku,
@@ -3203,7 +3186,7 @@ def apply_product_update(session, api_base: str, sku: str, attributes: dict):
         pass
     resp = session.put(
         url,
-        json={"product": payload},
+        json=payload,
         headers=build_magento_headers(session=session),
         timeout=30,
     )
@@ -3309,9 +3292,11 @@ def save_step2_to_magento():
                 attr_set_clean = int(attr_set_value)
             except (TypeError, ValueError):
                 attr_set_clean = attr_set_value
-            payload_by_sku.setdefault(sku_value, {})["attribute_set_id"] = (
-                attr_set_clean
+            entry = payload_by_sku.setdefault(
+                sku_value,
+                {"attribute_set_id": attr_set_clean, "values": {}, "meta": {}},
             )
+            entry["attribute_set_id"] = attr_set_clean
 
             baseline_row: pd.Series | None
             if baseline_idx is not None and sku in baseline_idx.index:
@@ -3530,10 +3515,49 @@ def save_step2_to_magento():
                     )
                     continue
 
-                payload_by_sku.setdefault(sku_value, {})[attr_code] = normalized
+                meta_for_payload: dict[str, object] = {}
+                if isinstance(meta_info, dict):
+                    meta_for_payload = dict(meta_info)
+
+                options_map_raw = meta_for_payload.get("options_map")
+                normalized_options_map: dict[str, str] = {}
+                if isinstance(options_map_raw, dict):
+                    for opt_key, opt_value in options_map_raw.items():
+                        if opt_key in (None, ""):
+                            continue
+                        if isinstance(opt_key, str):
+                            key_clean = opt_key.strip()
+                            if not key_clean:
+                                continue
+                            normalized_options_map[key_clean.lower()] = str(opt_value)
+                        else:
+                            key_str = str(opt_key).strip()
+                            if not key_str:
+                                continue
+                            normalized_options_map[key_str.lower()] = str(opt_value)
+                elif isinstance(meta_for_payload.get("values_to_labels"), dict):
+                    values_to_labels = meta_for_payload.get("values_to_labels") or {}
+                    for value_key, label in values_to_labels.items():
+                        if not isinstance(label, str):
+                            continue
+                        label_clean = label.strip()
+                        if not label_clean:
+                            continue
+                        normalized_options_map[label_clean.lower()] = str(value_key)
+
+                meta_for_payload["options_map"] = normalized_options_map
+                meta_for_payload["frontend_input"] = input_type
+
+                entry = payload_by_sku.setdefault(
+                    sku_value,
+                    {"attribute_set_id": attr_set_clean, "values": {}, "meta": {}},
+                )
+                entry.setdefault("values", {})[attr_code] = normalized
+                entry.setdefault("meta", {})[attr_code] = meta_for_payload
 
             entry = payload_by_sku.get(sku_value)
-            if entry and set(entry.keys()) == {"attribute_set_id"}:
+            values_map = entry.get("values") if isinstance(entry, dict) else None
+            if entry and (not values_map or not values_map.keys()):
                 payload_by_sku.pop(sku_value, None)
 
     if not payload_by_sku and not errors:
@@ -3546,28 +3570,90 @@ def save_step2_to_magento():
         return
 
     ok_skus: set[str] = set()
-    for sku, attrs in payload_by_sku.items():
-        attr_keys = [key for key in attrs.keys() if key != "attribute_set_id"]
+    for sku, entry in payload_by_sku.items():
+        values_map = entry.get("values") if isinstance(entry, dict) else {}
+        if not isinstance(values_map, dict):
+            values_map = {}
+        meta_map = entry.get("meta") if isinstance(entry, dict) else {}
+        if not isinstance(meta_map, dict):
+            meta_map = {}
+
+        attr_keys = list(values_map.keys())
         trace(
             {
                 "where": "save:payload",
                 "sku": sku,
-                "keys": sorted(attrs.keys()),
+                "keys": sorted(attr_keys + ["attribute_set_id"]),
                 "payload_preview": {
                     k: (
                         _short_preview(v)
                         if k != "categories"
                         else v
                     )
-                    for k, v in attrs.items()
+                    for k, v in values_map.items()
                 },
-                "attribute_set_id": attrs.get("attribute_set_id"),
+                "attribute_set_id": entry.get("attribute_set_id"),
                 "count_custom_attrs": len(attr_keys),
                 "has_categories": "categories" in attr_keys,
             }
         )
+
+        validation_failed = False
+        for code, raw_value in values_map.items():
+            if code == "categories":
+                continue
+            meta_for_code = meta_map.get(code) if isinstance(meta_map, dict) else {}
+            mapped_value = map_value_for_magento(code, raw_value, meta_for_code)
+            frontend_input = str(
+                (meta_for_code or {}).get("frontend_input") or ""
+            ).lower()
+
+            if frontend_input in {"select", "boolean"} and mapped_value in (None, ""):
+                label_text = _short_preview(raw_value) or str(raw_value)
+                errors.append(
+                    {
+                        "sku": sku,
+                        "attribute": code,
+                        "raw": repr(raw_value),
+                        "hint_examples": f'Не найден option_id для "{label_text}" в атрибуте {code}',
+                        "expected_codes": "",
+                    }
+                )
+                validation_failed = True
+            elif frontend_input == "multiselect" and mapped_value == "":
+                if isinstance(raw_value, (list, tuple, set)):
+                    label_text = ", ".join(
+                        str(v).strip() for v in raw_value if v not in (None, "")
+                    )
+                else:
+                    label_text = _short_preview(raw_value) or str(raw_value)
+                errors.append(
+                    {
+                        "sku": sku,
+                        "attribute": code,
+                        "raw": repr(raw_value),
+                        "hint_examples": f'Не найден option_id для "{label_text}" в атрибуте {code}',
+                        "expected_codes": "",
+                    }
+                )
+                validation_failed = True
+
+        if validation_failed:
+            continue
+
+        attributes_payload: dict[str, object] = {}
+        if entry.get("attribute_set_id") is not None:
+            attributes_payload["attribute_set_id"] = entry.get("attribute_set_id")
+        attributes_payload.update(values_map)
+
         try:
-            apply_product_update(session, api_base, sku, attrs)
+            apply_product_update(
+                session,
+                api_base,
+                sku,
+                attributes_payload,
+                meta_map,
+            )
             ok_skus.add(sku)
             trace({"where": "save:http_ok", "sku": sku, "status": "ok"})
         except Exception as exc:  # pragma: no cover - network interaction
@@ -3575,8 +3661,8 @@ def save_step2_to_magento():
                 {
                     "sku": sku,
                     "attribute": "*batch*",
-                    "raw": repr(attrs),
-                    "hint_examples": f"{exc}\nKeys: {', '.join(sorted(attrs.keys()))}",
+                    "raw": repr(attributes_payload),
+                    "hint_examples": f"{exc}\nKeys: {', '.join(sorted(attributes_payload.keys()))}",
                     "expected_codes": "",
                 }
             )

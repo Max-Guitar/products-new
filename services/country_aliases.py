@@ -78,3 +78,25 @@ def country_aliases(name_or_code: object) -> list[str]:
             return [lower_value]
     aliases = _COUNTRY_ALIASES.get(canonical, {lower_value})
     return sorted(aliases)
+
+
+def normalize_country(value: object) -> str | None:
+    """Return a canonical uppercase code or cleaned country name."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+    else:
+        text = str(value).strip()
+    if not text:
+        return None
+
+    lower_value = text.lower()
+    aliases = country_aliases(lower_value)
+    for alias in aliases:
+        alias_clean = alias.strip()
+        if len(alias_clean) == 2 and alias_clean.isalpha():
+            return alias_clean.upper()
+    if len(text) == 2 and text.isalpha():
+        return text.upper()
+    return text
