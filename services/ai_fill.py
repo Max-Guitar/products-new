@@ -19,6 +19,7 @@ from utils.http import MAGENTO_REST_PATH_CANDIDATES, build_magento_headers
 
 from services.llm_extract import (
     RegexExtraction,
+    _sanitize_llm_json,
     build_retry_questions,
     is_numeric_spec,
     regex_extract,
@@ -154,6 +155,30 @@ SET_ATTRS: Mapping[str, Set[str]] = {
     },
 }
 
+DEFAULT_OPENAI_MODEL = "gpt-5-mini"
+
+OPENAI_MODEL_ALIASES: Mapping[str, str] = {
+    "4": "gpt-4o",
+    "4-mini": "gpt-4o-mini",
+    "5": "gpt-5",
+    "5-mini": "gpt-5-mini",
+    "o4": "o4",
+    "o4-mini": "o4-mini",
+}
+
+
+def resolve_model_name(model: str | None, default: str = DEFAULT_OPENAI_MODEL) -> str:
+    candidate = (model or "").strip()
+    if not candidate:
+        return default
+
+    candidate_key = candidate.casefold()
+    for alias, actual in OPENAI_MODEL_ALIASES.items():
+        if alias.casefold() == candidate_key:
+            return actual
+    return candidate
+
+
 AI_RULES_TEXT = (
     "Ты помощник по каталогизации гитар. Используй входные данные, чтобы заполнить "
     "пропущенные атрибуты товара. Всегда отвечай JSON вида "
@@ -169,6 +194,7 @@ AI_RULES_TEXT = (
     "- Булевы значения задавай как true/false.\n"
     "- Для категорий используй текстовые лейблы.\n"
     "- Если данных недостаточно — возвращай пустое значение.\n"
+    "- Возвращай только один JSON-объект без Markdown.\n"
     "\n"
     "Примеры:\n"
     "Вход: {\"sku\":\"ACOUSTIC-1\",\"name\":\"Taylor GS Mini\",\"attribute_set_name\":\"Acoustic guitar\","
@@ -222,6 +248,7 @@ class AiConversation:
 def get_ai_conversation(model: str | None = None) -> AiConversation:
     """Return a global AI conversation, resetting when rules/model change."""
 
+    resolved_model = resolve_model_name(model)
     stored = st.session_state.get("ai_conv")
     if isinstance(stored, AiConversation):
         conv = stored
@@ -235,23 +262,23 @@ def get_ai_conversation(model: str | None = None) -> AiConversation:
     else:
         conv = AiConversation()
 
-    model_changed = bool(model) and conv.model not in (None, model)
+    model_changed = bool(resolved_model) and conv.model not in (None, resolved_model)
     rules_changed = conv.rules_hash != AI_RULES_HASH
     if model_changed or rules_changed:
         conv = AiConversation(
             conversation_id=None,
             rules_hash=AI_RULES_HASH,
             system_messages=[{"role": "system", "content": AI_RULES_TEXT}],
-            model=model,
+            model=resolved_model,
         )
     else:
         conv.rules_hash = AI_RULES_HASH
-        if model is not None:
-            conv.model = model
+        if resolved_model is not None:
+            conv.model = resolved_model
         if not conv.system_messages:
             conv.system_messages = [{"role": "system", "content": AI_RULES_TEXT}]
         if conv.model is None:
-            conv.model = model
+            conv.model = resolved_model
 
     st.session_state["ai_conv"] = conv
     return conv
@@ -839,12 +866,14 @@ def _openai_complete(
     conv: AiConversation | None,
     user_msg: str,
     api_key: str,
-    model: str = "gpt-5-mini",
+    model: str = DEFAULT_OPENAI_MODEL,
     timeout: int = 60,
 ) -> tuple[dict, str]:
     api_key = api_key or os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OpenAI API key is not configured.")
+
+    resolved_model = resolve_model_name(model)
 
     if isinstance(conv, AiConversation) and conv.system_messages:
         system_messages = list(conv.system_messages)
@@ -865,67 +894,42 @@ def _openai_complete(
     except Exception as exc:  # pragma: no cover - client init safety
         raise RuntimeError(f"OpenAI request failed: {exc}") from exc
 
-    kwargs = {
-        "model": model,
-        "input": messages_payload,
-        "temperature": 0.1,
-        "timeout": timeout,
-    }
-    if isinstance(conv, AiConversation) and conv.conversation_id:
-        kwargs["conversation"] = {"id": conv.conversation_id}
-
     try:
-        response = client.responses.create(**kwargs)
-    except TypeError:
-        # Fallback for environments without the Responses API.
-        try:
-            chat_response = client.chat.completions.create(
-                model=model,
-                messages=messages_payload,
-                temperature=0.1,
-                timeout=timeout,
-            )
-        except Exception as exc:  # pragma: no cover - network error handling
-            raise RuntimeError(f"OpenAI request failed: {exc}") from exc
-
-        try:
-            content = chat_response.choices[0].message.content
-        except (AttributeError, IndexError, TypeError) as exc:
-            raise RuntimeError("OpenAI response missing message content") from exc
-
-        try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("OpenAI response was not valid JSON") from exc
-
-        if isinstance(conv, AiConversation):
-            conv.conversation_id = None
-            conv.rules_hash = AI_RULES_HASH
-            conv.model = model
-            conv.system_messages = system_messages
-
-        return parsed, content
+        chat = client.chat.completions.create(
+            model=resolved_model,
+            messages=messages_payload,
+            temperature=0.1,
+            timeout=timeout,
+            response_format={"type": "json_object"},
+            max_tokens=1200,
+        )
     except Exception as exc:  # pragma: no cover - network error handling
         raise RuntimeError(f"OpenAI request failed: {exc}") from exc
 
-    raw_content = _extract_response_text(response)
+    try:
+        raw_content = chat.choices[0].message.content or ""
+    except (AttributeError, IndexError, TypeError) as exc:
+        raise RuntimeError("OpenAI response missing message content") from exc
+
     if not raw_content:
         raise RuntimeError("OpenAI response missing message content")
 
     try:
         parsed = json.loads(raw_content)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("OpenAI response was not valid JSON") from exc
+    except json.JSONDecodeError:
+        cleaned = _sanitize_llm_json(raw_content)
+        try:
+            parsed = json.loads(cleaned)
+        except json.JSONDecodeError as exc:
+            error = RuntimeError("OpenAI response was not valid JSON")
+            setattr(error, "raw_response", raw_content)
+            setattr(error, "raw_response_sanitized", cleaned)
+            raise error from exc
 
     if isinstance(conv, AiConversation):
-        conversation_info = getattr(response, "conversation", None)
-        new_id = getattr(conversation_info, "id", None)
-        if new_id is None and isinstance(conversation_info, Mapping):
-            new_id = conversation_info.get("id")
-        if new_id:
-            conv.conversation_id = new_id
+        conv.conversation_id = None
         conv.rules_hash = AI_RULES_HASH
-        conv.model = model
+        conv.model = resolved_model
         conv.system_messages = system_messages
 
     return parsed, raw_content
@@ -1191,7 +1195,7 @@ def infer_missing(
     *,
     conv: AiConversation | None = None,
     hints: Mapping[str, object] | None = None,
-    model: str = "gpt-5-mini",
+    model: str = DEFAULT_OPENAI_MODEL,
 ) -> pd.DataFrame:
     allowed_set: Set[str] = {str(item) for item in allowed if isinstance(item, str)}
     missing: List[dict] = []
@@ -1390,6 +1394,18 @@ def infer_missing(
 
     payload_json = json.dumps(user_payload, ensure_ascii=False)
     completion, raw_content = _openai_complete(conv, payload_json, api_key, model=model)
+    try:
+        buf = st.session_state.setdefault("_trace_events", [])
+        buf.append(
+            {
+                "where": "ai_fill:raw_llm",
+                "sku": (product or {}).get("sku") if isinstance(product, Mapping) else None,
+                "ai_codes": list(ai_codes),
+                "raw_preview": raw_content[:1500] if raw_content else "",
+            }
+        )
+    except Exception:
+        pass
     attributes = completion.get("attributes") if isinstance(completion, Mapping) else []
     ai_df = pd.DataFrame(attributes or [])
 
@@ -1447,6 +1463,20 @@ def infer_missing(
         retry_df = pd.DataFrame(retry_attributes or [])
         retry_map = _df_to_code_map(retry_df)
         raw_previews.append(_truncate_preview(raw_retry))
+        try:
+            buf = st.session_state.setdefault("_trace_events", [])
+            buf.append(
+                {
+                    "where": "ai_fill:raw_llm_retry",
+                    "sku": (product or {}).get("sku")
+                    if isinstance(product, Mapping)
+                    else None,
+                    "ai_codes": list(ai_codes),
+                    "raw_preview": raw_retry[:1500] if raw_retry else "",
+                }
+            )
+        except Exception:
+            pass
 
         for code, payload in retry_map.items():
             if not isinstance(payload, Mapping):
