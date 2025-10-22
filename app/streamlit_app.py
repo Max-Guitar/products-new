@@ -54,7 +54,9 @@ from connectors.magento.client import get_default_products, get_api_base
 from services.ai_fill import (
     ALWAYS_ATTRS,
     SET_ATTRS,
+    DEFAULT_OPENAI_MODEL,
     HTMLResponseError,
+    OPENAI_MODEL_ALIASES,
     collect_attributes_table,
     compute_allowed_attrs,
     derive_styles_from_texts,
@@ -65,6 +67,7 @@ from services.ai_fill import (
     infer_missing,
     normalize_category_label,
     probe_api_base,
+    resolve_model_name,
 )
 from services.llm_extract import brand_from_title, is_numeric_spec
 from services.inventory import (
@@ -85,8 +88,6 @@ from utils.http import build_magento_headers, get_session
 
 
 logger = logging.getLogger(__name__)
-
-MODEL_ALIASES = {"4": "gpt-4o", "4-mini": "gpt-4o-mini", "5": "gpt-5"}
 
 
 def _force_mark(sku: str, code: str):
@@ -2582,10 +2583,10 @@ def build_attributes_df(
     ai_results: dict[int, dict[str, dict[str, dict[str, object]]]] = defaultdict(dict)
     ai_errors: list[str] = []
     ai_log_data: dict[str, list[dict[str, object]]] = {"errors": []}
-    resolved_model = MODEL_ALIASES.get(ai_model, ai_model)
+    resolved_model = resolve_model_name(ai_model, default=DEFAULT_OPENAI_MODEL)
     if not resolved_model:
         resolved_model = st.session_state.get("ai_model_resolved")
-    ai_model_name = resolved_model or "gpt-5-mini"
+    ai_model_name = resolved_model or DEFAULT_OPENAI_MODEL
     ai_conv = get_ai_conversation(ai_model_name) if ai_enabled else None
 
     for _, row in df_changed.iterrows():
@@ -3863,29 +3864,49 @@ st.session_state["mg_base_url"] = magento_base_url
 ai_api_key_secret = st.secrets.get("OPENAI_API_KEY", "")
 if not ai_api_key_secret:
     ai_api_key_secret = os.getenv("OPENAI_API_KEY", "")
-ai_model_secret = st.secrets.get("OPENAI_MODEL", "gpt-3.5-turbo")
-if isinstance(ai_model_secret, str):
-    ai_model_secret = ai_model_secret.strip() or "gpt-3.5-turbo"
+ai_model_secret_raw = st.secrets.get("OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
+if isinstance(ai_model_secret_raw, str):
+    ai_model_secret_raw = ai_model_secret_raw.strip() or DEFAULT_OPENAI_MODEL
 else:
-    ai_model_secret = "gpt-3.5-turbo"
+    ai_model_secret_raw = DEFAULT_OPENAI_MODEL
+ai_model_secret = resolve_model_name(ai_model_secret_raw, default=DEFAULT_OPENAI_MODEL)
 st.session_state["ai_api_key"] = ai_api_key_secret
-model_options = ["gpt-4o-mini", "gpt-4o", "o4-mini", "o4"]
+model_options: list[str] = []
+for option in (
+    DEFAULT_OPENAI_MODEL,
+    OPENAI_MODEL_ALIASES.get("5"),
+    OPENAI_MODEL_ALIASES.get("5-mini"),
+    OPENAI_MODEL_ALIASES.get("4"),
+    OPENAI_MODEL_ALIASES.get("4-mini"),
+    OPENAI_MODEL_ALIASES.get("o4"),
+    OPENAI_MODEL_ALIASES.get("o4-mini"),
+):
+    if option and option not in model_options:
+        model_options.append(option)
+if not model_options:
+    model_options = [DEFAULT_OPENAI_MODEL]
+
 default_model = ai_model_secret if ai_model_secret in model_options else model_options[0]
-if not st.session_state.get("ai_model"):
+stored_model = st.session_state.get("ai_model")
+if not stored_model:
     st.session_state["ai_model"] = default_model
-current_model = st.session_state.get("ai_model", default_model)
+    stored_model = default_model
+current_model = stored_model
+resolved_current = resolve_model_name(current_model, default=default_model)
+if current_model not in model_options and resolved_current in model_options:
+    current_model = resolved_current
 if current_model not in model_options:
     current_model = default_model
+
 selected_model = st.sidebar.selectbox(
     "AI model",
     model_options,
     index=model_options.index(current_model),
 )
+
 st.session_state["ai_model"] = selected_model
-SELECTED_MODEL = MODEL_ALIASES.get(
-    st.session_state.get("ai_model"), st.session_state.get("ai_model")
-)
-st.session_state["ai_model_resolved"] = SELECTED_MODEL
+resolved_selected = resolve_model_name(selected_model, default=default_model)
+st.session_state["ai_model_resolved"] = resolved_selected
 
 if not st.session_state.get("_mg_auth_logged"):
     st.write(
