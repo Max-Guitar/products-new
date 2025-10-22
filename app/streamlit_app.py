@@ -68,6 +68,7 @@ from services.ai_fill import (
     normalize_category_label,
     probe_api_base,
     resolve_model_name,
+    should_force_override,
 )
 from services.llm_extract import brand_from_title, is_numeric_spec
 from services.inventory import (
@@ -1105,6 +1106,10 @@ def _apply_ai_suggestions_to_wide(
         if not row_mask.any():
             continue
         row_indices = updated.index[row_mask]
+        row_context: dict[str, object] = {"sku": sku_value}
+        first_row_idx = row_indices[0] if len(row_indices) else None
+        if first_row_idx is not None and "name" in updated.columns:
+            row_context["name"] = updated.at[first_row_idx, "name"]
         ai_suggested = attrs_payload if isinstance(attrs_payload, Mapping) else {}
         if DEBUG:
             try:
@@ -1399,14 +1404,22 @@ def _apply_ai_suggestions_to_wide(
                     empties = pd.Series(False, index=updated.index)
                 mask = (sku_series == sku_value) & empties
                 force_override_applied = False
+                soft_override_applied = False
                 if not mask.any():
                     existing_series = updated.loc[row_mask, code_key]
                     existing_value = None
                     if isinstance(existing_series, pd.Series) and not existing_series.empty:
                         existing_value = existing_series.iloc[0]
-                    if force_override_enabled:
+                    should_soft_override = should_force_override(
+                        code_key,
+                        existing_value,
+                        trimmed_value,
+                        row_context,
+                    )
+                    if force_override_enabled or should_soft_override:
                         mask = sku_series == sku_value
                         force_override_applied = True
+                        soft_override_applied = not force_override_enabled and should_soft_override
                         _force_mark(sku_value, code_key)
                     else:
                         if DEBUG:
@@ -1458,6 +1471,7 @@ def _apply_ai_suggestions_to_wide(
                         "row_idx": row_positions[0] if row_positions else None,
                         "rows_affected": len(indices_to_update),
                         "force_override": force_override_applied,
+                        "soft_override": soft_override_applied,
                     }
                 )
                 continue

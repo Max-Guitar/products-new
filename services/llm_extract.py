@@ -10,6 +10,12 @@ import traceback
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
+from services.spec_defaults import (
+    apply_series_defaults,
+    enrich_pickups,
+    maybe_set_gig_bag,
+)
+
 MODEL_STRONG = "gpt-5"
 MODEL_FALLBACK = "gpt-4o"
 FALLBACK_MODEL = MODEL_FALLBACK
@@ -200,39 +206,6 @@ _NUMERIC_CODES = {
     "neck_nutwidth",
     "nut_width",
 }
-
-
-SERIES_RULES = [
-    {
-        "when": [r"\bFender\b", r"\bVintera\s*II\b", r"\bP[- ]?Bass\b"],
-        "defaults": {
-            "scale_mensur": '34"',
-            "no_strings": "4",
-            "pickup_config": "P",
-            "bridge": "Vintage-Style 4-Saddle",
-            "tuning_machines": "Vintage-Style Open-Gear",
-            "body_material": "Alder",
-            "fretboard_material": "Rosewood",
-            "neck_profile": "C Shape",
-            "country_of_manufacture": "Mexico",
-        },
-    },
-]
-
-
-def apply_series_defaults(title: str | None, attrs: dict[str, object]) -> dict[str, object]:
-    import re
-
-    text = title or ""
-    for rule in SERIES_RULES:
-        conditions = rule.get("when", [])
-        defaults = rule.get("defaults", {})
-        if not isinstance(conditions, Sequence) or not isinstance(defaults, Mapping):
-            continue
-        if all(re.search(pattern, text, flags=re.IGNORECASE) for pattern in conditions):
-            for key, value in defaults.items():
-                attrs.setdefault(key, value)
-    return attrs
 
 
 COLOR_CODES = {
@@ -717,6 +690,8 @@ def extract_attributes(
     """Call an LLM to extract attributes with deterministic pre-extraction fallback."""
 
     pre_initial = regex_preextract(title, description)
+    pre_initial = apply_series_defaults(title, dict(pre_initial))
+    pre_initial = maybe_set_gig_bag(title, pre_initial)
     messages = _build_messages(title, description, attribute_tasks, hints)
 
     kwargs = {
@@ -810,6 +785,7 @@ def extract_attributes(
             if not _is_blank(value):
                 defaults_seed[key] = value
         defaults_with_series = apply_series_defaults(title, defaults_seed)
+        defaults_with_series = maybe_set_gig_bag(title, defaults_with_series)
 
         default_candidates: dict[str, object] = {}
         for key, value in defaults_with_series.items():
@@ -862,6 +838,8 @@ def extract_attributes(
             else:
                 final[code] = None
 
+        final = enrich_pickups(final)
+
         metadata = {
             "preextract": pre_initial,
             "raw_response": raw_content,
@@ -874,10 +852,13 @@ def extract_attributes(
         title_value = title or ""
         pre_local = regex_preextract(title, description)
         attrs = apply_series_defaults(title_value, dict(pre_local))
+        attrs = maybe_set_gig_bag(title_value, attrs)
         if not attrs.get("finish"):
             finish_guess = color_from_title(title_value)
             if finish_guess:
                 attrs["finish"] = finish_guess
+
+        attrs = enrich_pickups(attrs)
 
         non_empty_attrs = {k: v for k, v in attrs.items() if not _is_blank(v)}
         _trace(
