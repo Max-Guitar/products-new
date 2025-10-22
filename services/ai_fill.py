@@ -901,7 +901,7 @@ def _openai_complete(
             temperature=0.1,
             timeout=timeout,
             response_format={"type": "json_object"},
-            max_tokens=1200,
+            max_completion_tokens=1200,
         )
     except Exception as exc:  # pragma: no cover - network error handling
         raise RuntimeError(f"OpenAI request failed: {exc}") from exc
