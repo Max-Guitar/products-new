@@ -166,6 +166,39 @@ OPENAI_MODEL_ALIASES: Mapping[str, str] = {
     "o4-mini": "o4-mini",
 }
 
+_TRACE_CALLABLE = None
+_TRACE_LOOKUP_DONE = False
+
+
+def _trace(event: Mapping[str, object]) -> None:
+    """Forward trace events to the Streamlit debug panel when available."""
+
+    if not isinstance(event, Mapping):
+        return
+
+    global _TRACE_CALLABLE, _TRACE_LOOKUP_DONE
+
+    if not _TRACE_LOOKUP_DONE:
+        _TRACE_LOOKUP_DONE = True
+        try:  # pragma: no cover - streamlit-only helper
+            from app.streamlit_app import trace as _trace_func
+        except Exception:  # pragma: no cover - optional import guard
+            _trace_func = None
+        _TRACE_CALLABLE = _trace_func
+
+    if callable(_TRACE_CALLABLE):
+        try:  # pragma: no cover - streamlit-only helper
+            _TRACE_CALLABLE(dict(event))
+            return
+        except Exception:
+            pass
+
+    try:
+        buf = st.session_state.setdefault("_trace_events", [])
+        buf.append(dict(event))
+    except Exception:
+        pass
+
 
 def resolve_model_name(model: str | None, default: str = DEFAULT_OPENAI_MODEL) -> str:
     candidate = (model or "").strip()
@@ -862,6 +895,23 @@ def _strip_html(value: Optional[object]) -> str:
         return ""
 
 
+def _caps_for_model(model: str):
+    m = (model or "").lower()
+    if m.startswith("o4"):
+        return {
+            "supports_temperature": False,
+            "supports_top_p": False,
+            "supports_json_mode": True,
+            "supports_max_completion_tokens": True,
+        }
+    return {
+        "supports_temperature": True,
+        "supports_top_p": True,
+        "supports_json_mode": True,
+        "supports_max_completion_tokens": True,
+    }
+
+
 def _openai_complete(
     conv: AiConversation | None,
     user_msg: str,
@@ -894,17 +944,66 @@ def _openai_complete(
     except Exception as exc:  # pragma: no cover - client init safety
         raise RuntimeError(f"OpenAI request failed: {exc}") from exc
 
+    caps = _caps_for_model(resolved_model)
+
+    kwargs: dict[str, object] = {
+        "model": resolved_model,
+        "messages": messages_payload,
+        "timeout": timeout,
+    }
+
+    if caps["supports_json_mode"]:
+        kwargs["response_format"] = {"type": "json_object"}
+
+    if caps["supports_max_completion_tokens"]:
+        kwargs["max_completion_tokens"] = 1200
+
+    if caps["supports_temperature"]:
+        kwargs["temperature"] = 0.2
+
+    if caps["supports_top_p"]:
+        kwargs["top_p"] = 1
+
+    _trace(
+        {
+            "where": "ai:openai_call",
+            "model": resolved_model,
+            "kwargs_sent": list(kwargs.keys()),
+        }
+    )
+
     try:
-        chat = client.chat.completions.create(
-            model=resolved_model,
-            messages=messages_payload,
-            temperature=0.1,
-            timeout=timeout,
-            response_format={"type": "json_object"},
-            max_completion_tokens=1200,
-        )
+        chat = client.chat.completions.create(**kwargs)
     except Exception as exc:  # pragma: no cover - network error handling
-        raise RuntimeError(f"OpenAI request failed: {exc}") from exc
+        msg = str(exc)
+        if (
+            "unsupported_parameter" in msg
+            or "unsupported value" in msg
+            or "invalid_request_error" in msg
+        ):
+            stripped_kwargs = dict(kwargs)
+            needs_retry = False
+            for k in ("temperature", "top_p", "response_format", "max_completion_tokens"):
+                if k in stripped_kwargs:
+                    stripped_kwargs.pop(k, None)
+                    needs_retry = True
+            if needs_retry:
+                kwargs = stripped_kwargs
+                _trace(
+                    {
+                        "where": "ai:openai_retry_stripped",
+                        "model": resolved_model,
+                        "kwargs_sent": list(kwargs.keys()),
+                    }
+                )
+                try:
+                    chat = client.chat.completions.create(**kwargs)
+                except Exception as retry_exc:  # pragma: no cover - network error handling
+                    raise RuntimeError(f"OpenAI request failed: {retry_exc}") from retry_exc
+            else:
+                raise RuntimeError(f"OpenAI request failed: {exc}") from exc
+        else:
+            raise RuntimeError(f"OpenAI request failed: {exc}") from exc
 
     try:
         raw_content = chat.choices[0].message.content or ""
