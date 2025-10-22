@@ -38,6 +38,40 @@ ALWAYS_ATTRS: Set[str] = {
 
 ELECTRIC_SET_IDS: Set[int] = {12, 16}
 
+SOFT_OVERRIDE_WHITELIST: Set[str] = {"no_strings", "neck_radius", "neck_nutwidth"}
+
+
+def should_force_override(
+    code: str,
+    existing_val: object,
+    suggested_val: object,
+    row_ctx: Mapping[str, object] | None,
+) -> bool:
+    """Return ``True`` when AI suggestion should override an existing value."""
+
+    code_key = str(code)
+    if code_key not in SOFT_OVERRIDE_WHITELIST:
+        return False
+
+    title = ""
+    if isinstance(row_ctx, Mapping):
+        title = f"{row_ctx.get('name') or ''} {row_ctx.get('sku') or ''}".strip()
+
+    if code_key == "no_strings":
+        existing_str = str(existing_val).strip()
+        suggested_str = str(suggested_val).strip()
+        if existing_str in {"6", "", "None", "0"} and suggested_str == "4":
+            if "5" not in title and "6" not in title:
+                return True
+        return False
+
+    if code_key in {"neck_radius", "neck_nutwidth"}:
+        existing_str = str(existing_val).strip()
+        if not existing_str or existing_str == "None":
+            return bool(suggested_val)
+    return False
+
+
 SET_ATTRS: Mapping[str, Set[str]] = {
     "Accessories": {
         "condition",
@@ -1534,10 +1568,70 @@ def infer_missing(
             order.append(code)
 
     raw_previews: list[str] = [_truncate_preview(raw_content)]
+    retried = False
+
+    gap_missing_codes = [
+        code for code in ai_codes if _is_blank(suggestions_map.get(code, {}).get("value"))
+    ]
+    if gap_missing_codes:
+        gap_prompt_parts: list[str] = []
+        title_text = product.get("name") if isinstance(product, Mapping) else None
+        if isinstance(title_text, str) and title_text.strip():
+            gap_prompt_parts.append(f"Title: {title_text.strip()}")
+        description_candidates = []
+        for candidate in (short_desc, long_desc):
+            if isinstance(candidate, str) and candidate.strip():
+                description_candidates.append(candidate.strip())
+        if isinstance(product, Mapping):
+            fallback_desc = product.get("description")
+            if isinstance(fallback_desc, str) and fallback_desc.strip():
+                description_candidates.append(fallback_desc.strip())
+        if description_candidates:
+            gap_prompt_parts.append(f"Description: {description_candidates[0]}")
+        gap_prompt_parts.append(
+            "Fill only these attribute codes (return JSON): "
+            + ", ".join(sorted({str(code) for code in gap_missing_codes}))
+        )
+        gap_prompt = "\n".join(part for part in gap_prompt_parts if part)
+        completion_gap, raw_gap = _openai_complete(
+            conv, gap_prompt, api_key, model=model
+        )
+        gap_attrs = completion_gap.get("attributes") if isinstance(completion_gap, Mapping) else []
+        gap_df = pd.DataFrame(gap_attrs or [])
+        gap_map = _df_to_code_map(gap_df)
+        raw_previews.append(_truncate_preview(raw_gap))
+        try:
+            buf = st.session_state.setdefault("_trace_events", [])
+            buf.append(
+                {
+                    "where": "ai_fill:raw_llm_gap",
+                    "sku": (product or {}).get("sku")
+                    if isinstance(product, Mapping)
+                    else None,
+                    "ai_codes": list(gap_missing_codes),
+                    "raw_preview": raw_gap[:1500] if raw_gap else "",
+                }
+            )
+        except Exception:
+            pass
+        gap_missing_set = {str(code) for code in gap_missing_codes}
+        for code, payload in gap_map.items():
+            code_key = str(code)
+            if code_key not in gap_missing_set:
+                continue
+            if not isinstance(payload, Mapping):
+                continue
+            value = payload.get("value")
+            if _is_blank(value):
+                continue
+            suggestions_map[code_key] = payload
+            if code_key not in order:
+                order.append(code_key)
+        retried = True
+
     remaining_before_retry = [
         code for code in ai_codes if _is_blank(suggestions_map.get(code, {}).get("value"))
     ]
-    retried = False
 
     if remaining_before_retry:
         context_already_found = {
@@ -1609,10 +1703,10 @@ def infer_missing(
 
     previews_for_log: list[str] = []
     if raw_previews:
-        if raw_previews[0]:
-            previews_for_log.append(f"initial: {raw_previews[0]}")
-        if retried and len(raw_previews) > 1 and raw_previews[1]:
-            previews_for_log.append(f"retry: {raw_previews[1]}")
+        labels = ["initial"] + [f"retry{idx}" for idx in range(1, len(raw_previews))]
+        for label, preview in zip(labels, raw_previews):
+            if preview:
+                previews_for_log.append(f"{label}: {preview}")
 
     metadata = {
         "rules_hash": getattr(conv, "rules_hash", AI_RULES_HASH)

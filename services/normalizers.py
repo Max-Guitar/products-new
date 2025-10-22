@@ -42,6 +42,36 @@ TEXT_INPUT_TYPES = {
 }
 
 
+ALIASES = {
+    "tuning_machines": {
+        "Fender vintage-style open-gear tuners": "Vintage-Style Open-Gear",
+    },
+    "bridge": {
+        "Vintage Style 4-Saddle": "Vintage-Style 4-Saddle",
+    },
+}
+
+
+def normalize_alias(code: str, val: Any) -> Any:
+    """Normalize textual aliases for select/text inputs."""
+
+    if val in (None, ""):
+        return val
+
+    alias_map = ALIASES.get(code)
+    if not alias_map:
+        return val
+
+    text = str(val).strip()
+    if not text:
+        return val
+
+    for alias, normalized in alias_map.items():
+        if text == alias or text.casefold() == alias.casefold():
+            return normalized
+    return val
+
+
 def _format_inch_value(value: float) -> str:
     rounded = round(value, 2)
     if math.isclose(rounded, int(round(rounded))):
@@ -249,6 +279,7 @@ def normalize_for_magento(code: str, val: Any, meta: AttributeMetaCache | None):
     was_blank = _is_blank(val)
 
     val = normalize_units(code, val)
+    val = normalize_alias(code, val)
 
     info: dict[str, Any] | None = None
     if isinstance(meta, AttributeMetaCache):
