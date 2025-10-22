@@ -33,6 +33,7 @@ ALWAYS_ATTRS: Set[str] = {
     "condition",
     "categories",
     "country_of_manufacture",
+    "short_description",
 }
 
 ELECTRIC_SET_IDS: Set[int] = {12, 16}
