@@ -3598,8 +3598,8 @@ def save_step2_to_magento():
             }
         )
 
-        validation_failed = False
-        for code, raw_value in values_map.items():
+        to_drop: list[str] = []
+        for code, raw_value in list(values_map.items()):
             if code == "categories":
                 continue
             meta_for_code = meta_map.get(code) if isinstance(meta_map, dict) else {}
@@ -3609,7 +3609,9 @@ def save_step2_to_magento():
             ).lower()
 
             if frontend_input in {"select", "boolean"} and mapped_value in (None, ""):
-                label_text = _short_preview(raw_value) or str(raw_value)
+                label_text = (
+                    str(raw_value)[:120] if raw_value not in (None, "") else ""
+                )
                 errors.append(
                     {
                         "sku": sku,
@@ -3619,14 +3621,21 @@ def save_step2_to_magento():
                         "expected_codes": "",
                     }
                 )
-                validation_failed = True
+                to_drop.append(code)
             elif frontend_input == "multiselect" and mapped_value == "":
-                if isinstance(raw_value, (list, tuple, set)):
-                    label_text = ", ".join(
-                        str(v).strip() for v in raw_value if v not in (None, "")
+                label_text = (
+                    ", ".join(
+                        str(v).strip()
+                        for v in (raw_value or [])
+                        if v not in (None, "")
                     )
-                else:
-                    label_text = _short_preview(raw_value) or str(raw_value)
+                    if isinstance(raw_value, (list, tuple, set))
+                    else (
+                        str(raw_value)[:120]
+                        if raw_value not in (None, "")
+                        else ""
+                    )
+                )
                 errors.append(
                     {
                         "sku": sku,
@@ -3636,10 +3645,10 @@ def save_step2_to_magento():
                         "expected_codes": "",
                     }
                 )
-                validation_failed = True
+                to_drop.append(code)
 
-        if validation_failed:
-            continue
+        for code in to_drop:
+            values_map.pop(code, None)
 
         attributes_payload: dict[str, object] = {}
         if entry.get("attribute_set_id") is not None:
