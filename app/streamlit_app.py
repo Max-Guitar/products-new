@@ -3615,7 +3615,7 @@ def save_step2_to_magento():
                         "sku": sku,
                         "attribute": code,
                         "raw": repr(raw_value),
-                        "hint_examples": f'Не найден option_id для "{label_text}" в атрибуте {code}',
+                        "hint_examples": f'Не найден option_id для "{label_text}" в атрибуте {code} — атрибут пропущен при импорте.',
                         "expected_codes": "",
                     }
                 )
@@ -3632,7 +3632,7 @@ def save_step2_to_magento():
                         "sku": sku,
                         "attribute": code,
                         "raw": repr(raw_value),
-                        "hint_examples": f'Не найден option_id для "{label_text}" в атрибуте {code}',
+                        "hint_examples": f'Не найден option_id для "{label_text}" в атрибуте {code} — атрибут пропущен при импорте.',
                         "expected_codes": "",
                     }
                 )

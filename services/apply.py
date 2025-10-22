@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, Mapping, MutableMapping
 
+from country_aliases import country_aliases
 from services.country_aliases import normalize_country
 
 
@@ -17,37 +18,63 @@ def _is_blank(value: Any) -> bool:
     return False
 
 
+def map_country_to_option_id(value: str | None, meta: Mapping[str, Any] | None) -> str | None:
+    if not value:
+        return None
+    meta = meta or {}
+    options_map = meta.get("options_map") or {}
+    if not isinstance(options_map, Mapping):
+        return None
+    normalized_opts: Dict[str, str] = {}
+    for label, option_id in options_map.items():
+        if label in (None, ""):
+            continue
+        label_str = str(label).strip()
+        if not label_str:
+            continue
+        normalized_opts.setdefault(label_str.lower(), str(option_id))
+    if not normalized_opts:
+        return None
+
+    aliases = {
+        alias.strip().lower()
+        for alias in country_aliases(value)
+        if isinstance(alias, str) and alias.strip()
+    }
+    if not aliases:
+        aliases = {str(value).strip().lower()}
+
+    for label_lower, option_id in normalized_opts.items():
+        if label_lower in aliases:
+            return str(option_id)
+    return None
+
+
 def map_value_for_magento(
     attr_code: str, value: Any, meta: Mapping[str, Any] | None
 ) -> Any:
     """Map UI value to Magento-compatible representation."""
     meta = meta or {}
     input_type = str(meta.get("frontend_input") or "").lower()
-    options_map = meta.get("options_map") or {}
-    if isinstance(options_map, Mapping):
-        normalized_map: Dict[str, str] = {}
-        for key, target in options_map.items():
-            if key is None:
+    options_map_raw = meta.get("options_map") or {}
+    options_map: Dict[str, str] = {}
+    if isinstance(options_map_raw, Mapping):
+        for key, target in options_map_raw.items():
+            if key in (None, ""):
                 continue
-            if isinstance(key, str):
-                key_clean = key.strip()
-                if not key_clean:
-                    continue
-                normalized_map.setdefault(key_clean.lower(), str(target))
-            else:
-                key_str = str(key).strip()
-                if not key_str:
-                    continue
-                normalized_map.setdefault(key_str.lower(), str(target))
-        options_map = normalized_map
-    else:
-        options_map = {}
+            key_str = str(key).strip()
+            if not key_str:
+                continue
+            options_map.setdefault(key_str.lower(), str(target))
 
     if attr_code == "categories":
         return value
 
+    if attr_code == "country_of_manufacture":
+        return map_country_to_option_id(value, meta)
+
     if input_type in {"select", "boolean"}:
-        if _is_blank(value):
+        if not value:
             return None
         val_str = str(value).strip()
         if not val_str:
@@ -55,15 +82,16 @@ def map_value_for_magento(
         if val_str.isdigit():
             return val_str
         mapped = options_map.get(val_str.lower())
-        return str(mapped) if mapped is not None else None
+        return str(mapped) if mapped else None
 
     if input_type == "multiselect":
-        if value in (None, "", []):
+        if not value:
             return ""
-        if isinstance(value, Iterable) and not isinstance(value, (str, bytes)):
-            parts = [item for item in value]
-        else:
-            parts = [v.strip() for v in str(value).split(",") if v.strip()]
+        parts = (
+            value
+            if isinstance(value, Iterable) and not isinstance(value, (str, bytes))
+            else [p.strip() for p in str(value).split(",")]
+        )
         ids: list[str] = []
         for part in parts:
             pstr = str(part).strip()
@@ -71,13 +99,13 @@ def map_value_for_magento(
                 continue
             if pstr.isdigit():
                 ids.append(pstr)
-                continue
-            mapped = options_map.get(pstr.lower())
-            if mapped is not None:
-                ids.append(str(mapped))
+            else:
+                mapped = options_map.get(pstr.lower())
+                if mapped:
+                    ids.append(str(mapped))
         return ",".join(ids)
 
-    if attr_code == "scale_mensur" and value not in (None, ""):
+    if attr_code == "scale_mensur" and value:
         return str(value).replace('"', "").strip()
 
     return value
