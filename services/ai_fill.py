@@ -40,6 +40,8 @@ ELECTRIC_SET_IDS: Set[int] = {18, 16}
 
 SOFT_OVERRIDE_WHITELIST: Set[str] = {"no_strings", "neck_radius", "neck_nutwidth"}
 
+SELECT_FRONTEND_FIX: Set[str] = {"electro_acoustic", "acoustic_cutaway"}
+
 
 def should_force_override(
     code: str,
@@ -814,6 +816,10 @@ def get_attribute_meta(session: requests.Session, api_base: str, code: str) -> d
         meta_with_options = dict(_meta_cache[code])
         meta_with_options["options"] = _options_cache[code]
         _meta_cache[code] = meta_with_options
+    if code in SELECT_FRONTEND_FIX:
+        fixed_meta = dict(_meta_cache.get(code) or {})
+        fixed_meta["frontend_input"] = "select"
+        _meta_cache[code] = fixed_meta
     return _meta_cache[code]
 
 

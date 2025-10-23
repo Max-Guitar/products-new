@@ -123,6 +123,25 @@ BASE_FIRST = [
 ]
 
 
+SELECT_FIX = {"electro_acoustic", "acoustic_cutaway"}
+
+
+def coerce_select_empty(v):
+    s = str(v).strip().lower() if v not in (None, "") else ""
+    return None if v in (None, "", 0, "0", False) or s in {"none", "false"} else v
+
+
+def is_empty_value(v, t):
+    t = (t or "").lower()
+    if t == "select":
+        return v in (None, "", 0, "0", False)
+    if t == "multiselect":
+        return v in (None, "", [])
+    if t in {"boolean", "bool"}:
+        return v in (None, "", 0, "0", False)
+    return v in (None, "")
+
+
 ORDER_PRESETS = {
     # ELECTRIC GUITAR
     "electric guitar": [
@@ -833,6 +852,9 @@ def make_wide(df_long: pd.DataFrame) -> pd.DataFrame:
         out["generate_description"] = True
     for column in out.columns:
         out[column] = out[column].astype(object)
+    for code in SELECT_FIX:
+        if code in out.columns:
+            out[code] = out[code].map(coerce_select_empty)
     return out
 
 
@@ -1009,7 +1031,9 @@ def _apply_ai_suggestions_to_wide(
         for cache_key in keys_to_remove:
             empty_mask_cache.pop(cache_key, None)
 
-    def _get_empty_mask_for(code_key: str, sku_value: str) -> pd.Series | None:
+    def _get_empty_mask_for(
+        code_key: str, sku_value: str, frontend_input: str
+    ) -> pd.Series | None:
         cache_key = (code_key, sku_value)
         cached = empty_mask_cache.get(cache_key)
         if cached is not None:
@@ -1017,7 +1041,9 @@ def _apply_ai_suggestions_to_wide(
         if code_key not in updated.columns:
             return None
         try:
-            empties = updated[code_key].map(is_empty)
+            empties = updated[code_key].map(
+                lambda v: is_empty_value(v, frontend_input)
+            )
         except Exception:
             return None
         try:
@@ -1156,7 +1182,9 @@ def _apply_ai_suggestions_to_wide(
                 trace(
                     {"where": "apply_ai:new_col", "code": code_key, "sku": sku_value}
                 )
-            column_empty_mask = _get_empty_mask_for(code_key, sku_value)
+            column_empty_mask = _get_empty_mask_for(
+                code_key, sku_value, input_type
+            )
             
             def _trace_skip(reason: str, extra: dict[str, object] | None = None) -> None:
                 event = {
@@ -1425,7 +1453,9 @@ def _apply_ai_suggestions_to_wide(
                 if code_key not in updated.columns:
                     updated[code_key] = pd.NA
                 try:
-                    empties = updated[code_key].map(is_empty)
+                    empties = updated[code_key].map(
+                        lambda v: is_empty_value(v, input_type)
+                    )
                 except Exception:
                     empties = pd.Series(False, index=updated.index)
                 mask = (sku_series == sku_value) & empties
@@ -1436,36 +1466,42 @@ def _apply_ai_suggestions_to_wide(
                     existing_value = None
                     if isinstance(existing_series, pd.Series) and not existing_series.empty:
                         existing_value = existing_series.iloc[0]
-                    should_soft_override = should_force_override(
-                        code_key,
-                        existing_value,
-                        trimmed_value,
-                        row_context,
-                    )
-                    if force_override_enabled or should_soft_override:
+                    existing_is_empty = is_empty_value(existing_value, input_type)
+                    if existing_is_empty:
                         mask = sku_series == sku_value
-                        force_override_applied = True
-                        soft_override_applied = not force_override_enabled and should_soft_override
-                        _force_mark(sku_value, code_key)
                     else:
-                        if DEBUG:
-                            print(
-                                f"[DEBUG SKIP] {code_key} skipped — reason=non-empty "
-                                f"existing={_preview_existing(row_mask, code_key)}"
+                        should_soft_override = should_force_override(
+                            code_key,
+                            existing_value,
+                            trimmed_value,
+                            row_context,
+                        )
+                        if force_override_enabled or should_soft_override:
+                            mask = sku_series == sku_value
+                            force_override_applied = True
+                            soft_override_applied = (
+                                not force_override_enabled and should_soft_override
                             )
-                        _trace_skip(
-                            "non-empty",
-                            {"existing_value": existing_value, **skip_extra_base},
-                        )
-                        ai_log.append(
-                            {
-                                "sku": sku_value,
-                                "code": code_key,
-                                "skip_reason": "non-empty",
-                                "existing_value": existing_value,
-                            }
-                        )
-                        continue
+                            _force_mark(sku_value, code_key)
+                        else:
+                            if DEBUG:
+                                print(
+                                    f"[DEBUG SKIP] {code_key} skipped — reason=non-empty "
+                                    f"existing={_preview_existing(row_mask, code_key)}"
+                                )
+                            _trace_skip(
+                                "non-empty",
+                                {"existing_value": existing_value, **skip_extra_base},
+                            )
+                            ai_log.append(
+                                {
+                                    "sku": sku_value,
+                                    "code": code_key,
+                                    "skip_reason": "non-empty",
+                                    "existing_value": existing_value,
+                                }
+                            )
+                            continue
                 if DEBUG:
                     print(
                         f"[DEBUG APPLY] Writing {code_key}={trimmed_value!r} for {int(mask.sum())} rows"
@@ -1509,9 +1545,9 @@ def _apply_ai_suggestions_to_wide(
                     try:
                         is_cell_empty = bool(column_empty_mask.at[idx])
                     except Exception:
-                        is_cell_empty = is_empty(existing_raw)
+                        is_cell_empty = is_empty_value(existing_raw, input_type)
                 else:
-                    is_cell_empty = is_empty(existing_raw)
+                    is_cell_empty = is_empty_value(existing_raw, input_type)
                 row_position_arr = updated.index.get_indexer([idx])
                 row_position: int | None = None
                 if len(row_position_arr) == 1 and row_position_arr[0] >= 0:
@@ -1655,7 +1691,9 @@ def _apply_ai_suggestions_to_wide(
                         )
                         updated.at[idx, code_key] = combined_ids
                         if column_empty_mask is not None:
-                            column_empty_mask.at[idx] = is_empty(combined_ids)
+                            column_empty_mask.at[idx] = is_empty_value(
+                                combined_ids, input_type
+                            )
                         log_entry = {
                             "applied": found_ids,
                             "existing_before": existing_ids,
@@ -1805,7 +1843,9 @@ def _apply_ai_suggestions_to_wide(
                         )
                         updated.at[idx, code_key] = combined
                         if column_empty_mask is not None:
-                            column_empty_mask.at[idx] = is_empty(combined)
+                            column_empty_mask.at[idx] = is_empty_value(
+                                combined, input_type
+                            )
                         log_entry = {
                             "applied": new_items,
                             "existing_before": existing_list,
@@ -1934,7 +1974,7 @@ def _apply_ai_suggestions_to_wide(
 
                     converted_value = canonical_label
 
-                if not is_empty(existing_raw):
+                if not is_empty_value(existing_raw, input_type):
                     if DEBUG:
                         print(
                             f"[DEBUG SKIP] {code_key} skipped — reason=non-empty "
@@ -1970,7 +2010,9 @@ def _apply_ai_suggestions_to_wide(
                 )
                 updated.at[idx, code_key] = converted_value
                 if column_empty_mask is not None:
-                    column_empty_mask.at[idx] = is_empty(converted_value)
+                    column_empty_mask.at[idx] = is_empty_value(
+                        converted_value, input_type
+                    )
                 _mark_ai_filled(
                     ai_cells,
                     row_idx=row_position,
@@ -2352,7 +2394,18 @@ def colcfg_from_meta(
         return st.column_config.MultiselectColumn(column_label, options=labels)
     if ftype in {"boolean", "bool"}:
         return st.column_config.CheckboxColumn(column_label)
-    if ftype in {"select", "dropdown"} and labels:
+    if ftype == "select":
+        values_to_labels = (meta or {}).get("values_to_labels", {})
+        if isinstance(values_to_labels, Mapping):
+            opts = list(values_to_labels.keys())
+        else:
+            opts = []
+        if not opts:
+            opts = labels
+        return st.column_config.SelectboxColumn(
+            column_label, options=opts, default=None
+        )
+    if ftype == "dropdown" and labels:
         return st.column_config.SelectboxColumn(column_label, options=labels)
     if ftype in {"int", "integer", "decimal", "price", "float"}:
         return st.column_config.NumberColumn(column_label)
