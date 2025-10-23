@@ -2350,12 +2350,16 @@ def colcfg_from_meta(
 
     if ftype == "multiselect" and labels:
         return st.column_config.MultiselectColumn(column_label, options=labels)
-    if ftype == "boolean":
+    if ftype in {"boolean", "bool"}:
         return st.column_config.CheckboxColumn(column_label)
     if ftype in {"select", "dropdown"} and labels:
         return st.column_config.SelectboxColumn(column_label, options=labels)
     if ftype in {"int", "integer", "decimal", "price", "float"}:
         return st.column_config.NumberColumn(column_label)
+    if sample_df is not None and code in getattr(sample_df, "columns", {}):
+        series = sample_df[code]
+        if pd.api.types.is_bool_dtype(series):
+            return st.column_config.CheckboxColumn(column_label)
     return st.column_config.TextColumn(column_label)
 
 
@@ -2369,7 +2373,7 @@ def build_wide_colcfg(
 
     for code, original_meta in list(wide_meta.items()):
         meta = original_meta or {}
-        cfg[code] = colcfg_from_meta(code, meta)
+        cfg[code] = colcfg_from_meta(code, meta, sample_df)
 
     cfg.setdefault(
         "generate_description",
