@@ -123,25 +123,6 @@ BASE_FIRST = [
 ]
 
 
-SELECT_FIX = {"electro_acoustic", "acoustic_cutaway"}
-
-
-def coerce_select_empty(v):
-    s = str(v).strip().lower() if v not in (None, "") else ""
-    return None if v in (None, "", 0, "0", False) or s in {"none", "false"} else v
-
-
-def is_empty_value(v, t):
-    t = (t or "").lower()
-    if t == "select":
-        return v in (None, "", 0, "0", False)
-    if t == "multiselect":
-        return v in (None, "", [])
-    if t in {"boolean", "bool"}:
-        return v in (None, "", 0, "0", False)
-    return v in (None, "")
-
-
 ORDER_PRESETS = {
     # ELECTRIC GUITAR
     "electric guitar": [
@@ -658,27 +639,6 @@ def _normalize_editor_value(value):
     return value
 
 
-def _normalize_boolean_raw(value):
-    if isinstance(value, bool):
-        return value
-    if value in (None, ""):
-        return None
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        try:
-            return bool(int(value))
-        except (TypeError, ValueError):
-            return bool(value)
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if not lowered:
-            return None
-        if lowered in {"1", "true", "yes", "y", "on"}:
-            return True
-        if lowered in {"0", "false", "no", "n", "off"}:
-            return False
-    return None
-
-
 def _sanitize_for_storage(value):
     if isinstance(value, bool):
         return value
@@ -836,9 +796,7 @@ def make_wide(df_long: pd.DataFrame) -> pd.DataFrame:
     """Convert attribute rows to a wide table with one row per SKU."""
 
     if df_long.empty:
-        return pd.DataFrame(
-            columns=["sku", "name", "generate_description"]
-        ).astype(object)
+        return pd.DataFrame(columns=["sku", "name"]).astype(object)
 
     base = df_long[["sku", "name"]].drop_duplicates().set_index("sku")
     pv = df_long.pivot_table(
@@ -848,13 +806,8 @@ def make_wide(df_long: pd.DataFrame) -> pd.DataFrame:
         aggfunc=lambda x: x.iloc[-1],
     )
     out = base.join(pv, how="left").reset_index()
-    if "generate_description" not in out.columns:
-        out["generate_description"] = True
     for column in out.columns:
         out[column] = out[column].astype(object)
-    for code in SELECT_FIX:
-        if code in out.columns:
-            out[code] = out[code].map(coerce_select_empty)
     return out
 
 
@@ -1031,9 +984,7 @@ def _apply_ai_suggestions_to_wide(
         for cache_key in keys_to_remove:
             empty_mask_cache.pop(cache_key, None)
 
-    def _get_empty_mask_for(
-        code_key: str, sku_value: str, frontend_input: str
-    ) -> pd.Series | None:
+    def _get_empty_mask_for(code_key: str, sku_value: str) -> pd.Series | None:
         cache_key = (code_key, sku_value)
         cached = empty_mask_cache.get(cache_key)
         if cached is not None:
@@ -1041,9 +992,7 @@ def _apply_ai_suggestions_to_wide(
         if code_key not in updated.columns:
             return None
         try:
-            empties = updated[code_key].map(
-                lambda v: is_empty_value(v, frontend_input)
-            )
+            empties = updated[code_key].map(is_empty)
         except Exception:
             return None
         try:
@@ -1173,13 +1122,6 @@ def _apply_ai_suggestions_to_wide(
             )
         for code, payload in ai_suggested.items():
             code_key = str(code)
-            raw_meta_candidate = (
-                meta_map.get(code_key) if isinstance(meta_map, dict) else None
-            )
-            meta_for_code = (
-                raw_meta_candidate if isinstance(raw_meta_candidate, Mapping) else {}
-            )
-            input_type = str((meta_for_code or {}).get("frontend_input") or "").lower()
             if code_key not in updated.columns:
                 try:
                     updated[code_key] = pd.NA
@@ -1189,9 +1131,7 @@ def _apply_ai_suggestions_to_wide(
                 trace(
                     {"where": "apply_ai:new_col", "code": code_key, "sku": sku_value}
                 )
-            column_empty_mask = _get_empty_mask_for(
-                code_key, sku_value, input_type
-            )
+            column_empty_mask = _get_empty_mask_for(code_key, sku_value)
             
             def _trace_skip(reason: str, extra: dict[str, object] | None = None) -> None:
                 event = {
@@ -1228,7 +1168,7 @@ def _apply_ai_suggestions_to_wide(
                 if not suggestion_payload.get("reason"):
                     suggestion_payload["reason"] = "Regex pre-extract"
                 log_details = {"used_regex": True, "value": ai_value}
-            meta_candidate = raw_meta_candidate
+            meta_candidate = meta_map.get(code_key) if isinstance(meta_map, dict) else {}
             if meta_candidate is None:
                 meta = {"code": code_key, "frontend_input": "text"}
             elif isinstance(meta_candidate, Mapping):
@@ -1460,9 +1400,7 @@ def _apply_ai_suggestions_to_wide(
                 if code_key not in updated.columns:
                     updated[code_key] = pd.NA
                 try:
-                    empties = updated[code_key].map(
-                        lambda v: is_empty_value(v, input_type)
-                    )
+                    empties = updated[code_key].map(is_empty)
                 except Exception:
                     empties = pd.Series(False, index=updated.index)
                 mask = (sku_series == sku_value) & empties
@@ -1473,42 +1411,36 @@ def _apply_ai_suggestions_to_wide(
                     existing_value = None
                     if isinstance(existing_series, pd.Series) and not existing_series.empty:
                         existing_value = existing_series.iloc[0]
-                    existing_is_empty = is_empty_value(existing_value, input_type)
-                    if existing_is_empty:
+                    should_soft_override = should_force_override(
+                        code_key,
+                        existing_value,
+                        trimmed_value,
+                        row_context,
+                    )
+                    if force_override_enabled or should_soft_override:
                         mask = sku_series == sku_value
+                        force_override_applied = True
+                        soft_override_applied = not force_override_enabled and should_soft_override
+                        _force_mark(sku_value, code_key)
                     else:
-                        should_soft_override = should_force_override(
-                            code_key,
-                            existing_value,
-                            trimmed_value,
-                            row_context,
+                        if DEBUG:
+                            print(
+                                f"[DEBUG SKIP] {code_key} skipped — reason=non-empty "
+                                f"existing={_preview_existing(row_mask, code_key)}"
+                            )
+                        _trace_skip(
+                            "non-empty",
+                            {"existing_value": existing_value, **skip_extra_base},
                         )
-                        if force_override_enabled or should_soft_override:
-                            mask = sku_series == sku_value
-                            force_override_applied = True
-                            soft_override_applied = (
-                                not force_override_enabled and should_soft_override
-                            )
-                            _force_mark(sku_value, code_key)
-                        else:
-                            if DEBUG:
-                                print(
-                                    f"[DEBUG SKIP] {code_key} skipped — reason=non-empty "
-                                    f"existing={_preview_existing(row_mask, code_key)}"
-                                )
-                            _trace_skip(
-                                "non-empty",
-                                {"existing_value": existing_value, **skip_extra_base},
-                            )
-                            ai_log.append(
-                                {
-                                    "sku": sku_value,
-                                    "code": code_key,
-                                    "skip_reason": "non-empty",
-                                    "existing_value": existing_value,
-                                }
-                            )
-                            continue
+                        ai_log.append(
+                            {
+                                "sku": sku_value,
+                                "code": code_key,
+                                "skip_reason": "non-empty",
+                                "existing_value": existing_value,
+                            }
+                        )
+                        continue
                 if DEBUG:
                     print(
                         f"[DEBUG APPLY] Writing {code_key}={trimmed_value!r} for {int(mask.sum())} rows"
@@ -1552,9 +1484,9 @@ def _apply_ai_suggestions_to_wide(
                     try:
                         is_cell_empty = bool(column_empty_mask.at[idx])
                     except Exception:
-                        is_cell_empty = is_empty_value(existing_raw, input_type)
+                        is_cell_empty = is_empty(existing_raw)
                 else:
-                    is_cell_empty = is_empty_value(existing_raw, input_type)
+                    is_cell_empty = is_empty(existing_raw)
                 row_position_arr = updated.index.get_indexer([idx])
                 row_position: int | None = None
                 if len(row_position_arr) == 1 and row_position_arr[0] >= 0:
@@ -1698,9 +1630,7 @@ def _apply_ai_suggestions_to_wide(
                         )
                         updated.at[idx, code_key] = combined_ids
                         if column_empty_mask is not None:
-                            column_empty_mask.at[idx] = is_empty_value(
-                                combined_ids, input_type
-                            )
+                            column_empty_mask.at[idx] = is_empty(combined_ids)
                         log_entry = {
                             "applied": found_ids,
                             "existing_before": existing_ids,
@@ -1850,9 +1780,7 @@ def _apply_ai_suggestions_to_wide(
                         )
                         updated.at[idx, code_key] = combined
                         if column_empty_mask is not None:
-                            column_empty_mask.at[idx] = is_empty_value(
-                                combined, input_type
-                            )
+                            column_empty_mask.at[idx] = is_empty(combined)
                         log_entry = {
                             "applied": new_items,
                             "existing_before": existing_list,
@@ -1981,7 +1909,7 @@ def _apply_ai_suggestions_to_wide(
 
                     converted_value = canonical_label
 
-                if not is_empty_value(existing_raw, input_type):
+                if not is_empty(existing_raw):
                     if DEBUG:
                         print(
                             f"[DEBUG SKIP] {code_key} skipped — reason=non-empty "
@@ -2017,9 +1945,7 @@ def _apply_ai_suggestions_to_wide(
                 )
                 updated.at[idx, code_key] = converted_value
                 if column_empty_mask is not None:
-                    column_empty_mask.at[idx] = is_empty_value(
-                        converted_value, input_type
-                    )
+                    column_empty_mask.at[idx] = is_empty(converted_value)
                 _mark_ai_filled(
                     ai_cells,
                     row_idx=row_position,
@@ -2399,27 +2325,12 @@ def colcfg_from_meta(
 
     if ftype == "multiselect" and labels:
         return st.column_config.MultiselectColumn(column_label, options=labels)
-    if ftype in {"boolean", "bool"}:
+    if ftype == "boolean":
         return st.column_config.CheckboxColumn(column_label)
-    if ftype == "select":
-        values_to_labels = (meta or {}).get("values_to_labels", {})
-        if isinstance(values_to_labels, Mapping):
-            opts = list(values_to_labels.keys())
-        else:
-            opts = []
-        if not opts:
-            opts = labels
-        return st.column_config.SelectboxColumn(
-            column_label, options=opts, default=None
-        )
-    if ftype == "dropdown" and labels:
+    if ftype in {"select", "dropdown"} and labels:
         return st.column_config.SelectboxColumn(column_label, options=labels)
     if ftype in {"int", "integer", "decimal", "price", "float"}:
         return st.column_config.NumberColumn(column_label)
-    if sample_df is not None and code in getattr(sample_df, "columns", {}):
-        series = sample_df[code]
-        if pd.api.types.is_bool_dtype(series):
-            return st.column_config.CheckboxColumn(column_label)
     return st.column_config.TextColumn(column_label)
 
 
@@ -2433,12 +2344,7 @@ def build_wide_colcfg(
 
     for code, original_meta in list(wide_meta.items()):
         meta = original_meta or {}
-        cfg[code] = colcfg_from_meta(code, meta, sample_df)
-
-    cfg.setdefault(
-        "generate_description",
-        st.column_config.CheckboxColumn("Generate description", default=True),
-    )
+        cfg[code] = colcfg_from_meta(code, meta)
 
     if "guitarstylemultiplechoice" in cfg:
         guitar_cfg = cfg["guitarstylemultiplechoice"]
@@ -2849,8 +2755,7 @@ def build_attributes_df(
             if code in {"sku", "name", "attribute set"}:
                 continue
             meta = meta_cache.get(code) or {}
-            attr_entry = attr_rows.get(code, {}) if isinstance(attr_rows, Mapping) else {}
-            value = _value_for_editor(attr_entry, meta)
+            value = _value_for_editor(attr_rows.get(code, {}), meta)
             frontend_input = (
                 meta.get("frontend_input")
                 or meta.get("backend_type")
@@ -2868,16 +2773,7 @@ def build_attributes_df(
                 except (TypeError, ValueError):
                     value = str(value).strip() if isinstance(value, str) else value
             elif frontend_input == "boolean":
-                normalized_bool = _normalize_boolean_raw(
-                    attr_entry.get("raw_value") if isinstance(attr_entry, Mapping) else None
-                )
-                if normalized_bool is None:
-                    normalized_bool = _normalize_boolean_raw(
-                        attr_entry.get("label") if isinstance(attr_entry, Mapping) else None
-                    )
-                if normalized_bool is None:
-                    normalized_bool = _normalize_boolean_raw(value)
-                value = bool(normalized_bool) if normalized_bool is not None else bool(value)
+                value = bool(value)
             elif frontend_input == "multiselect":
                 if not isinstance(value, list):
                     value = _split_multiselect_input(value)
@@ -3368,7 +3264,7 @@ def save_step2_to_magento():
         attr_cols = [
             col
             for col in wide_df.columns
-            if col not in ("sku", "name", "attribute_set_id", "generate_description")
+            if col not in ("sku", "name", "attribute_set_id")
         ]
         if not attr_cols:
             continue
@@ -4941,12 +4837,7 @@ if df_original_key in st.session_state:
                                         attr_cols = [
                                             col
                                             for col in wide_df.columns
-                                            if col not in (
-                                                "sku",
-                                                "name",
-                                                "attribute_set_id",
-                                                "generate_description",
-                                            )
+                                            if col not in ("sku", "name")
                                         ]
                                         cacheable = isinstance(
                                             meta_cache, AttributeMetaCache
@@ -5168,12 +5059,7 @@ if df_original_key in st.session_state:
                                         attr_cols = [
                                             col
                                             for col in wide_df.columns
-                                            if col not in (
-                                                "sku",
-                                                "name",
-                                                "attribute_set_id",
-                                                "generate_description",
-                                            )
+                                            if col not in ("sku", "name")
                                         ]
                                         cacheable = isinstance(
                                             meta_cache, AttributeMetaCache
@@ -5662,8 +5548,6 @@ if df_original_key in st.session_state:
 
                                             group = group.reset_index(drop=True)
                                             df_view = group.copy()
-                                            if "generate_description" not in df_view.columns:
-                                                df_view["generate_description"] = True
                                             if "attribute_set_id" in df_view.columns:
                                                 df_view = df_view.drop(
                                                     columns=["attribute_set_id"]
@@ -5717,12 +5601,6 @@ if df_original_key in st.session_state:
                                                 ] = st.column_config.NumberColumn(
                                                     label="Price", disabled=True
                                                 )
-                                            column_config_final.setdefault(
-                                                "generate_description",
-                                                st.column_config.CheckboxColumn(
-                                                    "Generate description", default=True
-                                                ),
-                                            )
                                             if "guitarstylemultiplechoice" in column_config_final:
                                                 cfg = column_config_final[
                                                     "guitarstylemultiplechoice"
