@@ -101,6 +101,9 @@ _DEF_ATTR_SET_NAME = "Default"
 _ALLOWED_TYPES = {"simple", "configurable"}
 
 
+GENERATE_DESCRIPTION_COLUMN = "generate_description"
+
+
 _ATTRIBUTE_SET_ICONS = {
     "Accessories": "🧩",
     "Acoustic guitar": "🎻",
@@ -2353,6 +2356,10 @@ def build_wide_colcfg(
         elif hasattr(guitar_cfg, "_label"):
             guitar_cfg._label = "Guitar style"
 
+    cfg[GENERATE_DESCRIPTION_COLUMN] = st.column_config.CheckboxColumn(
+        "Generate description", default=True
+    )
+
     return cfg
 
 
@@ -3264,7 +3271,13 @@ def save_step2_to_magento():
         attr_cols = [
             col
             for col in wide_df.columns
-            if col not in ("sku", "name", "attribute_set_id")
+            if col
+            not in (
+                "sku",
+                "name",
+                "attribute_set_id",
+                GENERATE_DESCRIPTION_COLUMN,
+            )
         ]
         if not attr_cols:
             continue
@@ -4822,6 +4835,11 @@ if df_original_key in st.session_state:
                                             wide_df["attribute_set_id"] = set_id
                                         else:
                                             wide_df.insert(1, "attribute_set_id", set_id)
+                                        if (
+                                            GENERATE_DESCRIPTION_COLUMN
+                                            not in wide_df.columns
+                                        ):
+                                            wide_df[GENERATE_DESCRIPTION_COLUMN] = True
                                         for column in wide_df.columns:
                                             wide_df[column] = wide_df[column].astype(object)
                                         baseline_df = wide_df.copy(deep=True)
@@ -4837,7 +4855,12 @@ if df_original_key in st.session_state:
                                         attr_cols = [
                                             col
                                             for col in wide_df.columns
-                                            if col not in ("sku", "name")
+                                            if col
+                                            not in (
+                                                "sku",
+                                                "name",
+                                                GENERATE_DESCRIPTION_COLUMN,
+                                            )
                                         ]
                                         cacheable = isinstance(
                                             meta_cache, AttributeMetaCache
@@ -5043,6 +5066,11 @@ if df_original_key in st.session_state:
                                             wide_df["attribute_set_id"] = set_id
                                         else:
                                             wide_df.insert(1, "attribute_set_id", set_id)
+                                        if (
+                                            GENERATE_DESCRIPTION_COLUMN
+                                            not in wide_df.columns
+                                        ):
+                                            wide_df[GENERATE_DESCRIPTION_COLUMN] = True
                                         for column in wide_df.columns:
                                             wide_df[column] = wide_df[column].astype(object)
                                         baseline_df = wide_df.copy(deep=True)
@@ -5059,7 +5087,12 @@ if df_original_key in st.session_state:
                                         attr_cols = [
                                             col
                                             for col in wide_df.columns
-                                            if col not in ("sku", "name")
+                                            if col
+                                            not in (
+                                                "sku",
+                                                "name",
+                                                GENERATE_DESCRIPTION_COLUMN,
+                                            )
                                         ]
                                         cacheable = isinstance(
                                             meta_cache, AttributeMetaCache
@@ -5552,6 +5585,11 @@ if df_original_key in st.session_state:
                                                 df_view = df_view.drop(
                                                     columns=["attribute_set_id"]
                                                 )
+                                            if (
+                                                GENERATE_DESCRIPTION_COLUMN
+                                                not in df_view.columns
+                                            ):
+                                                df_view[GENERATE_DESCRIPTION_COLUMN] = True
 
                                             column_order = build_column_order(
                                                 set_name,
