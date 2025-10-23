@@ -853,10 +853,17 @@ def list_categories(session: requests.Session, api_base: str) -> List[Dict[str, 
     return sorted(items, key=_sort_key)
 
 
-def option_label_for(session: requests.Session, api_base: str, code: str, raw_value) -> Tuple[Optional[str], Optional[str]]:
+def option_label_for(
+    session: requests.Session, api_base: str, code: str, raw_value
+) -> Tuple[Optional[str], Optional[str]]:
     meta = get_attribute_meta(session, api_base, code) or {}
     frontend_input = (meta.get("frontend_input") or "").lower()
     options = meta.get("options") or []
+    if frontend_input == "boolean":
+        normalized = _normalize_boolean(raw_value)
+        if normalized is None:
+            return None, "boolean"
+        return ("Yes" if normalized else "No"), "boolean"
     if frontend_input in {"select", "multiselect"} and raw_value not in (None, "", []):
         values = [str(val).strip() for val in str(raw_value).split(",") if str(val).strip()]
         id_to_label = {
@@ -899,25 +906,45 @@ def collect_attributes_table(
         if code in data:
             meta = get_attribute_meta(session, api_base, code)
             label, input_type = option_label_for(session, api_base, code, value)
-            data[code].update(
-                {
-                    "raw": value,
-                    "label": label,
-                    "type": input_type or meta.get("frontend_input"),
-                }
-            )
+            meta_type = str(meta.get("frontend_input") or "").lower()
+            effective_type = input_type or meta_type
+            normalized_bool = None
+            if effective_type == "boolean":
+                normalized_bool = _normalize_boolean(value)
+            update_payload = {
+                "raw": value,
+                "label": label,
+                "type": effective_type or meta.get("frontend_input"),
+            }
+            if effective_type == "boolean":
+                update_payload["type"] = "boolean"
+                if normalized_bool is not None:
+                    update_payload["raw"] = normalized_bool
+                if label is None and normalized_bool is not None:
+                    update_payload["label"] = "Yes" if normalized_bool else "No"
+            data[code].update(update_payload)
     for field in ("sku", "name", "price", "weight"):
         if field in data:
             value = product.get(field)
             meta = get_attribute_meta(session, api_base, field)
             label, input_type = option_label_for(session, api_base, field, value)
-            data[field].update(
-                {
-                    "raw": value,
-                    "label": label,
-                    "type": input_type or meta.get("frontend_input"),
-                }
-            )
+            meta_type = str(meta.get("frontend_input") or "").lower()
+            effective_type = input_type or meta_type
+            normalized_bool = None
+            if effective_type == "boolean":
+                normalized_bool = _normalize_boolean(value)
+            update_payload = {
+                "raw": value,
+                "label": label,
+                "type": effective_type or meta.get("frontend_input"),
+            }
+            if effective_type == "boolean":
+                update_payload["type"] = "boolean"
+                if normalized_bool is not None:
+                    update_payload["raw"] = normalized_bool
+                if label is None and normalized_bool is not None:
+                    update_payload["label"] = "Yes" if normalized_bool else "No"
+            data[field].update(update_payload)
     df = pd.DataFrame(data).T.rename(columns={"raw": "raw_value"})
     return df
 

@@ -639,6 +639,27 @@ def _normalize_editor_value(value):
     return value
 
 
+def _normalize_boolean_raw(value):
+    if isinstance(value, bool):
+        return value
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return bool(int(value))
+        except (TypeError, ValueError):
+            return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if not lowered:
+            return None
+        if lowered in {"1", "true", "yes", "y", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "n", "off"}:
+            return False
+    return None
+
+
 def _sanitize_for_storage(value):
     if isinstance(value, bool):
         return value
@@ -2764,7 +2785,8 @@ def build_attributes_df(
             if code in {"sku", "name", "attribute set"}:
                 continue
             meta = meta_cache.get(code) or {}
-            value = _value_for_editor(attr_rows.get(code, {}), meta)
+            attr_entry = attr_rows.get(code, {}) if isinstance(attr_rows, Mapping) else {}
+            value = _value_for_editor(attr_entry, meta)
             frontend_input = (
                 meta.get("frontend_input")
                 or meta.get("backend_type")
@@ -2782,7 +2804,16 @@ def build_attributes_df(
                 except (TypeError, ValueError):
                     value = str(value).strip() if isinstance(value, str) else value
             elif frontend_input == "boolean":
-                value = bool(value)
+                normalized_bool = _normalize_boolean_raw(
+                    attr_entry.get("raw_value") if isinstance(attr_entry, Mapping) else None
+                )
+                if normalized_bool is None:
+                    normalized_bool = _normalize_boolean_raw(
+                        attr_entry.get("label") if isinstance(attr_entry, Mapping) else None
+                    )
+                if normalized_bool is None:
+                    normalized_bool = _normalize_boolean_raw(value)
+                value = bool(normalized_bool) if normalized_bool is not None else bool(value)
             elif frontend_input == "multiselect":
                 if not isinstance(value, list):
                     value = _split_multiselect_input(value)
