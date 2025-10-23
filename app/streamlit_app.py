@@ -1173,6 +1173,13 @@ def _apply_ai_suggestions_to_wide(
             )
         for code, payload in ai_suggested.items():
             code_key = str(code)
+            raw_meta_candidate = (
+                meta_map.get(code_key) if isinstance(meta_map, dict) else None
+            )
+            meta_for_code = (
+                raw_meta_candidate if isinstance(raw_meta_candidate, Mapping) else {}
+            )
+            input_type = str((meta_for_code or {}).get("frontend_input") or "").lower()
             if code_key not in updated.columns:
                 try:
                     updated[code_key] = pd.NA
@@ -1221,7 +1228,7 @@ def _apply_ai_suggestions_to_wide(
                 if not suggestion_payload.get("reason"):
                     suggestion_payload["reason"] = "Regex pre-extract"
                 log_details = {"used_regex": True, "value": ai_value}
-            meta_candidate = meta_map.get(code_key) if isinstance(meta_map, dict) else {}
+            meta_candidate = raw_meta_candidate
             if meta_candidate is None:
                 meta = {"code": code_key, "frontend_input": "text"}
             elif isinstance(meta_candidate, Mapping):
