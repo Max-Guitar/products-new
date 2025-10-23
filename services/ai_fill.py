@@ -33,6 +33,7 @@ ALWAYS_ATTRS: Set[str] = {
     "condition",
     "categories",
     "country_of_manufacture",
+    "short_description",
 }
 
 ELECTRIC_SET_IDS: Set[int] = {12, 16}
@@ -106,6 +107,7 @@ SET_ATTRS: Mapping[str, Set[str]] = {
         "amount_of_frets",
         "acoustic_pickup",
         "cases_covers",
+        "short_description",
     },
     "Amps": {
         "amp_style",
@@ -116,6 +118,7 @@ SET_ATTRS: Mapping[str, Set[str]] = {
         "cover_included",
         "footswitch_included",
         "vintage",
+        "short_description",
     },
     "Bass Guitar": {
         "condition",
@@ -145,6 +148,7 @@ SET_ATTRS: Mapping[str, Set[str]] = {
         "scale_mensur",
         "amount_of_frets",
         "cases_covers",
+        "short_description",
     },
     "Default": {"name", "price"},
     "Effects": {
@@ -155,6 +159,7 @@ SET_ATTRS: Mapping[str, Set[str]] = {
         "power",
         "power_polarity",
         "battery",
+        "short_description",
     },
     "Electric guitar": {
         "condition",
@@ -185,6 +190,7 @@ SET_ATTRS: Mapping[str, Set[str]] = {
         "scale_mensur",
         "amount_of_frets",
         "cases_covers",
+        "short_description",
     },
 }
 
