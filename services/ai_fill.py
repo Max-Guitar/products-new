@@ -36,7 +36,7 @@ ALWAYS_ATTRS: Set[str] = {
     "short_description",
 }
 
-ELECTRIC_SET_IDS: Set[int] = {12, 16}
+ELECTRIC_SET_IDS: Set[int] = {18, 16}
 
 SOFT_OVERRIDE_WHITELIST: Set[str] = {"no_strings", "neck_radius", "neck_nutwidth"}
 
