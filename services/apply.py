@@ -18,6 +18,17 @@ def _is_blank(value: Any) -> bool:
     return False
 
 
+def is_blank_ui_value(value: Any, input_type: str | None = None) -> bool:
+    """Return True if the UI value should be treated as empty for AI/boolean fields."""
+    t = (input_type or "").lower()
+    if value in (None, "", [], {}, "None"):
+        return True
+    if t in {"boolean", "bool"}:
+        # Treat unchecked / default False as empty
+        return value in (False, 0, "0", "false", "no", None, "")
+    return False
+
+
 def map_country_to_option_id(value: str | None, meta: Mapping[str, Any] | None) -> str | None:
     if not value:
         return None
@@ -151,7 +162,7 @@ def build_magento_payload(
         if code == "categories":
             continue
         mapped = map_value_for_magento(code, value, meta)
-        if mapped in (None, ""):
+        if is_blank_ui_value(value, meta.get("frontend_input")) or mapped in (None, ""):
             continue
         custom_attributes.append({"attribute_code": code, "value": mapped})
 
