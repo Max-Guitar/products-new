@@ -796,7 +796,9 @@ def make_wide(df_long: pd.DataFrame) -> pd.DataFrame:
     """Convert attribute rows to a wide table with one row per SKU."""
 
     if df_long.empty:
-        return pd.DataFrame(columns=["sku", "name"]).astype(object)
+        return pd.DataFrame(
+            columns=["sku", "name", "generate_description"]
+        ).astype(object)
 
     base = df_long[["sku", "name"]].drop_duplicates().set_index("sku")
     pv = df_long.pivot_table(
@@ -806,6 +808,8 @@ def make_wide(df_long: pd.DataFrame) -> pd.DataFrame:
         aggfunc=lambda x: x.iloc[-1],
     )
     out = base.join(pv, how="left").reset_index()
+    if "generate_description" not in out.columns:
+        out["generate_description"] = True
     for column in out.columns:
         out[column] = out[column].astype(object)
     return out
@@ -2346,6 +2350,11 @@ def build_wide_colcfg(
         meta = original_meta or {}
         cfg[code] = colcfg_from_meta(code, meta)
 
+    cfg.setdefault(
+        "generate_description",
+        st.column_config.CheckboxColumn("Generate description", default=True),
+    )
+
     if "guitarstylemultiplechoice" in cfg:
         guitar_cfg = cfg["guitarstylemultiplechoice"]
         if hasattr(guitar_cfg, "label"):
@@ -3264,7 +3273,7 @@ def save_step2_to_magento():
         attr_cols = [
             col
             for col in wide_df.columns
-            if col not in ("sku", "name", "attribute_set_id")
+            if col not in ("sku", "name", "attribute_set_id", "generate_description")
         ]
         if not attr_cols:
             continue
@@ -4837,7 +4846,12 @@ if df_original_key in st.session_state:
                                         attr_cols = [
                                             col
                                             for col in wide_df.columns
-                                            if col not in ("sku", "name")
+                                            if col not in (
+                                                "sku",
+                                                "name",
+                                                "attribute_set_id",
+                                                "generate_description",
+                                            )
                                         ]
                                         cacheable = isinstance(
                                             meta_cache, AttributeMetaCache
@@ -5059,7 +5073,12 @@ if df_original_key in st.session_state:
                                         attr_cols = [
                                             col
                                             for col in wide_df.columns
-                                            if col not in ("sku", "name")
+                                            if col not in (
+                                                "sku",
+                                                "name",
+                                                "attribute_set_id",
+                                                "generate_description",
+                                            )
                                         ]
                                         cacheable = isinstance(
                                             meta_cache, AttributeMetaCache
@@ -5548,6 +5567,8 @@ if df_original_key in st.session_state:
 
                                             group = group.reset_index(drop=True)
                                             df_view = group.copy()
+                                            if "generate_description" not in df_view.columns:
+                                                df_view["generate_description"] = True
                                             if "attribute_set_id" in df_view.columns:
                                                 df_view = df_view.drop(
                                                     columns=["attribute_set_id"]
@@ -5601,6 +5622,12 @@ if df_original_key in st.session_state:
                                                 ] = st.column_config.NumberColumn(
                                                     label="Price", disabled=True
                                                 )
+                                            column_config_final.setdefault(
+                                                "generate_description",
+                                                st.column_config.CheckboxColumn(
+                                                    "Generate description", default=True
+                                                ),
+                                            )
                                             if "guitarstylemultiplechoice" in column_config_final:
                                                 cfg = column_config_final[
                                                     "guitarstylemultiplechoice"
