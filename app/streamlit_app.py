@@ -44,10 +44,6 @@ def trace(event: dict):
     except Exception:
         pass
 
-
-with st.expander("🧪 Debug trace", expanded=False):
-    st.json(st.session_state["_trace_events"][-500:])  # последние 500 событий
-
 from connectors.magento.attributes import AttributeMetaCache
 from connectors.magento.categories import ensure_categories_meta
 from connectors.magento.client import get_default_products, get_api_base
@@ -103,6 +99,9 @@ _ALLOWED_TYPES = {"simple", "configurable"}
 
 
 GENERATE_DESCRIPTION_COLUMN = "generate_description"
+
+
+ALLOW_OVERWRITE_NON_EMPTY_TEXT = False
 
 
 _ATTRIBUTE_SET_ICONS = {
@@ -956,9 +955,7 @@ def _apply_ai_suggestions_to_wide(
         return wide_df, [], []
 
     DEBUG = bool(st.session_state.get("debug_ai", True))
-    force_override_enabled = bool(
-        st.session_state.get("ai_force_text_override")
-    )
+    force_override_enabled = ALLOW_OVERWRITE_NON_EMPTY_TEXT
 
     def is_empty(v: object) -> bool:
         if v is None:
@@ -4489,6 +4486,7 @@ if df_original_key in st.session_state:
             column_config_view = {
                 key: value for key, value in col_cfg.items() if key in df_view.columns
             }
+            st.session_state.pop(editor_key, None)
             edited_df = st.data_editor(
                 df_view,
                 column_config=column_config_view,
@@ -5329,103 +5327,6 @@ if df_original_key in st.session_state:
                                     )
                                     completed = True
                                 elif st.session_state.get("show_attrs"):
-                                    ctrl_col1, ctrl_col2 = st.columns([1, 1])
-                                    rerun_clicked = ctrl_col1.button(
-                                        "🔁 Re-run AI for visible rows",
-                                        key="btn_step2_rerun_ai",
-                                    )
-                                    ctrl_col2.checkbox(
-                                        "🚩 Разрешить перезапись непустых текстовых атрибутов ИИ",
-                                        value=bool(
-                                            st.session_state.get("ai_force_text_override", False)
-                                        ),
-                                        key="ai_force_text_override",
-                                    )
-                                    if rerun_clicked:
-                                        suggestions_map = (
-                                            step2_state.get("ai_suggestions") or {}
-                                        )
-                                        wide_map = step2_state.get("wide", {})
-                                        wide_meta_map = step2_state.get("wide_meta", {})
-                                        ai_cells_map = step2_state.setdefault(
-                                            "ai_cells", {}
-                                        )
-                                        ai_logs_map = step2_state.setdefault(
-                                            "ai_logs", {}
-                                        )
-                                        pipeline_snapshots = step2_state.setdefault(
-                                            "pipeline_snapshots", {}
-                                        )
-                                        visible_sets = (
-                                            selected_set_ids
-                                            or sorted(step2_state.get("wide", {}).keys())
-                                        )
-                                        for current_set_id in visible_sets:
-                                            wide_current = wide_map.get(current_set_id)
-                                            suggestions_for_set = suggestions_map.get(
-                                                current_set_id
-                                            )
-                                            if not (
-                                                isinstance(wide_current, pd.DataFrame)
-                                                and suggestions_for_set
-                                            ):
-                                                continue
-                                            meta_for_set = (
-                                                wide_meta_map.get(current_set_id, {})
-                                                if isinstance(wide_meta_map, dict)
-                                                else {}
-                                            )
-                                            snapshot_entry = pipeline_snapshots.setdefault(
-                                                current_set_id,
-                                                {},
-                                            )
-                                            snapshot_entry["wide_before_ai"] = wide_current.copy(
-                                                deep=True
-                                            )
-                                            (
-                                                updated_df,
-                                                filled_cells,
-                                                ai_log_entries,
-                                            ) = _apply_ai_suggestions_to_wide(
-                                                wide_current,
-                                                suggestions_for_set,
-                                                meta_for_set,
-                                                meta_cache=meta_cache,
-                                                session=session,
-                                                api_base=api_base,
-                                            )
-                                            if not isinstance(updated_df, pd.DataFrame):
-                                                continue
-                                            step2_state["wide"][current_set_id] = updated_df
-                                            snapshot_entry["wide_after_ai"] = updated_df.copy(
-                                                deep=True
-                                            )
-                                            if filled_cells:
-                                                ai_cells_map[current_set_id] = filled_cells
-                                            else:
-                                                ai_cells_map.pop(current_set_id, None)
-                                            if ai_log_entries:
-                                                ai_logs_map[current_set_id] = ai_log_entries
-                                            else:
-                                                ai_logs_map.pop(current_set_id, None)
-                                            df_view_rerun = _coerce_for_ui(
-                                                updated_df, meta_for_set
-                                            )
-                                            if isinstance(df_view_rerun, pd.DataFrame):
-                                                snapshot_entry[
-                                                    "ui_before_editor"
-                                                ] = df_view_rerun.copy(deep=True)
-                                                display_df = df_view_rerun.copy()
-                                                if "attribute_set_id" in display_df.columns:
-                                                    display_df = display_df.drop(
-                                                        columns=["attribute_set_id"]
-                                                    )
-                                                _sync_ai_highlight_state(
-                                                    step2_state,
-                                                    current_set_id,
-                                                    display_df,
-                                                )
-                                        st.rerun()
                                     wide_meta = step2_state.setdefault("wide_meta", {})
                                     categories_meta = step2_state.get("categories_meta", {})
                                     if not isinstance(categories_meta, dict):
