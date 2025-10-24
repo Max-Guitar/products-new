@@ -1255,9 +1255,11 @@ def enrich_ai_suggestions(
         set_id_int = int(set_id) if set_id not in (None, "") else None
     except (TypeError, ValueError):
         set_id_int = None
-    is_electric = set_name_cf in {"electric guitar", "electric guitars"} or (
-        set_id_int in ELECTRIC_SET_IDS if set_id_int is not None else False
-    )
+    is_electric = False
+    if set_id_int is not None and set_id_int in ELECTRIC_SET_IDS:
+        is_electric = True
+    elif set_name_cf.startswith("electric "):
+        is_electric = True
 
     derived_styles = (
         derive_styles_from_texts(candidate_texts) if is_electric else []
@@ -1270,7 +1272,7 @@ def enrich_ai_suggestions(
             if STYLE_CASCADE.get(style)
         ]
         merged_styles = _merge_unique(merged_styles, cascade_styles)
-    if merged_styles:
+    if merged_styles and is_electric:
         style_entry = by_code.setdefault(
             "guitarstylemultiplechoice",
             {"code": "guitarstylemultiplechoice", "reason": "enriched_from_hints"},
@@ -1280,6 +1282,8 @@ def enrich_ai_suggestions(
             style_entry["reason"] = "enriched_from_hints"
         if "guitarstylemultiplechoice" not in order:
             order.append("guitarstylemultiplechoice")
+    elif not is_electric:
+        by_code.pop("guitarstylemultiplechoice", None)
 
     # Normalize multi-select payloads to lists of strings
     for code_key, payload in by_code.items():

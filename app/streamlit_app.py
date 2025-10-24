@@ -54,6 +54,7 @@ from connectors.magento.client import get_default_products, get_api_base
 from services.ai_fill import (
     ALWAYS_ATTRS,
     SET_ATTRS,
+    ELECTRIC_SET_IDS,
     DEFAULT_OPENAI_MODEL,
     HTMLResponseError,
     OPENAI_MODEL_ALIASES,
@@ -2338,7 +2339,10 @@ def colcfg_from_meta(
 
 
 def build_wide_colcfg(
-    wide_meta: dict[str, dict], sample_df: pd.DataFrame | None = None
+    wide_meta: dict[str, dict],
+    sample_df: pd.DataFrame | None = None,
+    set_id: int | str | None = None,
+    set_name: str | None = None,
 ):
     cfg = {
         "sku": st.column_config.TextColumn("SKU", disabled=True),
@@ -2349,7 +2353,22 @@ def build_wide_colcfg(
         meta = original_meta or {}
         cfg[code] = colcfg_from_meta(code, meta)
 
-    if "guitarstylemultiplechoice" in cfg:
+    set_name_text = str(set_name or "")
+    set_name_norm = set_name_text.strip().lower()
+    set_id_value: int | None = None
+    if set_id not in (None, ""):
+        try:
+            set_id_value = int(set_id)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            set_id_value = None
+
+    is_electric = False
+    if set_id_value is not None and set_id_value in ELECTRIC_SET_IDS:
+        is_electric = True
+    elif set_name_norm.startswith("electric"):
+        is_electric = True
+
+    if is_electric and "guitarstylemultiplechoice" in cfg:
         guitar_cfg = cfg["guitarstylemultiplechoice"]
         if hasattr(guitar_cfg, "label"):
             guitar_cfg.label = "Guitar style"
@@ -2708,7 +2727,7 @@ def build_attributes_df(
                 meta_cache,
             )
 
-        force_codes = {"categories", "guitarstylemultiplechoice"}
+        force_codes = {"categories"}
         bool_codes = {
             c
             for c in editor_codes
@@ -5033,9 +5052,16 @@ if df_original_key in st.session_state:
                                             st.write("condition:", _meta_shot("condition"))
                                             st.write("DEBUG types distribution:", counts)
 
+                                        set_label = (
+                                            step2_state.get("set_names", {}).get(
+                                                set_id, str(set_id)
+                                            )
+                                        )
                                         step2_state["wide_colcfg"][set_id] = build_wide_colcfg(
                                             meta_for_debug,
                                             sample_df=step2_state["wide"].get(set_id),
+                                            set_id=set_id,
+                                            set_name=set_label,
                                         )
 
                                 step2_state["meta_cache"] = meta_cache
@@ -5264,9 +5290,16 @@ if df_original_key in st.session_state:
                                             st.write("condition:", _meta_shot("condition"))
                                             st.write("DEBUG types distribution:", counts)
 
+                                        set_label = (
+                                            step2_state.get("set_names", {}).get(
+                                                set_id, str(set_id)
+                                            )
+                                        )
                                         step2_state["wide_colcfg"][set_id] = build_wide_colcfg(
                                             meta_for_debug,
                                             sample_df=step2_state["wide"].get(set_id),
+                                            set_id=set_id,
+                                            set_name=set_label,
                                         )
 
                                 if step2_state["wide"]:
@@ -5523,8 +5556,16 @@ if df_original_key in st.session_state:
                                             _pupdate(75, "Composing column configs…")
                                             config_stage_logged = True
 
+                                        set_label = (
+                                            step2_state.get("set_names", {}).get(
+                                                set_id, str(set_id)
+                                            )
+                                        )
                                         column_config = build_wide_colcfg(
-                                            meta_map, sample_df=df_ref
+                                            meta_map,
+                                            sample_df=df_ref,
+                                            set_id=set_id,
+                                            set_name=set_label,
                                         )
                                         if (
                                             isinstance(df_ref, pd.DataFrame)
@@ -5595,7 +5636,41 @@ if df_original_key in st.session_state:
                                                 set_name,
                                                 df_view.columns.tolist(),
                                             )
-                                            df_view = df_view[column_order]
+
+                                            set_name_key = (
+                                                set_name
+                                                if isinstance(set_name, str)
+                                                else str(set_name)
+                                            )
+                                            allowed_for_set = (
+                                                set(BASE_FIRST)
+                                                | set(ALWAYS_ATTRS)
+                                                | set(SET_ATTRS.get(set_name_key, []))
+                                                | set(
+                                                    SET_ATTRS.get(
+                                                        str(current_set_id), []
+                                                    )
+                                                )
+                                            )
+                                            allowed_for_set.add(GENERATE_DESCRIPTION_COLUMN)
+
+                                            allowed_columns = [
+                                                col
+                                                for col in df_view.columns
+                                                if col in allowed_for_set
+                                            ]
+                                            df_view = df_view[allowed_columns]
+                                            column_order = [
+                                                c
+                                                for c in column_order
+                                                if c in allowed_for_set
+                                            ]
+                                            if column_order:
+                                                df_view = df_view[column_order]
+                                            else:
+                                                column_order = (
+                                                    df_view.columns.tolist()
+                                                )
 
                                             snapshot_entry = pipeline_snapshots.setdefault(
                                                 current_set_id,
@@ -5615,6 +5690,21 @@ if df_original_key in st.session_state:
                                                         ),
                                                     }
                                                 )
+
+                                            set_name_norm = set_name_key.strip().lower()
+                                            current_set_id_value: int | None = None
+                                            try:
+                                                current_set_id_value = int(current_set_id)
+                                            except (TypeError, ValueError):
+                                                current_set_id_value = None
+                                            is_electric = False
+                                            if (
+                                                current_set_id_value is not None
+                                                and current_set_id_value in ELECTRIC_SET_IDS
+                                            ):
+                                                is_electric = True
+                                            elif set_name_norm.startswith("electric"):
+                                                is_electric = True
 
                                             column_config_final = dict(column_config or {})
                                             if "sku" in df_view.columns:
@@ -5639,7 +5729,7 @@ if df_original_key in st.session_state:
                                                 ] = st.column_config.NumberColumn(
                                                     label="Price", disabled=True
                                                 )
-                                            if "guitarstylemultiplechoice" in column_config_final:
+                                            if is_electric and "guitarstylemultiplechoice" in column_config_final:
                                                 cfg = column_config_final[
                                                     "guitarstylemultiplechoice"
                                                 ]
