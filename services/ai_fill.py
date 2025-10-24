@@ -101,6 +101,7 @@ SET_ATTRS: Mapping[str, Set[str]] = {
         "controls",
         "neck_material",
         "neck_radius",
+        "neck_nutwidth",
         "tuning_machines",
         "fretboard_material",
         "scale_mensur",
