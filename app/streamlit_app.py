@@ -4542,6 +4542,20 @@ if df_original_key in st.session_state:
                             )
                         else:
                             updated_df.loc[idx, "attribute set"] = str(coerced)
+
+                    name_to_id = {
+                        name: int(_id)
+                        for name, _id in attribute_sets.items()
+                        if _id is not None
+                    }
+                    if "attribute set" in updated_df.columns and "attribute_set_id" in updated_df.columns:
+                        for idx, val in updated_df["attribute set"].items():
+                            if pd.isna(updated_df.at[idx, "attribute_set_id"]) or not updated_df.at[
+                                idx, "attribute_set_id"
+                            ]:
+                                nm = str(val or "").strip()
+                                if nm and nm in name_to_id:
+                                    updated_df.at[idx, "attribute_set_id"] = name_to_id[nm]
                 st.session_state[df_edited_key] = updated_df
                 st.session_state["show_attributes_trigger"] = True
                 st.session_state["_go_step2_requested"] = True
@@ -4598,16 +4612,16 @@ if df_original_key in st.session_state:
                                 except Exception:
                                     return None
 
-                        if "attribute_set_id" in df_new_common.columns:
-                            eff_ids = df_new_common["attribute_set_id"].apply(
-                                _coerce_set_id
-                            )
-                        else:
-                            eff_ids = df_new_common["attribute set"].apply(
-                                _coerce_set_id
-                            )
+                        def _coerce_set_id_smart(row: pd.Series):
+                            left = _coerce_set_id(row.get("attribute_set_id"))
+                            if left is not None:
+                                return left
+                            return _coerce_set_id(row.get("attribute set"))
 
-                        df_changed = df_new_common.loc[eff_ids.ne(4)].reset_index()
+                        eff_ids = df_new_common.apply(_coerce_set_id_smart, axis=1)
+
+                        mask_valid = eff_ids.notna()
+                        df_changed = df_new_common.loc[mask_valid & eff_ids.ne(4)].reset_index()
 
                         if df_changed.empty:
                             st.warning("No updated products.")
