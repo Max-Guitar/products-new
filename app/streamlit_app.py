@@ -102,46 +102,6 @@ _DEF_ATTR_SET_NAME = "Default"
 _ALLOWED_TYPES = {"simple", "configurable"}
 
 
-MODEL_SPEED_ESTIMATES = {
-    "gpt-4": 15,
-    "gpt-4o": 12,
-    "gpt-5-mini": 70,
-    "gpt-3.5": 5,
-}
-
-
-_MODEL_SPEED_PREFIXES: list[tuple[str, int]] = [
-    ("gpt-5-mini", MODEL_SPEED_ESTIMATES["gpt-5-mini"]),
-    ("gpt-4o", MODEL_SPEED_ESTIMATES["gpt-4o"]),
-    ("gpt-4", MODEL_SPEED_ESTIMATES["gpt-4"]),
-    ("gpt-3.5", MODEL_SPEED_ESTIMATES["gpt-3.5"]),
-]
-
-
-DEFAULT_MODEL_SPEED_SECONDS = 12
-
-
-def _estimate_seconds_per_item(model_name: str | None) -> float:
-    key = (model_name or "").strip().lower()
-    if not key:
-        return float(DEFAULT_MODEL_SPEED_SECONDS)
-    for prefix, seconds in _MODEL_SPEED_PREFIXES:
-        if key.startswith(prefix):
-            return float(seconds)
-    return float(DEFAULT_MODEL_SPEED_SECONDS)
-
-
-ETA_SECONDS_FIRST_ITEM = 80
-ETA_SECONDS_REST_ITEMS = 40
-
-
-def _estimate_initial_ai_eta(total_items: int) -> float:
-    if total_items <= 0:
-        return 0.0
-    remaining = max(total_items - 1, 0)
-    return float(ETA_SECONDS_FIRST_ITEM + ETA_SECONDS_REST_ITEMS * remaining)
-
-
 GENERATE_DESCRIPTION_COLUMN = "generate_description"
 
 
@@ -2669,7 +2629,6 @@ def build_attributes_df(
         resolved_model = st.session_state.get("ai_model_resolved")
     ai_model_name = resolved_model or DEFAULT_OPENAI_MODEL
     ai_conv = get_ai_conversation(ai_model_name) if ai_enabled else None
-    estimated_seconds_per_item = _estimate_seconds_per_item(ai_model_name)
 
     for _, row in df_changed.iterrows():
         sku_value = str(row.get("sku", "")).strip()
@@ -2895,22 +2854,8 @@ def build_attributes_df(
             }
         )
 
-    total_ai = len(ai_requests)
-
-    if ai_enabled and total_ai > 0:
-        preliminary_eta_seconds = _estimate_initial_ai_eta(total_ai)
-        if preliminary_eta_seconds > 0:
-            try:
-                eta_label = _format_eta_duration(preliminary_eta_seconds)
-                _pupdate(
-                    PROGRESS_PREP_END,
-                    f"Collecting selected sets… (ETA ~{eta_label})",
-                )
-            except NameError:
-                pass
-
     if not rows_by_set:
-        return {}, {}, {}, meta_cache, {}, {}, {}, [], total_ai, ai_log_data
+        return {}, {}, {}, meta_cache, {}, {}, {}, [], ai_log_data
 
     dfs: dict[int, pd.DataFrame] = {}
     column_configs: dict[int, dict] = {}
@@ -2936,190 +2881,126 @@ def build_attributes_df(
         }
         disabled[set_id] = ["sku", "name", "attribute_code"]
 
-    if ai_enabled and total_ai > 0:
-        ai_progress_start = PROGRESS_AI_START
-        ai_progress_span = PROGRESS_AI_END - PROGRESS_AI_START
-        ai_progress_value = float(ai_progress_start)
-        ai_progress_delta = (
-            float(ai_progress_span) / float(total_ai)
-            if total_ai > 0
-            else float(ai_progress_span)
-        )
-
-        def _format_eta(completed: int) -> str:
-            remaining = total_ai - completed
-            if remaining <= 0:
-                return ""
-            eta_seconds = estimated_seconds_per_item * remaining
-            if eta_seconds <= 0:
-                return ""
-            return f" (ETA ~{_format_eta_duration(eta_seconds)})"
-
-        def _update_ai_status(completed: int, *, final: bool = False) -> None:
-            nonlocal ai_progress_value
-            if total_ai <= 0:
-                return
-            if final:
-                pct = PROGRESS_AI_END
-            else:
-                clamped_completed = max(0, min(completed, total_ai))
-                incremental_target = ai_progress_start + (
-                    ai_progress_delta * clamped_completed
-                )
-                if clamped_completed > 0:
-                    minimal_target = ai_progress_start + math.ceil(
-                        ai_progress_delta * clamped_completed
+    if ai_enabled and ai_requests:
+        with st.spinner("🤖 Generating AI suggestions…"):
+            for (
+                set_id,
+                sku_value,
+                product_data,
+                df_full,
+                editor_codes,
+                hints_payload,
+            ) in ai_requests:
+                try:
+                    ai_df = infer_missing(
+                        product_data,
+                        df_full,
+                        session,
+                        api_base,
+                        editor_codes,
+                        ai_api_key,
+                        conv=ai_conv,
+                        hints=hints_payload,
+                        model=ai_model_name,
                     )
-                    incremental_target = max(incremental_target, float(minimal_target))
-                ai_progress_value = max(ai_progress_value, incremental_target)
-                pct = min(PROGRESS_AI_END, ai_progress_value)
-            if final:
-                done = min(completed, total_ai)
-                message = f"AI suggestions complete ({done} of {total_ai})"
-            else:
-                eta_text = _format_eta(completed)
-                remaining = max(total_ai - completed, 0)
-                if remaining > 0:
-                    noun = "item" if remaining == 1 else "items"
-                    remaining_suffix = f" — {remaining} {noun} left"
-                else:
-                    remaining_suffix = ""
-                message = (
-                    f"Generating suggestions… {completed} of {total_ai} done"
-                    f"{eta_text}{remaining_suffix}"
-                )
-            _pupdate(pct, message)
-
-        _update_ai_status(0)
-
-        completed = 0
-
-        for (
-            set_id,
-            sku_value,
-            product_data,
-            df_full,
-            editor_codes,
-            hints_payload,
-        ) in ai_requests:
-            try:
-                ai_df = infer_missing(
-                    product_data,
-                    df_full,
-                    session,
-                    api_base,
-                    editor_codes,
-                    ai_api_key,
-                    conv=ai_conv,
-                    hints=hints_payload,
-                    model=ai_model_name,
-                )
-            except Exception as exc:  # pragma: no cover - network error handling
-                raw_preview_source = (
-                    getattr(exc, "raw_response", None)
-                    or getattr(exc, "raw_response_retry", None)
-                    or getattr(exc, "raw_response_sanitized", None)
-                    or ""
-                )
-                trace(
-                    {
-                        "where": "ai:json_error",
-                        "sku": sku_value,
-                        "err": str(exc),
-                        "raw_preview": str(raw_preview_source)[:400],
-                        "tb": traceback.format_exc()[-600:],
-                    }
-                )
-                if "json" in str(exc).lower():
-                    ai_log_data.setdefault("errors", []).append(
+                except Exception as exc:  # pragma: no cover - network error handling
+                    raw_preview_source = (
+                        getattr(exc, "raw_response", None)
+                        or getattr(exc, "raw_response_retry", None)
+                        or getattr(exc, "raw_response_sanitized", None)
+                        or ""
+                    )
+                    trace(
                         {
+                            "where": "ai:json_error",
                             "sku": sku_value,
-                            "reason": "json-parse-failed",
-                            "model": ai_model_name,
+                            "err": str(exc),
+                            "raw_preview": str(raw_preview_source)[:400],
+                            "tb": traceback.format_exc()[-600:],
                         }
                     )
-                error_message = f"AI suggestion failed for {sku_value}: {exc}"
-                st.warning(error_message)
-                ai_errors.append(error_message)
-                completed += 1
-                _update_ai_status(completed, final=completed >= total_ai)
-                continue
+                    if "json" in str(exc).lower():
+                        ai_log_data.setdefault("errors", []).append(
+                            {
+                                "sku": sku_value,
+                                "reason": "json-parse-failed",
+                                "model": ai_model_name,
+                            }
+                        )
+                    error_message = f"AI suggestion failed for {sku_value}: {exc}"
+                    st.warning(error_message)
+                    ai_errors.append(error_message)
+                    continue
 
-            if isinstance(ai_df, pd.DataFrame):
-                preview_df = ai_df.head(50)
-                if {"code", "value"} <= set(preview_df.columns):
-                    suggested_records = preview_df[["code", "value"]].to_dict(
-                        orient="records"
-                    )
+                if isinstance(ai_df, pd.DataFrame):
+                    preview_df = ai_df.head(50)
+                    if {"code", "value"} <= set(preview_df.columns):
+                        suggested_records = preview_df[["code", "value"]].to_dict(
+                            orient="records"
+                        )
+                    else:
+                        suggested_records = preview_df.to_dict(orient="records")
+                elif hasattr(ai_df, "to_dict"):
+                    try:
+                        suggested_records = list(ai_df.to_dict().items())
+                    except Exception:
+                        suggested_records = []
                 else:
-                    suggested_records = preview_df.to_dict(orient="records")
-            elif hasattr(ai_df, "to_dict"):
-                try:
-                    suggested_records = list(ai_df.to_dict().items())
-                except Exception:
                     suggested_records = []
-            else:
-                suggested_records = []
-            trace(
-                {
-                    "where": "ai:raw",
-                    "sku": sku_value,
-                    "set_id": set_id,
-                    "suggested": suggested_records,
-                }
-            )
+                trace(
+                    {
+                        "where": "ai:raw",
+                        "sku": sku_value,
+                        "set_id": set_id,
+                        "suggested": suggested_records,
+                    }
+                )
 
-            categories_meta_for_ai = step2_state.get("categories_meta")
-            if not isinstance(categories_meta_for_ai, Mapping):
-                categories_meta_for_ai = {}
-            attribute_set_label = set_names.get(set_id, "")
-            ai_df = enrich_ai_suggestions(
-                ai_df,
-                hints_payload,
-                categories_meta_for_ai,
-                attribute_set_label,
-                set_id,
-            )
+                categories_meta_for_ai = step2_state.get("categories_meta")
+                if not isinstance(categories_meta_for_ai, Mapping):
+                    categories_meta_for_ai = {}
+                attribute_set_label = set_names.get(set_id, "")
+                ai_df = enrich_ai_suggestions(
+                    ai_df,
+                    hints_payload,
+                    categories_meta_for_ai,
+                    attribute_set_label,
+                    set_id,
+                )
 
-            sku_key = str(sku_value)
-            per_sku = ai_results.setdefault(set_id, {}).setdefault(sku_key, {})
+                sku_key = str(sku_value)
+                per_sku = ai_results.setdefault(set_id, {}).setdefault(sku_key, {})
 
-            metadata = getattr(ai_df, "attrs", {}).get("meta") if hasattr(ai_df, "attrs") else None
-            if isinstance(metadata, dict) and metadata:
-                per_sku["__meta__"] = metadata
+                metadata = getattr(ai_df, "attrs", {}).get("meta") if hasattr(ai_df, "attrs") else None
+                if isinstance(metadata, dict) and metadata:
+                    per_sku["__meta__"] = metadata
 
-            trace(
-                {
-                    "where": "ai:enriched",
-                    "sku": sku_value,
-                    "set_id": set_id,
-                    "keys": list(per_sku.keys()),
-                }
-            )
+                trace(
+                    {
+                        "where": "ai:enriched",
+                        "sku": sku_value,
+                        "set_id": set_id,
+                        "keys": list(per_sku.keys()),
+                    }
+                )
 
-            if not isinstance(ai_df, pd.DataFrame) or ai_df.empty:
-                completed += 1
-                _update_ai_status(completed, final=completed >= total_ai)
-                continue
-
-            for _, suggestion in ai_df.iterrows():
-                code = suggestion.get("code")
-                if not code:
+                if not isinstance(ai_df, pd.DataFrame) or ai_df.empty:
                     continue
-                value = suggestion.get("value")
-                if value is None:
-                    continue
-                if isinstance(value, str) and not value.strip():
-                    continue
-                reason = suggestion.get("reason")
-                per_sku[str(code)] = {
-                    "value": value,
-                    "reason": reason,
-                }
 
-            completed += 1
-            _update_ai_status(completed, final=completed >= total_ai)
-
+                for _, suggestion in ai_df.iterrows():
+                    code = suggestion.get("code")
+                    if not code:
+                        continue
+                    value = suggestion.get("value")
+                    if value is None:
+                        continue
+                    if isinstance(value, str) and not value.strip():
+                        continue
+                    reason = suggestion.get("reason")
+                    per_sku[str(code)] = {
+                        "value": value,
+                        "reason": reason,
+                    }
 
     return (
         dfs,
@@ -3130,7 +3011,6 @@ def build_attributes_df(
         set_names,
         {key: value for key, value in ai_results.items()},
         ai_errors,
-        total_ai,
         ai_log_data,
     )
 
@@ -4771,115 +4651,16 @@ if df_original_key in st.session_state:
                                     "Building attribute editor…", expanded=True
                                 )
                                 progress = st.progress(0)
-                                st.session_state["_step2_last_progress_pct"] = 0
 
-                                PROGRESS_PREP_END = 5
-                                PROGRESS_AI_START = PROGRESS_PREP_END
-                                PROGRESS_AI_END = 65
-                                PROGRESS_RESOLVE_START = PROGRESS_AI_END
-                                PROGRESS_RESOLVE_END = 85
-                                PROGRESS_META_START = PROGRESS_RESOLVE_END
-                                PROGRESS_META_END = 95
-                                PROGRESS_FINAL_START = PROGRESS_META_END
-                                PROGRESS_FINAL_END = 100
-
-                                model_for_eta = (
-                                    st.session_state.get("ai_model_resolved")
-                                    or st.session_state.get("ai_model")
-                                    or DEFAULT_OPENAI_MODEL
-                                )
-                                estimated_seconds_per_item = _estimate_seconds_per_item(
-                                    model_for_eta
-                                )
-
-                                def _format_eta_duration(seconds: float) -> str:
-                                    seconds = max(float(seconds), 0.0)
-                                    if seconds < 1:
-                                        return "<1s"
-
-                                    if seconds < 10:
-                                        rounded = math.ceil(seconds * 10.0) / 10.0
-                                        if math.isclose(rounded, round(rounded)):
-                                            return f"{int(round(rounded))}s"
-                                        return f"{rounded:.1f}s"
-
-                                    total_seconds = math.ceil(seconds)
-                                    if total_seconds >= 3600:
-                                        hours = total_seconds // 3600
-                                        minutes = math.ceil((total_seconds % 3600) / 60)
-                                        if minutes == 60:
-                                            hours += 1
-                                            minutes = 0
-                                        if minutes > 0:
-                                            return f"{hours}h {minutes}m"
-                                        return f"{hours}h"
-
-                                    if total_seconds >= 60:
-                                        minutes = total_seconds // 60
-                                        seconds_rem = total_seconds % 60
-                                        if seconds_rem == 0:
-                                            return f"{minutes}m"
-                                        return f"{minutes}m {seconds_rem}s"
-
-                                    return f"{total_seconds}s"
-
-                                step2_state = _ensure_step2_state()
-                                step2_state.setdefault("staged", {})
-
-                                total_ai = int(
-                                    step2_state.get("ai_total_requested") or 0
-                                )
-                                initial_eta_suffix = ""
-                                if total_ai > 0:
-                                    preliminary_eta_seconds = _estimate_initial_ai_eta(
-                                        total_ai
-                                    )
-                                    if preliminary_eta_seconds > 0:
-                                        initial_eta_suffix = (
-                                            f" (ETA ~{_format_eta_duration(preliminary_eta_seconds)})"
-                                        )
-
-                                def _progress_in_range(
-                                    start: int, end: int, current: int, total: int
-                                ) -> int:
-                                    if end <= start:
-                                        return int(start)
-                                    total = max(total, 1)
-                                    ratio = max(
-                                        0.0, min(float(current) / float(total), 1.0)
-                                    )
-                                    value = start + round((end - start) * ratio)
-                                    return int(max(start, min(value, end)))
-
-                                def _progress_fraction(
-                                    start: int, end: int, fraction: float
-                                ) -> int:
-                                    if end <= start:
-                                        return int(start)
-                                    ratio = max(0.0, min(float(fraction), 1.0))
-                                    value = start + round((end - start) * ratio)
-                                    return int(max(start, min(value, end)))
-
-                                def _pupdate(pct: float, msg: str) -> None:
-                                    target = round(float(pct))
-                                    target = max(0, min(int(target), 100))
-                                    prev = st.session_state.get(
-                                        "_step2_last_progress_pct", 0
-                                    )
-                                    if target < prev:
-                                        target = prev
-                                    progress.progress(target)
-                                    st.session_state["_step2_last_progress_pct"] = target
+                                def _pupdate(pct: int, msg: str) -> None:
+                                    clamped = max(0, min(int(pct), 100))
+                                    progress.progress(clamped)
                                     status2.update(label=msg)
 
-                                _pupdate(
-                                    PROGRESS_PREP_END,
-                                    f"Collecting selected sets…{initial_eta_suffix}",
-                                )
+                                _pupdate(5, "Collecting selected sets…")
                                 selected_set_ids: list[int] = []
-                                total_ai = int(
-                                    step2_state.get("ai_total_requested") or 0
-                                )
+                                step2_state = _ensure_step2_state()
+                                step2_state.setdefault("staged", {})
 
                                 meta_cache: AttributeMetaCache | None = step2_state.get(
                                     "meta_cache"
@@ -5001,7 +4782,6 @@ if df_original_key in st.session_state:
                                         set_names,
                                         ai_suggestions_map,
                                         ai_errors,
-                                        total_ai,
                                         ai_log_data,
                                     ) = build_attributes_df(
                                         df_changed,
@@ -5021,7 +4801,6 @@ if df_original_key in st.session_state:
                                     )
                                     step2_state["ai_errors"] = ai_errors
                                     step2_state["ai_log_data"] = ai_log_data or {"errors": []}
-                                    step2_state["ai_total_requested"] = total_ai
                                     if ai_errors:
                                         preview = "\n".join(
                                             f"- {msg}" for msg in ai_errors[:5]
@@ -5112,11 +4891,8 @@ if df_original_key in st.session_state:
                                             )
                                         resolved_map: dict[str, str] = {}
                                         effective_codes: list[str] = []
-                                        pct_resolve = _progress_in_range(
-                                            PROGRESS_RESOLVE_START,
-                                            PROGRESS_RESOLVE_END,
-                                            i,
-                                            total_sets,
+                                        pct_resolve = 10 + int(
+                                            20 * i / max(total_sets, 1)
                                         )
                                         _pupdate(
                                             pct_resolve,
@@ -5134,11 +4910,8 @@ if df_original_key in st.session_state:
                                                 if effective and effective not in seen_effective:
                                                     seen_effective.add(effective)
                                                     effective_codes.append(effective)
-                                        pct_meta = _progress_in_range(
-                                            PROGRESS_META_START,
-                                            PROGRESS_META_END,
-                                            i,
-                                            total_sets,
+                                        pct_meta = 30 + int(
+                                            10 * i / max(total_sets, 1)
                                         )
                                         _pupdate(
                                             pct_meta,
@@ -5357,11 +5130,8 @@ if df_original_key in st.session_state:
                                             )
                                         resolved_map: dict[str, str] = {}
                                         effective_codes: list[str] = []
-                                        pct_resolve = _progress_in_range(
-                                            PROGRESS_RESOLVE_START,
-                                            PROGRESS_RESOLVE_END,
-                                            i,
-                                            total_sets,
+                                        pct_resolve = 10 + int(
+                                            20 * i / max(total_sets, 1)
                                         )
                                         _pupdate(
                                             pct_resolve,
@@ -5379,11 +5149,8 @@ if df_original_key in st.session_state:
                                                 if effective and effective not in seen_effective:
                                                     seen_effective.add(effective)
                                                     effective_codes.append(effective)
-                                        pct_meta = _progress_in_range(
-                                            PROGRESS_META_START,
-                                            PROGRESS_META_END,
-                                            i,
-                                            total_sets,
+                                        pct_meta = 30 + int(
+                                            10 * i / max(total_sets, 1)
                                         )
                                         _pupdate(
                                             pct_meta,
@@ -5541,23 +5308,13 @@ if df_original_key in st.session_state:
                                         | set(step2_state["wide"].keys())
                                     )
 
-                                _pupdate(
-                                    PROGRESS_META_START,
-                                    "Fetching metadata from Magento…",
-                                )
+                                _pupdate(40, "Fetching metadata from Magento…")
 
                                 categories_meta = step2_state.get("categories_meta")
                                 if not isinstance(categories_meta, dict):
                                     categories_meta = {}
 
-                                _pupdate(
-                                    _progress_fraction(
-                                        PROGRESS_META_START,
-                                        PROGRESS_META_END,
-                                        0.2,
-                                    ),
-                                    "Preparing categories (full tree)…",
-                                )
+                                _pupdate(45, "Preparing categories (full tree)…")
 
                                 st.session_state["show_attrs"] = bool(
                                     step2_state["wide"]
@@ -5685,10 +5442,7 @@ if df_original_key in st.session_state:
                                     )
                                     normalized_rows = 0
                                     if total_rows == 0:
-                                        _pupdate(
-                                            PROGRESS_META_START,
-                                            "Normalizing values…",
-                                        )
+                                        _pupdate(70, "Normalizing values…")
                                     config_stage_logged = False
                                     render_counter = 0
                                     total_sets_render = len(selected_set_ids) or 1
@@ -5773,11 +5527,10 @@ if df_original_key in st.session_state:
                                                     or idx % 25 == 0
                                                     or normalized_rows == total_rows
                                                 ):
-                                                    pct = _progress_in_range(
-                                                        PROGRESS_META_START,
-                                                        PROGRESS_META_END,
-                                                        normalized_rows,
-                                                        total_rows,
+                                                    pct = 45 + int(
+                                                        25
+                                                        * normalized_rows
+                                                        / max(total_rows, 1)
                                                     )
                                                     _pupdate(
                                                         pct,
@@ -5800,14 +5553,7 @@ if df_original_key in st.session_state:
                                             )
 
                                         if not config_stage_logged:
-                                            _pupdate(
-                                                _progress_fraction(
-                                                    PROGRESS_META_START,
-                                                    PROGRESS_META_END,
-                                                    0.6,
-                                                ),
-                                                "Composing column configs…",
-                                            )
+                                            _pupdate(75, "Composing column configs…")
                                             config_stage_logged = True
 
                                         set_label = (
@@ -5849,14 +5595,10 @@ if df_original_key in st.session_state:
                                             "attribute_set_id"
                                         ):
                                             render_counter += 1
-                                            pct_render = _progress_in_range(
-                                                PROGRESS_FINAL_START,
-                                                PROGRESS_FINAL_END,
-                                                render_counter,
-                                                total_sets_render,
-                                            )
-                                            pct_render = min(
-                                                PROGRESS_FINAL_END - 1, pct_render
+                                            pct_render = 80 + int(
+                                                15
+                                                * render_counter
+                                                / max(total_sets_render, 1)
                                             )
                                             _pupdate(
                                                 pct_render,
