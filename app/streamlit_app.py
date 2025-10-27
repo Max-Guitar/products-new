@@ -105,7 +105,7 @@ _ALLOWED_TYPES = {"simple", "configurable"}
 MODEL_SPEED_ESTIMATES = {
     "gpt-4": 15,
     "gpt-4o": 12,
-    "gpt-5-mini": 5,
+    "gpt-5-mini": 70,
     "gpt-3.5": 5,
 }
 
@@ -2658,6 +2658,7 @@ def build_attributes_df(
         resolved_model = st.session_state.get("ai_model_resolved")
     ai_model_name = resolved_model or DEFAULT_OPENAI_MODEL
     ai_conv = get_ai_conversation(ai_model_name) if ai_enabled else None
+    estimated_seconds_per_item = _estimate_seconds_per_item(ai_model_name)
 
     for _, row in df_changed.iterrows():
         sku_value = str(row.get("sku", "")).strip()
@@ -2883,8 +2884,22 @@ def build_attributes_df(
             }
         )
 
+    total_ai = len(ai_requests)
+
+    if ai_enabled and total_ai > 0:
+        preliminary_eta_seconds = estimated_seconds_per_item * total_ai
+        if preliminary_eta_seconds > 0:
+            try:
+                eta_label = _format_eta_duration(preliminary_eta_seconds)
+                _pupdate(
+                    PROGRESS_PREP_END,
+                    f"Collecting selected sets… (ETA ~{eta_label})",
+                )
+            except NameError:
+                pass
+
     if not rows_by_set:
-        return {}, {}, {}, meta_cache, {}, {}, {}, [], ai_log_data
+        return {}, {}, {}, meta_cache, {}, {}, {}, [], total_ai, ai_log_data
 
     dfs: dict[int, pd.DataFrame] = {}
     column_configs: dict[int, dict] = {}
@@ -2910,48 +2925,15 @@ def build_attributes_df(
         }
         disabled[set_id] = ["sku", "name", "attribute_code"]
 
-    if ai_enabled and ai_requests:
-        total_ai = len(ai_requests)
+    if ai_enabled and total_ai > 0:
         ai_progress_start = PROGRESS_AI_START
         ai_progress_span = PROGRESS_AI_END - PROGRESS_AI_START
-        estimated_seconds_per_item = 70.0  # fixed avg seconds per item for ETA
         ai_progress_value = float(ai_progress_start)
         ai_progress_delta = (
             float(ai_progress_span) / float(total_ai)
             if total_ai > 0
             else float(ai_progress_span)
         )
-
-        def _format_eta_duration(seconds: float) -> str:
-            seconds = max(float(seconds), 0.0)
-            if seconds < 1:
-                return "<1s"
-
-            if seconds < 10:
-                rounded = math.ceil(seconds * 10.0) / 10.0
-                if math.isclose(rounded, round(rounded)):
-                    return f"{int(round(rounded))}s"
-                return f"{rounded:.1f}s"
-
-            total_seconds = math.ceil(seconds)
-            if total_seconds >= 3600:
-                hours = total_seconds // 3600
-                minutes = math.ceil((total_seconds % 3600) / 60)
-                if minutes == 60:
-                    hours += 1
-                    minutes = 0
-                if minutes > 0:
-                    return f"{hours}h {minutes}m"
-                return f"{hours}h"
-
-            if total_seconds >= 60:
-                minutes = total_seconds // 60
-                seconds_rem = total_seconds % 60
-                if seconds_rem == 0:
-                    return f"{minutes}m"
-                return f"{minutes}m {seconds_rem}s"
-
-            return f"{total_seconds}s"
 
         def _format_eta(completed: int) -> str:
             remaining = total_ai - completed
@@ -3137,6 +3119,7 @@ def build_attributes_df(
         set_names,
         {key: value for key, value in ai_results.items()},
         ai_errors,
+        total_ai,
         ai_log_data,
     )
 
@@ -4789,6 +4772,62 @@ if df_original_key in st.session_state:
                                 PROGRESS_FINAL_START = PROGRESS_META_END
                                 PROGRESS_FINAL_END = 100
 
+                                model_for_eta = (
+                                    st.session_state.get("ai_model_resolved")
+                                    or st.session_state.get("ai_model")
+                                    or DEFAULT_OPENAI_MODEL
+                                )
+                                estimated_seconds_per_item = _estimate_seconds_per_item(
+                                    model_for_eta
+                                )
+
+                                def _format_eta_duration(seconds: float) -> str:
+                                    seconds = max(float(seconds), 0.0)
+                                    if seconds < 1:
+                                        return "<1s"
+
+                                    if seconds < 10:
+                                        rounded = math.ceil(seconds * 10.0) / 10.0
+                                        if math.isclose(rounded, round(rounded)):
+                                            return f"{int(round(rounded))}s"
+                                        return f"{rounded:.1f}s"
+
+                                    total_seconds = math.ceil(seconds)
+                                    if total_seconds >= 3600:
+                                        hours = total_seconds // 3600
+                                        minutes = math.ceil((total_seconds % 3600) / 60)
+                                        if minutes == 60:
+                                            hours += 1
+                                            minutes = 0
+                                        if minutes > 0:
+                                            return f"{hours}h {minutes}m"
+                                        return f"{hours}h"
+
+                                    if total_seconds >= 60:
+                                        minutes = total_seconds // 60
+                                        seconds_rem = total_seconds % 60
+                                        if seconds_rem == 0:
+                                            return f"{minutes}m"
+                                        return f"{minutes}m {seconds_rem}s"
+
+                                    return f"{total_seconds}s"
+
+                                step2_state = _ensure_step2_state()
+                                step2_state.setdefault("staged", {})
+
+                                total_ai = int(
+                                    step2_state.get("ai_total_requested") or 0
+                                )
+                                initial_eta_suffix = ""
+                                if total_ai > 0:
+                                    preliminary_eta_seconds = (
+                                        estimated_seconds_per_item * total_ai
+                                    )
+                                    if preliminary_eta_seconds > 0:
+                                        initial_eta_suffix = (
+                                            f" (ETA ~{_format_eta_duration(preliminary_eta_seconds)})"
+                                        )
+
                                 def _progress_in_range(
                                     start: int, end: int, current: int, total: int
                                 ) -> int:
@@ -4823,11 +4862,13 @@ if df_original_key in st.session_state:
                                     status2.update(label=msg)
 
                                 _pupdate(
-                                    PROGRESS_PREP_END, "Collecting selected sets…"
+                                    PROGRESS_PREP_END,
+                                    f"Collecting selected sets…{initial_eta_suffix}",
                                 )
                                 selected_set_ids: list[int] = []
-                                step2_state = _ensure_step2_state()
-                                step2_state.setdefault("staged", {})
+                                total_ai = int(
+                                    step2_state.get("ai_total_requested") or 0
+                                )
 
                                 meta_cache: AttributeMetaCache | None = step2_state.get(
                                     "meta_cache"
@@ -4949,6 +4990,7 @@ if df_original_key in st.session_state:
                                         set_names,
                                         ai_suggestions_map,
                                         ai_errors,
+                                        total_ai,
                                         ai_log_data,
                                     ) = build_attributes_df(
                                         df_changed,
@@ -4968,6 +5010,7 @@ if df_original_key in st.session_state:
                                     )
                                     step2_state["ai_errors"] = ai_errors
                                     step2_state["ai_log_data"] = ai_log_data or {"errors": []}
+                                    step2_state["ai_total_requested"] = total_ai
                                     if ai_errors:
                                         preview = "\n".join(
                                             f"- {msg}" for msg in ai_errors[:5]
