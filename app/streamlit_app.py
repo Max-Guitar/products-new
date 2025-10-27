@@ -131,6 +131,17 @@ def _estimate_seconds_per_item(model_name: str | None) -> float:
     return float(DEFAULT_MODEL_SPEED_SECONDS)
 
 
+ETA_SECONDS_FIRST_ITEM = 80
+ETA_SECONDS_REST_ITEMS = 40
+
+
+def _estimate_initial_ai_eta(total_items: int) -> float:
+    if total_items <= 0:
+        return 0.0
+    remaining = max(total_items - 1, 0)
+    return float(ETA_SECONDS_FIRST_ITEM + ETA_SECONDS_REST_ITEMS * remaining)
+
+
 GENERATE_DESCRIPTION_COLUMN = "generate_description"
 
 
@@ -2887,7 +2898,7 @@ def build_attributes_df(
     total_ai = len(ai_requests)
 
     if ai_enabled and total_ai > 0:
-        preliminary_eta_seconds = estimated_seconds_per_item * total_ai
+        preliminary_eta_seconds = _estimate_initial_ai_eta(total_ai)
         if preliminary_eta_seconds > 0:
             try:
                 eta_label = _format_eta_duration(preliminary_eta_seconds)
@@ -4820,8 +4831,8 @@ if df_original_key in st.session_state:
                                 )
                                 initial_eta_suffix = ""
                                 if total_ai > 0:
-                                    preliminary_eta_seconds = (
-                                        estimated_seconds_per_item * total_ai
+                                    preliminary_eta_seconds = _estimate_initial_ai_eta(
+                                        total_ai
                                     )
                                     if preliminary_eta_seconds > 0:
                                         initial_eta_suffix = (

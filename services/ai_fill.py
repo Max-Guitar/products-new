@@ -6,6 +6,7 @@ import json
 import os
 import re
 import hashlib
+import time
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 from urllib.parse import quote
@@ -957,7 +958,6 @@ def _openai_complete(
     user_msg: str,
     api_key: str,
     model: str = DEFAULT_OPENAI_MODEL,
-    timeout: int = 60,
 ) -> tuple[dict, str]:
     api_key = api_key or os.getenv("OPENAI_API_KEY")
     if not api_key:
@@ -989,7 +989,6 @@ def _openai_complete(
     kwargs: dict[str, object] = {
         "model": resolved_model,
         "messages": messages_payload,
-        "timeout": timeout,
     }
 
     if caps["supports_json_mode"]:
@@ -1535,8 +1534,22 @@ def infer_missing(
     user_payload["regex_hints"] = regex_info.values if regex_info else {}
     user_payload["retry_questions"] = build_retry_questions(ai_codes)
 
+    item_started_at = time.perf_counter()
+    call_durations: list[dict[str, object]] = []
+
+    def _record_phase(phase: str, started_at: float) -> None:
+        try:
+            elapsed = time.perf_counter() - float(started_at)
+        except Exception:
+            return
+        call_durations.append(
+            {"phase": phase, "seconds": round(float(elapsed), 3)}
+        )
+
     payload_json = json.dumps(user_payload, ensure_ascii=False)
+    initial_started_at = time.perf_counter()
     completion, raw_content = _openai_complete(conv, payload_json, api_key, model=model)
+    _record_phase("initial", initial_started_at)
     try:
         buf = st.session_state.setdefault("_trace_events", [])
         buf.append(
@@ -1603,9 +1616,11 @@ def infer_missing(
             + ", ".join(sorted({str(code) for code in gap_missing_codes}))
         )
         gap_prompt = "\n".join(part for part in gap_prompt_parts if part)
+        gap_started_at = time.perf_counter()
         completion_gap, raw_gap = _openai_complete(
             conv, gap_prompt, api_key, model=model
         )
+        _record_phase("gap", gap_started_at)
         gap_attrs = completion_gap.get("attributes") if isinstance(completion_gap, Mapping) else []
         gap_df = pd.DataFrame(gap_attrs or [])
         gap_map = _df_to_code_map(gap_df)
@@ -1657,7 +1672,9 @@ def infer_missing(
         retry_payload["remaining_codes"] = remaining_before_retry
         retry_payload["retry_questions"] = build_retry_questions(remaining_before_retry)
         retry_json = json.dumps(retry_payload, ensure_ascii=False)
+        retry_started_at = time.perf_counter()
         completion_retry, raw_retry = _openai_complete(conv, retry_json, api_key, model=model)
+        _record_phase("retry", retry_started_at)
         retry_attributes = (
             completion_retry.get("attributes")
             if isinstance(completion_retry, Mapping)
@@ -1733,6 +1750,18 @@ def infer_missing(
     if brand_hint_reason:
         metadata["brand_hint_reason"] = brand_hint_reason
     result_df.attrs["meta"] = metadata
+
+    total_elapsed = time.perf_counter() - item_started_at
+    _trace(
+        {
+            "where": "ai:infer_missing_duration",
+            "sku": (product or {}).get("sku") if isinstance(product, Mapping) else None,
+            "model": model,
+            "ai_codes": list(ai_codes),
+            "seconds": round(float(total_elapsed), 3),
+            "calls": call_durations,
+        }
+    )
     return result_df
 
 
