@@ -103,6 +103,35 @@ _DEF_ATTR_SET_NAME = "Default"
 _ALLOWED_TYPES = {"simple", "configurable"}
 
 
+MODEL_SPEED_ESTIMATES = {
+    "gpt-4": 15,
+    "gpt-4o": 12,
+    "gpt-5-mini": 5,
+    "gpt-3.5": 5,
+}
+
+
+_MODEL_SPEED_PREFIXES: list[tuple[str, int]] = [
+    ("gpt-5-mini", MODEL_SPEED_ESTIMATES["gpt-5-mini"]),
+    ("gpt-4o", MODEL_SPEED_ESTIMATES["gpt-4o"]),
+    ("gpt-4", MODEL_SPEED_ESTIMATES["gpt-4"]),
+    ("gpt-3.5", MODEL_SPEED_ESTIMATES["gpt-3.5"]),
+]
+
+
+DEFAULT_MODEL_SPEED_SECONDS = 12
+
+
+def _estimate_seconds_per_item(model_name: str | None) -> float:
+    key = (model_name or "").strip().lower()
+    if not key:
+        return float(DEFAULT_MODEL_SPEED_SECONDS)
+    for prefix, seconds in _MODEL_SPEED_PREFIXES:
+        if key.startswith(prefix):
+            return float(seconds)
+    return float(DEFAULT_MODEL_SPEED_SECONDS)
+
+
 GENERATE_DESCRIPTION_COLUMN = "generate_description"
 
 
@@ -2886,59 +2915,85 @@ def build_attributes_df(
         total_ai = len(ai_requests)
         ai_progress_start = PROGRESS_AI_START
         ai_progress_span = PROGRESS_AI_END - PROGRESS_AI_START
-
-        _pupdate(
-            ai_progress_start,
-            f"Generating suggestions… 0 of {total_ai} done",
+        estimated_seconds_per_item = _estimate_seconds_per_item(ai_model_name)
+        start_time = time.monotonic()
+        ai_progress_value = float(ai_progress_start)
+        ai_progress_delta = (
+            float(ai_progress_span) / float(total_ai)
+            if total_ai > 0
+            else float(ai_progress_span)
         )
 
-        start_time = time.monotonic()
+        def _format_eta_duration(seconds: float) -> str:
+            seconds = max(float(seconds), 0.0)
+            if seconds >= 3600:
+                hours = int(seconds // 3600)
+                minutes = int((seconds % 3600) // 60)
+                return f"{hours}h {minutes}m"
+            if seconds >= 60:
+                minutes = int(seconds // 60)
+                seconds_rem = int(seconds % 60)
+                return f"{minutes}m {seconds_rem}s"
+            if seconds >= 10:
+                return f"{int(seconds)}s"
+            if seconds >= 1:
+                return f"{seconds:.1f}s"
+            return "<1s"
 
         def _format_eta(completed: int) -> str:
             remaining = total_ai - completed
-            if remaining <= 0 or completed <= 0:
+            if remaining <= 0:
                 return ""
-            elapsed = time.monotonic() - start_time
-            if elapsed <= 0:
+            eta_seconds: float | None = None
+            if completed <= 0:
+                eta_seconds = estimated_seconds_per_item * remaining
+            else:
+                elapsed = time.monotonic() - start_time
+                if elapsed > 0:
+                    avg = elapsed / completed
+                    eta_seconds = avg * remaining
+                else:
+                    eta_seconds = estimated_seconds_per_item * remaining
+            if not eta_seconds or eta_seconds <= 0:
                 return ""
-            avg = elapsed / completed
-            eta = avg * remaining
-            if eta >= 3600:
-                hours = int(eta // 3600)
-                minutes = int((eta % 3600) // 60)
-                return f" (~{hours}h {minutes}m left)"
-            if eta >= 60:
-                minutes = int(eta // 60)
-                seconds = int(eta % 60)
-                return f" (~{minutes}m {seconds}s left)"
-            if eta >= 10:
-                return f" (~{int(eta)}s left)"
-            if eta >= 1:
-                return f" (~{eta:.1f}s left)"
-            return " (<1s left)"
+            return f" (ETA ~{_format_eta_duration(eta_seconds)})"
 
         def _update_ai_status(completed: int, *, final: bool = False) -> None:
+            nonlocal ai_progress_value
             if total_ai <= 0:
                 return
-            pct = (
-                PROGRESS_AI_END
-                if final
-                else min(
-                    PROGRESS_AI_END,
-                    ai_progress_start
-                    + round(ai_progress_span * completed / total_ai),
+            if final:
+                pct = PROGRESS_AI_END
+            else:
+                clamped_completed = max(0, min(completed, total_ai))
+                incremental_target = ai_progress_start + (
+                    ai_progress_delta * clamped_completed
                 )
-            )
+                if clamped_completed > 0:
+                    minimal_target = ai_progress_start + math.ceil(
+                        ai_progress_delta * clamped_completed
+                    )
+                    incremental_target = max(incremental_target, float(minimal_target))
+                ai_progress_value = max(ai_progress_value, incremental_target)
+                pct = min(PROGRESS_AI_END, ai_progress_value)
             if final:
                 done = min(completed, total_ai)
                 message = f"AI suggestions complete ({done} of {total_ai})"
             else:
                 eta_text = _format_eta(completed)
+                remaining = max(total_ai - completed, 0)
+                if remaining > 0:
+                    noun = "item" if remaining == 1 else "items"
+                    remaining_suffix = f" — {remaining} {noun} left"
+                else:
+                    remaining_suffix = ""
                 message = (
                     f"Generating suggestions… {completed} of {total_ai} done"
-                    f"{eta_text}"
+                    f"{eta_text}{remaining_suffix}"
                 )
             _pupdate(pct, message)
+
+        _update_ai_status(0)
 
         completed = 0
 
