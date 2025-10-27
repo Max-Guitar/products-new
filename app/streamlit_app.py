@@ -2884,12 +2884,12 @@ def build_attributes_df(
 
     if ai_enabled and ai_requests:
         total_ai = len(ai_requests)
-        ai_progress_start = 5
-        ai_progress_span = 35
+        ai_progress_start = PROGRESS_AI_START
+        ai_progress_span = PROGRESS_AI_END - PROGRESS_AI_START
 
         _pupdate(
             ai_progress_start,
-            f"Generating AI suggestions… 0/{total_ai} done",
+            f"Generating suggestions… 0 of {total_ai} done",
         )
 
         start_time = time.monotonic()
@@ -2921,19 +2921,23 @@ def build_attributes_df(
             if total_ai <= 0:
                 return
             pct = (
-                ai_progress_start + ai_progress_span
+                PROGRESS_AI_END
                 if final
-                else ai_progress_start
-                + int(ai_progress_span * completed / total_ai)
-            )
-            pct = min(ai_progress_start + ai_progress_span, pct)
-            if final:
-                message = (
-                    f"Generating AI suggestions… {completed}/{total_ai} done (completed)"
+                else min(
+                    PROGRESS_AI_END,
+                    ai_progress_start
+                    + round(ai_progress_span * completed / total_ai),
                 )
+            )
+            if final:
+                done = min(completed, total_ai)
+                message = f"AI suggestions complete ({done} of {total_ai})"
             else:
                 eta_text = _format_eta(completed)
-                message = f"Generating AI suggestions… {completed}/{total_ai} done{eta_text}"
+                message = (
+                    f"Generating suggestions… {completed} of {total_ai} done"
+                    f"{eta_text}"
+                )
             _pupdate(pct, message)
 
         completed = 0
@@ -4716,8 +4720,40 @@ if df_original_key in st.session_state:
                                 progress = st.progress(0)
                                 st.session_state["_step2_last_progress_pct"] = 0
 
-                                def _pupdate(pct: int, msg: str) -> None:
-                                    target = max(0, min(int(pct), 100))
+                                PROGRESS_PREP_END = 5
+                                PROGRESS_AI_START = PROGRESS_PREP_END
+                                PROGRESS_AI_END = 65
+                                PROGRESS_RESOLVE_START = PROGRESS_AI_END
+                                PROGRESS_RESOLVE_END = 85
+                                PROGRESS_META_START = PROGRESS_RESOLVE_END
+                                PROGRESS_META_END = 95
+                                PROGRESS_FINAL_START = PROGRESS_META_END
+                                PROGRESS_FINAL_END = 100
+
+                                def _progress_in_range(
+                                    start: int, end: int, current: int, total: int
+                                ) -> int:
+                                    if end <= start:
+                                        return int(start)
+                                    total = max(total, 1)
+                                    ratio = max(
+                                        0.0, min(float(current) / float(total), 1.0)
+                                    )
+                                    value = start + round((end - start) * ratio)
+                                    return int(max(start, min(value, end)))
+
+                                def _progress_fraction(
+                                    start: int, end: int, fraction: float
+                                ) -> int:
+                                    if end <= start:
+                                        return int(start)
+                                    ratio = max(0.0, min(float(fraction), 1.0))
+                                    value = start + round((end - start) * ratio)
+                                    return int(max(start, min(value, end)))
+
+                                def _pupdate(pct: float, msg: str) -> None:
+                                    target = round(float(pct))
+                                    target = max(0, min(int(target), 100))
                                     prev = st.session_state.get(
                                         "_step2_last_progress_pct", 0
                                     )
@@ -4727,7 +4763,9 @@ if df_original_key in st.session_state:
                                     st.session_state["_step2_last_progress_pct"] = target
                                     status2.update(label=msg)
 
-                                _pupdate(5, "Collecting selected sets…")
+                                _pupdate(
+                                    PROGRESS_PREP_END, "Collecting selected sets…"
+                                )
                                 selected_set_ids: list[int] = []
                                 step2_state = _ensure_step2_state()
                                 step2_state.setdefault("staged", {})
@@ -4961,8 +4999,11 @@ if df_original_key in st.session_state:
                                             )
                                         resolved_map: dict[str, str] = {}
                                         effective_codes: list[str] = []
-                                        pct_resolve = 10 + int(
-                                            20 * i / max(total_sets, 1)
+                                        pct_resolve = _progress_in_range(
+                                            PROGRESS_RESOLVE_START,
+                                            PROGRESS_RESOLVE_END,
+                                            i,
+                                            total_sets,
                                         )
                                         _pupdate(
                                             pct_resolve,
@@ -4980,8 +5021,11 @@ if df_original_key in st.session_state:
                                                 if effective and effective not in seen_effective:
                                                     seen_effective.add(effective)
                                                     effective_codes.append(effective)
-                                        pct_meta = 30 + int(
-                                            10 * i / max(total_sets, 1)
+                                        pct_meta = _progress_in_range(
+                                            PROGRESS_META_START,
+                                            PROGRESS_META_END,
+                                            i,
+                                            total_sets,
                                         )
                                         _pupdate(
                                             pct_meta,
@@ -5200,8 +5244,11 @@ if df_original_key in st.session_state:
                                             )
                                         resolved_map: dict[str, str] = {}
                                         effective_codes: list[str] = []
-                                        pct_resolve = 10 + int(
-                                            20 * i / max(total_sets, 1)
+                                        pct_resolve = _progress_in_range(
+                                            PROGRESS_RESOLVE_START,
+                                            PROGRESS_RESOLVE_END,
+                                            i,
+                                            total_sets,
                                         )
                                         _pupdate(
                                             pct_resolve,
@@ -5219,8 +5266,11 @@ if df_original_key in st.session_state:
                                                 if effective and effective not in seen_effective:
                                                     seen_effective.add(effective)
                                                     effective_codes.append(effective)
-                                        pct_meta = 30 + int(
-                                            10 * i / max(total_sets, 1)
+                                        pct_meta = _progress_in_range(
+                                            PROGRESS_META_START,
+                                            PROGRESS_META_END,
+                                            i,
+                                            total_sets,
                                         )
                                         _pupdate(
                                             pct_meta,
@@ -5378,13 +5428,23 @@ if df_original_key in st.session_state:
                                         | set(step2_state["wide"].keys())
                                     )
 
-                                _pupdate(40, "Fetching metadata from Magento…")
+                                _pupdate(
+                                    PROGRESS_META_START,
+                                    "Fetching metadata from Magento…",
+                                )
 
                                 categories_meta = step2_state.get("categories_meta")
                                 if not isinstance(categories_meta, dict):
                                     categories_meta = {}
 
-                                _pupdate(45, "Preparing categories (full tree)…")
+                                _pupdate(
+                                    _progress_fraction(
+                                        PROGRESS_META_START,
+                                        PROGRESS_META_END,
+                                        0.2,
+                                    ),
+                                    "Preparing categories (full tree)…",
+                                )
 
                                 st.session_state["show_attrs"] = bool(
                                     step2_state["wide"]
@@ -5512,7 +5572,10 @@ if df_original_key in st.session_state:
                                     )
                                     normalized_rows = 0
                                     if total_rows == 0:
-                                        _pupdate(70, "Normalizing values…")
+                                        _pupdate(
+                                            PROGRESS_META_START,
+                                            "Normalizing values…",
+                                        )
                                     config_stage_logged = False
                                     render_counter = 0
                                     total_sets_render = len(selected_set_ids) or 1
@@ -5597,10 +5660,11 @@ if df_original_key in st.session_state:
                                                     or idx % 25 == 0
                                                     or normalized_rows == total_rows
                                                 ):
-                                                    pct = 45 + int(
-                                                        25
-                                                        * normalized_rows
-                                                        / max(total_rows, 1)
+                                                    pct = _progress_in_range(
+                                                        PROGRESS_META_START,
+                                                        PROGRESS_META_END,
+                                                        normalized_rows,
+                                                        total_rows,
                                                     )
                                                     _pupdate(
                                                         pct,
@@ -5623,7 +5687,14 @@ if df_original_key in st.session_state:
                                             )
 
                                         if not config_stage_logged:
-                                            _pupdate(75, "Composing column configs…")
+                                            _pupdate(
+                                                _progress_fraction(
+                                                    PROGRESS_META_START,
+                                                    PROGRESS_META_END,
+                                                    0.6,
+                                                ),
+                                                "Composing column configs…",
+                                            )
                                             config_stage_logged = True
 
                                         set_label = (
@@ -5665,10 +5736,14 @@ if df_original_key in st.session_state:
                                             "attribute_set_id"
                                         ):
                                             render_counter += 1
-                                            pct_render = 80 + int(
-                                                15
-                                                * render_counter
-                                                / max(total_sets_render, 1)
+                                            pct_render = _progress_in_range(
+                                                PROGRESS_FINAL_START,
+                                                PROGRESS_FINAL_END,
+                                                render_counter,
+                                                total_sets_render,
+                                            )
+                                            pct_render = min(
+                                                PROGRESS_FINAL_END - 1, pct_render
                                             )
                                             _pupdate(
                                                 pct_render,
