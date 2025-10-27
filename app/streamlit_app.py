@@ -9,13 +9,12 @@ from pathlib import Path
 import os
 import traceback
 from string import Template
-import time
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from collections import defaultdict, deque
+from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from urllib.parse import quote
 import re
@@ -2915,8 +2914,7 @@ def build_attributes_df(
         total_ai = len(ai_requests)
         ai_progress_start = PROGRESS_AI_START
         ai_progress_span = PROGRESS_AI_END - PROGRESS_AI_START
-        estimated_seconds_per_item = _estimate_seconds_per_item(ai_model_name)
-        duration_buffer: deque[float] = deque(maxlen=5)
+        estimated_seconds_per_item = 70.0  # fixed avg seconds per item for ETA
         ai_progress_value = float(ai_progress_start)
         ai_progress_delta = (
             float(ai_progress_span) / float(total_ai)
@@ -2926,33 +2924,41 @@ def build_attributes_df(
 
         def _format_eta_duration(seconds: float) -> str:
             seconds = max(float(seconds), 0.0)
-            if seconds >= 3600:
-                hours = int(seconds // 3600)
-                minutes = int((seconds % 3600) // 60)
-                return f"{hours}h {minutes}m"
-            if seconds >= 60:
-                minutes = int(seconds // 60)
-                seconds_rem = int(seconds % 60)
+            if seconds < 1:
+                return "<1s"
+
+            if seconds < 10:
+                rounded = math.ceil(seconds * 10.0) / 10.0
+                if math.isclose(rounded, round(rounded)):
+                    return f"{int(round(rounded))}s"
+                return f"{rounded:.1f}s"
+
+            total_seconds = math.ceil(seconds)
+            if total_seconds >= 3600:
+                hours = total_seconds // 3600
+                minutes = math.ceil((total_seconds % 3600) / 60)
+                if minutes == 60:
+                    hours += 1
+                    minutes = 0
+                if minutes > 0:
+                    return f"{hours}h {minutes}m"
+                return f"{hours}h"
+
+            if total_seconds >= 60:
+                minutes = total_seconds // 60
+                seconds_rem = total_seconds % 60
+                if seconds_rem == 0:
+                    return f"{minutes}m"
                 return f"{minutes}m {seconds_rem}s"
-            if seconds >= 10:
-                return f"{int(seconds)}s"
-            if seconds >= 1:
-                return f"{seconds:.1f}s"
-            return "<1s"
+
+            return f"{total_seconds}s"
 
         def _format_eta(completed: int) -> str:
             remaining = total_ai - completed
             if remaining <= 0:
                 return ""
-            eta_seconds: float | None = None
-            if completed <= 0:
-                eta_seconds = estimated_seconds_per_item * remaining
-            elif duration_buffer:
-                avg_duration = sum(duration_buffer) / len(duration_buffer)
-                eta_seconds = avg_duration * remaining
-            else:
-                eta_seconds = estimated_seconds_per_item * remaining
-            if not eta_seconds or eta_seconds <= 0:
+            eta_seconds = estimated_seconds_per_item * remaining
+            if eta_seconds <= 0:
                 return ""
             return f" (ETA ~{_format_eta_duration(eta_seconds)})"
 
@@ -3003,7 +3009,6 @@ def build_attributes_df(
             editor_codes,
             hints_payload,
         ) in ai_requests:
-            item_start = time.monotonic()
             try:
                 ai_df = infer_missing(
                     product_data,
@@ -3017,8 +3022,6 @@ def build_attributes_df(
                     model=ai_model_name,
                 )
             except Exception as exc:  # pragma: no cover - network error handling
-                duration = time.monotonic() - item_start
-                duration_buffer.append(duration)
                 raw_preview_source = (
                     getattr(exc, "raw_response", None)
                     or getattr(exc, "raw_response_retry", None)
@@ -3102,8 +3105,6 @@ def build_attributes_df(
             )
 
             if not isinstance(ai_df, pd.DataFrame) or ai_df.empty:
-                duration = time.monotonic() - item_start
-                duration_buffer.append(duration)
                 completed += 1
                 _update_ai_status(completed, final=completed >= total_ai)
                 continue
@@ -3123,8 +3124,6 @@ def build_attributes_df(
                     "reason": reason,
                 }
 
-            duration = time.monotonic() - item_start
-            duration_buffer.append(duration)
             completed += 1
             _update_ai_status(completed, final=completed >= total_ai)
 
