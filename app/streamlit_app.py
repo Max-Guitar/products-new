@@ -9,6 +9,7 @@ from pathlib import Path
 import os
 import traceback
 from string import Template
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -2882,125 +2883,187 @@ def build_attributes_df(
         disabled[set_id] = ["sku", "name", "attribute_code"]
 
     if ai_enabled and ai_requests:
-        with st.spinner("🤖 Generating AI suggestions…"):
-            for (
-                set_id,
-                sku_value,
-                product_data,
-                df_full,
-                editor_codes,
-                hints_payload,
-            ) in ai_requests:
-                try:
-                    ai_df = infer_missing(
-                        product_data,
-                        df_full,
-                        session,
-                        api_base,
-                        editor_codes,
-                        ai_api_key,
-                        conv=ai_conv,
-                        hints=hints_payload,
-                        model=ai_model_name,
-                    )
-                except Exception as exc:  # pragma: no cover - network error handling
-                    raw_preview_source = (
-                        getattr(exc, "raw_response", None)
-                        or getattr(exc, "raw_response_retry", None)
-                        or getattr(exc, "raw_response_sanitized", None)
-                        or ""
-                    )
-                    trace(
+        total_ai = len(ai_requests)
+        ai_progress_start = 5
+        ai_progress_span = 35
+
+        _pupdate(
+            ai_progress_start,
+            f"Generating AI suggestions… 0/{total_ai} done",
+        )
+
+        start_time = time.monotonic()
+
+        def _format_eta(completed: int) -> str:
+            remaining = total_ai - completed
+            if remaining <= 0 or completed <= 0:
+                return ""
+            elapsed = time.monotonic() - start_time
+            if elapsed <= 0:
+                return ""
+            avg = elapsed / completed
+            eta = avg * remaining
+            if eta >= 3600:
+                hours = int(eta // 3600)
+                minutes = int((eta % 3600) // 60)
+                return f" (~{hours}h {minutes}m left)"
+            if eta >= 60:
+                minutes = int(eta // 60)
+                seconds = int(eta % 60)
+                return f" (~{minutes}m {seconds}s left)"
+            if eta >= 10:
+                return f" (~{int(eta)}s left)"
+            if eta >= 1:
+                return f" (~{eta:.1f}s left)"
+            return " (<1s left)"
+
+        def _update_ai_status(completed: int, *, final: bool = False) -> None:
+            if total_ai <= 0:
+                return
+            pct = (
+                ai_progress_start + ai_progress_span
+                if final
+                else ai_progress_start
+                + int(ai_progress_span * completed / total_ai)
+            )
+            pct = min(ai_progress_start + ai_progress_span, pct)
+            if final:
+                message = (
+                    f"Generating AI suggestions… {completed}/{total_ai} done (completed)"
+                )
+            else:
+                eta_text = _format_eta(completed)
+                message = f"Generating AI suggestions… {completed}/{total_ai} done{eta_text}"
+            _pupdate(pct, message)
+
+        completed = 0
+
+        for (
+            set_id,
+            sku_value,
+            product_data,
+            df_full,
+            editor_codes,
+            hints_payload,
+        ) in ai_requests:
+            try:
+                ai_df = infer_missing(
+                    product_data,
+                    df_full,
+                    session,
+                    api_base,
+                    editor_codes,
+                    ai_api_key,
+                    conv=ai_conv,
+                    hints=hints_payload,
+                    model=ai_model_name,
+                )
+            except Exception as exc:  # pragma: no cover - network error handling
+                raw_preview_source = (
+                    getattr(exc, "raw_response", None)
+                    or getattr(exc, "raw_response_retry", None)
+                    or getattr(exc, "raw_response_sanitized", None)
+                    or ""
+                )
+                trace(
+                    {
+                        "where": "ai:json_error",
+                        "sku": sku_value,
+                        "err": str(exc),
+                        "raw_preview": str(raw_preview_source)[:400],
+                        "tb": traceback.format_exc()[-600:],
+                    }
+                )
+                if "json" in str(exc).lower():
+                    ai_log_data.setdefault("errors", []).append(
                         {
-                            "where": "ai:json_error",
                             "sku": sku_value,
-                            "err": str(exc),
-                            "raw_preview": str(raw_preview_source)[:400],
-                            "tb": traceback.format_exc()[-600:],
+                            "reason": "json-parse-failed",
+                            "model": ai_model_name,
                         }
                     )
-                    if "json" in str(exc).lower():
-                        ai_log_data.setdefault("errors", []).append(
-                            {
-                                "sku": sku_value,
-                                "reason": "json-parse-failed",
-                                "model": ai_model_name,
-                            }
-                        )
-                    error_message = f"AI suggestion failed for {sku_value}: {exc}"
-                    st.warning(error_message)
-                    ai_errors.append(error_message)
-                    continue
+                error_message = f"AI suggestion failed for {sku_value}: {exc}"
+                st.warning(error_message)
+                ai_errors.append(error_message)
+                completed += 1
+                _update_ai_status(completed, final=completed >= total_ai)
+                continue
 
-                if isinstance(ai_df, pd.DataFrame):
-                    preview_df = ai_df.head(50)
-                    if {"code", "value"} <= set(preview_df.columns):
-                        suggested_records = preview_df[["code", "value"]].to_dict(
-                            orient="records"
-                        )
-                    else:
-                        suggested_records = preview_df.to_dict(orient="records")
-                elif hasattr(ai_df, "to_dict"):
-                    try:
-                        suggested_records = list(ai_df.to_dict().items())
-                    except Exception:
-                        suggested_records = []
+            if isinstance(ai_df, pd.DataFrame):
+                preview_df = ai_df.head(50)
+                if {"code", "value"} <= set(preview_df.columns):
+                    suggested_records = preview_df[["code", "value"]].to_dict(
+                        orient="records"
+                    )
                 else:
+                    suggested_records = preview_df.to_dict(orient="records")
+            elif hasattr(ai_df, "to_dict"):
+                try:
+                    suggested_records = list(ai_df.to_dict().items())
+                except Exception:
                     suggested_records = []
-                trace(
-                    {
-                        "where": "ai:raw",
-                        "sku": sku_value,
-                        "set_id": set_id,
-                        "suggested": suggested_records,
-                    }
-                )
+            else:
+                suggested_records = []
+            trace(
+                {
+                    "where": "ai:raw",
+                    "sku": sku_value,
+                    "set_id": set_id,
+                    "suggested": suggested_records,
+                }
+            )
 
-                categories_meta_for_ai = step2_state.get("categories_meta")
-                if not isinstance(categories_meta_for_ai, Mapping):
-                    categories_meta_for_ai = {}
-                attribute_set_label = set_names.get(set_id, "")
-                ai_df = enrich_ai_suggestions(
-                    ai_df,
-                    hints_payload,
-                    categories_meta_for_ai,
-                    attribute_set_label,
-                    set_id,
-                )
+            categories_meta_for_ai = step2_state.get("categories_meta")
+            if not isinstance(categories_meta_for_ai, Mapping):
+                categories_meta_for_ai = {}
+            attribute_set_label = set_names.get(set_id, "")
+            ai_df = enrich_ai_suggestions(
+                ai_df,
+                hints_payload,
+                categories_meta_for_ai,
+                attribute_set_label,
+                set_id,
+            )
 
-                sku_key = str(sku_value)
-                per_sku = ai_results.setdefault(set_id, {}).setdefault(sku_key, {})
+            sku_key = str(sku_value)
+            per_sku = ai_results.setdefault(set_id, {}).setdefault(sku_key, {})
 
-                metadata = getattr(ai_df, "attrs", {}).get("meta") if hasattr(ai_df, "attrs") else None
-                if isinstance(metadata, dict) and metadata:
-                    per_sku["__meta__"] = metadata
+            metadata = getattr(ai_df, "attrs", {}).get("meta") if hasattr(ai_df, "attrs") else None
+            if isinstance(metadata, dict) and metadata:
+                per_sku["__meta__"] = metadata
 
-                trace(
-                    {
-                        "where": "ai:enriched",
-                        "sku": sku_value,
-                        "set_id": set_id,
-                        "keys": list(per_sku.keys()),
-                    }
-                )
+            trace(
+                {
+                    "where": "ai:enriched",
+                    "sku": sku_value,
+                    "set_id": set_id,
+                    "keys": list(per_sku.keys()),
+                }
+            )
 
-                if not isinstance(ai_df, pd.DataFrame) or ai_df.empty:
+            if not isinstance(ai_df, pd.DataFrame) or ai_df.empty:
+                completed += 1
+                _update_ai_status(completed, final=completed >= total_ai)
+                continue
+
+            for _, suggestion in ai_df.iterrows():
+                code = suggestion.get("code")
+                if not code:
                     continue
+                value = suggestion.get("value")
+                if value is None:
+                    continue
+                if isinstance(value, str) and not value.strip():
+                    continue
+                reason = suggestion.get("reason")
+                per_sku[str(code)] = {
+                    "value": value,
+                    "reason": reason,
+                }
 
-                for _, suggestion in ai_df.iterrows():
-                    code = suggestion.get("code")
-                    if not code:
-                        continue
-                    value = suggestion.get("value")
-                    if value is None:
-                        continue
-                    if isinstance(value, str) and not value.strip():
-                        continue
-                    reason = suggestion.get("reason")
-                    per_sku[str(code)] = {
-                        "value": value,
-                        "reason": reason,
-                    }
+            completed += 1
+            _update_ai_status(completed, final=completed >= total_ai)
+
 
     return (
         dfs,
@@ -4651,10 +4714,17 @@ if df_original_key in st.session_state:
                                     "Building attribute editor…", expanded=True
                                 )
                                 progress = st.progress(0)
+                                st.session_state["_step2_last_progress_pct"] = 0
 
                                 def _pupdate(pct: int, msg: str) -> None:
-                                    clamped = max(0, min(int(pct), 100))
-                                    progress.progress(clamped)
+                                    target = max(0, min(int(pct), 100))
+                                    prev = st.session_state.get(
+                                        "_step2_last_progress_pct", 0
+                                    )
+                                    if target < prev:
+                                        target = prev
+                                    progress.progress(target)
+                                    st.session_state["_step2_last_progress_pct"] = target
                                     status2.update(label=msg)
 
                                 _pupdate(5, "Collecting selected sets…")
