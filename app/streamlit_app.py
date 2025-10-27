@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Iterable, Mapping, Sequence
 from urllib.parse import quote
 import re
@@ -2916,7 +2916,7 @@ def build_attributes_df(
         ai_progress_start = PROGRESS_AI_START
         ai_progress_span = PROGRESS_AI_END - PROGRESS_AI_START
         estimated_seconds_per_item = _estimate_seconds_per_item(ai_model_name)
-        start_time = time.monotonic()
+        duration_buffer: deque[float] = deque(maxlen=5)
         ai_progress_value = float(ai_progress_start)
         ai_progress_delta = (
             float(ai_progress_span) / float(total_ai)
@@ -2947,13 +2947,11 @@ def build_attributes_df(
             eta_seconds: float | None = None
             if completed <= 0:
                 eta_seconds = estimated_seconds_per_item * remaining
+            elif duration_buffer:
+                avg_duration = sum(duration_buffer) / len(duration_buffer)
+                eta_seconds = avg_duration * remaining
             else:
-                elapsed = time.monotonic() - start_time
-                if elapsed > 0:
-                    avg = elapsed / completed
-                    eta_seconds = avg * remaining
-                else:
-                    eta_seconds = estimated_seconds_per_item * remaining
+                eta_seconds = estimated_seconds_per_item * remaining
             if not eta_seconds or eta_seconds <= 0:
                 return ""
             return f" (ETA ~{_format_eta_duration(eta_seconds)})"
@@ -3005,6 +3003,7 @@ def build_attributes_df(
             editor_codes,
             hints_payload,
         ) in ai_requests:
+            item_start = time.monotonic()
             try:
                 ai_df = infer_missing(
                     product_data,
@@ -3018,6 +3017,8 @@ def build_attributes_df(
                     model=ai_model_name,
                 )
             except Exception as exc:  # pragma: no cover - network error handling
+                duration = time.monotonic() - item_start
+                duration_buffer.append(duration)
                 raw_preview_source = (
                     getattr(exc, "raw_response", None)
                     or getattr(exc, "raw_response_retry", None)
@@ -3101,6 +3102,8 @@ def build_attributes_df(
             )
 
             if not isinstance(ai_df, pd.DataFrame) or ai_df.empty:
+                duration = time.monotonic() - item_start
+                duration_buffer.append(duration)
                 completed += 1
                 _update_ai_status(completed, final=completed >= total_ai)
                 continue
@@ -3120,6 +3123,8 @@ def build_attributes_df(
                     "reason": reason,
                 }
 
+            duration = time.monotonic() - item_start
+            duration_buffer.append(duration)
             completed += 1
             _update_ai_status(completed, final=completed >= total_ai)
 
