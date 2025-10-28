@@ -24,6 +24,9 @@ import requests
 import pandas as pd
 import streamlit as st
 
+st.session_state.setdefault("allow_ai_overwrite_text", False)
+st.session_state.setdefault("ai_rerun_requested", False)
+
 st.set_page_config(
     page_title="🤖 Peter v.1.0 (AI Content Manager)",
     page_icon="🤖",
@@ -5330,10 +5333,7 @@ if df_original_key in st.session_state:
                                     completed = True
                                 elif st.session_state.get("show_attrs"):
                                     ctrl_col1, ctrl_col2 = st.columns([1, 1])
-                                    rerun_clicked = ctrl_col1.button(
-                                        "🔁 Re-run AI for visible rows",
-                                        key="btn_step2_rerun_ai",
-                                    )
+                                    ctrl_col1.empty()
                                     ctrl_col2.checkbox(
                                         "🚩 Разрешить перезапись непустых текстовых атрибутов ИИ",
                                         value=bool(
@@ -5341,7 +5341,8 @@ if df_original_key in st.session_state:
                                         ),
                                         key="ai_force_text_override",
                                     )
-                                    if rerun_clicked:
+                                    if st.session_state.get("ai_rerun_requested", False):
+                                        st.session_state["ai_rerun_requested"] = False
                                         suggestions_map = (
                                             step2_state.get("ai_suggestions") or {}
                                         )
