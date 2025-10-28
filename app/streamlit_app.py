@@ -25,7 +25,8 @@ import pandas as pd
 import streamlit as st
 
 st.session_state.setdefault("allow_ai_overwrite_text", False)
-st.session_state.setdefault("ai_rerun_requested", False)
+st.session_state.setdefault("ai_force_text_override", False)
+st.session_state.setdefault("ai_rerun_requested", False)  # оставляем на случай логики флага
 
 st.set_page_config(
     page_title="🤖 Peter v.1.0 (AI Content Manager)",
@@ -47,9 +48,10 @@ def trace(event: dict):
     except Exception:
         pass
 
-
-with st.expander("🧪 Debug trace", expanded=False):
-    st.json(st.session_state["_trace_events"][-500:])  # последние 500 событий
+# Рисуем Debug trace ТОЛЬКО когда мы не в шаге 2
+if not st.session_state.get("show_attributes_trigger", False):
+    with st.expander("🧪 Debug trace", expanded=False):
+        st.json(st.session_state["_trace_events"][-500:])  # последние 500 событий
 
 from connectors.magento.attributes import AttributeMetaCache
 from connectors.magento.categories import ensure_categories_meta
@@ -5332,15 +5334,6 @@ if df_original_key in st.session_state:
                                     )
                                     completed = True
                                 elif st.session_state.get("show_attrs"):
-                                    ctrl_col1, ctrl_col2 = st.columns([1, 1])
-                                    ctrl_col1.empty()
-                                    ctrl_col2.checkbox(
-                                        "🚩 Разрешить перезапись непустых текстовых атрибутов ИИ",
-                                        value=bool(
-                                            st.session_state.get("ai_force_text_override", False)
-                                        ),
-                                        key="ai_force_text_override",
-                                    )
                                     if st.session_state.get("ai_rerun_requested", False):
                                         st.session_state["ai_rerun_requested"] = False
                                         suggestions_map = (
