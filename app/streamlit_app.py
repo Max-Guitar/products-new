@@ -16,17 +16,24 @@ if str(ROOT) not in sys.path:
 
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from urllib.parse import quote
 import re
 
 import requests
+import openai
 
 import pandas as pd
 import streamlit as st
+import random
 
 st.session_state.setdefault("allow_ai_overwrite_text", False)
 st.session_state.setdefault("ai_force_text_override", False)
 st.session_state.setdefault("ai_rerun_requested", False)  # оставляем на случай логики флага
+st.session_state.setdefault("step3_active", False)
+st.session_state.setdefault("descriptions", {})
+st.session_state.setdefault("step3", {})
+st.session_state.setdefault("step3_generation_pending", False)
 
 header_ph = st.session_state.setdefault("_header_ph", st.empty())
 if not st.session_state.get("_header_rendered", False):
@@ -762,6 +769,992 @@ def _ensure_step2_state() -> dict:
     state.setdefault("ai_errors", [])
     state.setdefault("ai_logs", {})
     return state
+
+
+@dataclass
+class Step3Product:
+    sku: str
+    name: str
+    attribute_set_id: int | None
+    attribute_set_name: str
+    generate: bool
+    short_description: str
+    attributes: dict[str, object]
+
+
+ACOUSTIC_SET_NAMES = {"acoustic guitar"}
+ELECTRIC_SET_NAMES = {"electric guitar"}
+BASS_SET_NAMES = {"bass guitar"}
+AMP_SET_NAMES = {"amps", "amp"}
+EFFECT_SET_NAMES = {"effects", "effect"}
+ACCESSORY_SET_NAMES = {"accessories", "default"}
+
+BRAND_ACCENTS: dict[str, str] = {
+    "martin": (
+        "Highlight Martin's pre-war heritage, meticulous hand-scalloped bracing, "
+        "and the warm projection that makes these acoustics stage-ready."
+    ),
+    "taylor": (
+        "Reference Taylor's precision bolt-on NT neck, ultra-consistent build quality, "
+        "and the articulate, modern voice that records beautifully."
+    ),
+    "gibson": (
+        "Mention Gibson's round-shoulder legacy, scalloped X-bracing, and the rich "
+        "midrange that supports vocalists in Americana and rock."
+    ),
+    "guild": (
+        "Talk about Guild's arched-back projection, robust mahogany builds, and their "
+        "folk scene credentials from the '60s onward."
+    ),
+    "fender": (
+        "Note Fender's fast-playing necks, stage-ready electronics, and the balance "
+        "between sparkle and warmth players expect from the brand."
+    ),
+}
+
+ACOUSTIC_BODY_KEYWORDS = {
+    "dreadnought": "Dreadnought",
+    "om": "OM/000",
+    "000": "OM/000",
+    "ooo": "OM/000",
+    "grand auditorium": "Grand Auditorium",
+    "jumbo": "Jumbo",
+    "parlor": "Parlor",
+    "parlour": "Parlor",
+    "concert": "Concert",
+    "orchestra": "OM/000",
+}
+
+BASS_INTROS = [
+    "A modern take on a classic electric bass guitar, the {name} is ready for the groove.",
+    "Plug in the {name} and you immediately feel how effortlessly it fills the low end.",
+    "The {name} delivers boutique-level bass tones with roadworthy reliability.",
+]
+
+BASS_OUTROS = [
+    "Plug in, set your tone, and let the music happen—this bass is ready.",
+    "Every {brand} bass is inspected and set up by Max Guitar’s luthiers before it ships.",
+    "From the first rehearsal to the biggest stage, this bass leaves our workshop tour-ready.",
+]
+
+BASS_ANGLES = [
+    "Angle: Focus on how the woods and construction influence the fundamental punch and sustain.",
+    "Angle: Emphasize pickup configuration, onboard electronics, and how they sit in a dense mix.",
+    "Angle: Highlight ergonomics—neck profile, balance on a strap, and long-session comfort.",
+    "Angle: Discuss dynamic response for fingerstyle, pick, and slap techniques.",
+]
+
+AMP_INTROS = [
+    "The {name} amplifier was engineered to translate every nuance of your playing to the crowd.",
+    "Dial in the {name} and discover how responsive a great guitar amp can be.",
+    "Designed for discerning players, the {name} gives you stage power with studio refinement.",
+]
+
+AMP_OUTROS = [
+    "Our amp technicians bias, noise-test, and approve each unit—it's ready for the next gig.",
+    "Every amplifier is inspected, tuned, and signed off by the Max Guitar workshop team.",
+    "Bench-tested by our specialists, this amp leaves the shop fully dialed-in and reliable.",
+]
+
+AMP_ANGLES = [
+    "Angle: Explain how the amp handles pedals, FX loops, and channel switching on stage.",
+    "Angle: Focus on speaker configuration, cabinet design, and how it projects in different venues.",
+    "Angle: Highlight tube vs. solid-state topology, feel under the fingers, and dynamic response.",
+]
+
+EFFECTS_INTROS = [
+    "Stomp on the {name} and the character of your tone changes instantly.",
+    "The {name} guitar effects pedal captures the signature sound players chase on countless records.",
+    "Built for creative guitarists, the {name} turns any board into a tone laboratory.",
+]
+
+EFFECTS_OUTROS = [
+    "Each pedal is tested for footswitch reliability and low-noise performance before shipping.",
+    "Our electronics specialist checks power, switching, and audio path so your effect arrives gig-ready.",
+    "We verify bypass integrity, control taper, and noise floor—this effect is ready for the stage.",
+]
+
+EFFECTS_ANGLES = [
+    "Angle: Detail the circuit architecture, analog vs. digital design, and how controls reshape tone.",
+    "Angle: Describe famous rigs or genres where this effect shines, from ambient washes to tight riffs.",
+    "Angle: Focus on pedalboard practicality—power options, enclosure toughness, and switching behavior.",
+]
+
+ACCESSORY_INTROS = [
+    "The {name} is a guitar accessory designed to make daily playing smoother.",
+    "Elevate your rig with the {name}, a purpose-built guitar accessory from Max Guitar.",
+]
+
+ACCESSORY_OUTROS = [
+    "Inspected by our team for authenticity and quality, it ships ready to support your next session.",
+    "Every accessory leaving Max Guitar is checked for durability and real-world usability.",
+]
+
+TRANSLATION_MODEL = "gpt-4.1-mini"
+TRANSLATION_MODEL_FALLBACK = OPENAI_MODEL_ALIASES.get("4-mini") or "gpt-4o-mini"
+ACOUSTIC_EN_MODEL = OPENAI_MODEL_ALIASES.get("5") or "gpt-5"
+ELECTRIC_EN_MODEL = OPENAI_MODEL_ALIASES.get("5") or "gpt-5"
+BASS_MODEL = OPENAI_MODEL_ALIASES.get("5") or "gpt-5"
+AMP_MODEL = OPENAI_MODEL_ALIASES.get("5") or "gpt-5"
+EFFECT_MODEL = OPENAI_MODEL_ALIASES.get("5") or "gpt-5"
+ACCESSORY_MODEL = OPENAI_MODEL_ALIASES.get("5-mini") or DEFAULT_OPENAI_MODEL
+
+
+def _commit_step2_staged(step2_state: dict | None) -> None:
+    if not isinstance(step2_state, dict):
+        return
+
+    staged_map = (step2_state.get("staged") or {}).copy()
+    if not staged_map:
+        return
+
+    for set_id, draft in staged_map.items():
+        if not isinstance(draft, pd.DataFrame):
+            continue
+        draft_wide = draft.copy(deep=True)
+        step2_state.setdefault("wide", {})[set_id] = draft_wide
+        step2_state.setdefault("wide_orig", {})[set_id] = draft_wide.copy(deep=True)
+        existing_long = (step2_state.get("dfs") or {}).get(set_id)
+        updated_long = apply_wide_edits_to_long(existing_long, draft_wide)
+        if isinstance(updated_long, pd.DataFrame):
+            if "value" in updated_long.columns:
+                updated_long["value"] = updated_long["value"].astype(object)
+            step2_state.setdefault("dfs", {})[set_id] = updated_long
+            step2_state.setdefault("original", {})[set_id] = updated_long.copy(deep=True)
+        else:
+            step2_state.setdefault("dfs", {})[set_id] = draft_wide.copy(deep=True)
+            step2_state.setdefault("original", {})[set_id] = draft_wide.copy(deep=True)
+    step2_state.setdefault("staged", {}).clear()
+
+
+def _normalize_text(value: object) -> str:
+    if isinstance(value, float) and pd.isna(value):
+        return ""
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _clean_description_value(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    return _normalize_text(value)
+
+
+def _coerce_bool(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    if isinstance(value, (int, float)):
+        try:
+            return bool(int(value))
+        except (TypeError, ValueError):
+            return bool(value)
+    return bool(value)
+
+
+def _extract_video_embed(text: object) -> tuple[str, str]:
+    raw = _normalize_text(text)
+    if not raw:
+        return "", ""
+
+    iframe_with_wrapper = re.compile(
+        r"(<(?:div|figure)[^>]*>.*?<iframe.*?</iframe>.*?</(?:div|figure)>)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    iframe_only = re.compile(r"(<iframe.*?</iframe>)", re.IGNORECASE | re.DOTALL)
+
+    match = iframe_with_wrapper.search(raw)
+    if not match:
+        match = iframe_only.search(raw)
+
+    if not match:
+        return "", raw
+
+    embed = match.group(1).strip()
+    remainder = (raw[: match.start()] + raw[match.end() :]).strip()
+    return embed, remainder
+
+
+def _restore_embed(embed: str, body: str) -> str:
+    body_clean = body.strip()
+    if not embed:
+        return body_clean
+    if not body_clean:
+        return embed
+    return f"{embed}\n{body_clean}"
+
+
+def _detect_body_shape(name: str, attributes: Mapping[str, object]) -> str | None:
+    combined = " ".join(
+        part
+        for part in [name, _normalize_text(attributes.get("acoustic_body_shape"))]
+        if part
+    ).lower()
+    for keyword, label in ACOUSTIC_BODY_KEYWORDS.items():
+        if keyword in combined:
+            return label
+    return None
+
+
+def _resolve_brand_accent(brand_value: object, name: str) -> str | None:
+    brand = _normalize_text(brand_value) or _normalize_text(name.split()[0] if name else "")
+    lowered = brand.lower()
+    if lowered in BRAND_ACCENTS:
+        return BRAND_ACCENTS[lowered]
+    for key, accent in BRAND_ACCENTS.items():
+        if key in lowered:
+            return accent
+    return None
+
+
+def _format_attribute_summary(attributes: Mapping[str, object]) -> str:
+    if not isinstance(attributes, Mapping):
+        return ""
+    lines: list[str] = []
+    for key, value in attributes.items():
+        if key in {"sku", "name", "short_description", GENERATE_DESCRIPTION_COLUMN}:
+            continue
+        normalized = _normalize_text(value)
+        if not normalized:
+            continue
+        lines.append(f"- {key}: {normalized}")
+    return "\n".join(lines)
+
+
+def _openai_client_kwargs() -> dict[str, object]:
+    api_key = st.session_state.get("ai_api_key") or os.getenv("OPENAI_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("OpenAI API key is not configured.")
+    base_override = (
+        st.session_state.get("openai_api_base")
+        or os.getenv("OPENAI_API_BASE", "").strip()
+    )
+    kwargs: dict[str, object] = {"api_key": api_key}
+    if base_override:
+        kwargs["base_url"] = base_override.rstrip("/")
+    return kwargs
+
+
+def _call_openai_text(
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    temperature: float = 0.7,
+    max_tokens: int = 1100,
+    response_format: dict[str, object] | None = None,
+    timeout: int = 120,
+) -> str:
+    client_kwargs = _openai_client_kwargs()
+    try:
+        client = openai.OpenAI(**client_kwargs)
+    except Exception as exc:  # pragma: no cover - network client init
+        raise RuntimeError(f"OpenAI client init failed: {exc}") from exc
+
+    resolved_model = resolve_model_name(model, default=model)
+    messages: list[dict[str, str]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": user_prompt})
+
+    kwargs: dict[str, object] = {
+        "model": resolved_model,
+        "messages": messages,
+        "timeout": timeout,
+    }
+    if response_format:
+        kwargs["response_format"] = response_format
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+    if max_tokens:
+        kwargs["max_completion_tokens"] = max_tokens
+
+    trace(
+        {
+            "where": "step3:openai_call",
+            "model": resolved_model,
+            "temperature": temperature,
+            "keys": sorted(kwargs.keys()),
+        }
+    )
+
+    try:
+        chat = client.chat.completions.create(**kwargs)
+    except Exception as exc:  # pragma: no cover - API failure handling
+        stripped_kwargs = dict(kwargs)
+        for key in ("temperature", "response_format", "max_completion_tokens"):
+            stripped_kwargs.pop(key, None)
+        if stripped_kwargs != kwargs:
+            trace(
+                {
+                    "where": "step3:openai_retry",
+                    "model": resolved_model,
+                    "reason": str(exc)[:200],
+                }
+            )
+            try:
+                chat = client.chat.completions.create(**stripped_kwargs)
+            except Exception as retry_exc:  # pragma: no cover - API failure handling
+                raise RuntimeError(f"OpenAI request failed: {retry_exc}") from retry_exc
+        else:
+            raise RuntimeError(f"OpenAI request failed: {exc}") from exc
+
+    try:
+        content = chat.choices[0].message.content or ""
+    except (AttributeError, IndexError, TypeError) as exc:  # pragma: no cover - response guard
+        raise RuntimeError("OpenAI response missing content") from exc
+
+    return content.strip()
+
+
+def _call_openai_json(
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    temperature: float = 0.4,
+    timeout: int = 120,
+) -> dict[str, object]:
+    raw = _call_openai_text(
+        model,
+        system_prompt,
+        user_prompt,
+        temperature=temperature,
+        timeout=timeout,
+        response_format={"type": "json_object"},
+    )
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Failed to parse JSON from model: {exc}") from exc
+
+
+def _choose_random(texts: Sequence[str], fallback: str = "") -> str:
+    candidates = [t for t in texts if isinstance(t, str) and t.strip()]
+    if not candidates:
+        return fallback
+    return random.choice(candidates)
+
+
+def _translate_description(english_text: str) -> tuple[str, str]:
+    if not english_text:
+        return "", ""
+    model = TRANSLATION_MODEL
+    try:
+        payload = _call_openai_json(
+            model,
+            "You translate professional musical instrument copy. Return strict JSON.",
+            (
+                "Translate the following English guitar product description into "
+                "Dutch (nl) and German (de). Use natural marketing language and keep "
+                "line breaks.\n\n"
+                f"TEXT:\n{english_text.strip()}"
+            ),
+            temperature=0.2,
+        )
+    except Exception as exc:
+        trace(
+            {
+                "where": "step3:translate_error",
+                "err": str(exc)[:200],
+            }
+        )
+        if TRANSLATION_MODEL_FALLBACK and TRANSLATION_MODEL_FALLBACK != model:
+            payload = _call_openai_json(
+                TRANSLATION_MODEL_FALLBACK,
+                "You translate professional musical instrument copy. Return strict JSON.",
+                (
+                    "Translate the following English guitar product description into "
+                    "Dutch (nl) and German (de). Use natural marketing language and keep "
+                    "line breaks.\n\n"
+                    f"TEXT:\n{english_text.strip()}"
+                ),
+                temperature=0.2,
+            )
+        else:
+            raise
+
+    nl = _normalize_text(payload.get("nl"))
+    de = _normalize_text(payload.get("de"))
+    return nl, de
+
+
+def _categorize_product(product: Step3Product) -> str:
+    name_norm = _normalize_text(product.attribute_set_name).lower()
+
+    def _matches(candidates: set[str]) -> bool:
+        for candidate in candidates:
+            if candidate and candidate in name_norm:
+                return True
+        return False
+
+    if _matches(ACOUSTIC_SET_NAMES):
+        return "acoustic"
+    if _matches(ELECTRIC_SET_NAMES):
+        return "electric"
+    if _matches(BASS_SET_NAMES):
+        return "bass"
+    if _matches(AMP_SET_NAMES):
+        return "amp"
+    if _matches(EFFECT_SET_NAMES):
+        return "effect"
+    if _matches(ACCESSORY_SET_NAMES):
+        return "accessory"
+
+    try:
+        attr_set_id = int(product.attribute_set_id) if product.attribute_set_id is not None else None
+    except (TypeError, ValueError):
+        attr_set_id = None
+    if attr_set_id is not None and attr_set_id in ELECTRIC_SET_IDS:
+        return "electric"
+    return "accessory"
+
+
+def _generate_acoustic_copy(product: Step3Product) -> tuple[str, str, str]:
+    embed, existing_body = _extract_video_embed(product.short_description)
+    attr_summary = _format_attribute_summary(product.attributes)
+    hint = _normalize_text(product.attributes.get("hint"))
+    brand = product.attributes.get("brand")
+    brand_accent = _resolve_brand_accent(brand, product.name)
+    body_shape = _detect_body_shape(product.name, product.attributes)
+
+    user_lines = [
+        f"SKU: {product.sku}",
+        f"Model name: {product.name}",
+    ]
+    set_name_clean = _normalize_text(product.attribute_set_name)
+    if set_name_clean:
+        user_lines.append(f"Attribute set: {set_name_clean}")
+    if _normalize_text(brand):
+        user_lines.append(f"Brand: {_normalize_text(brand)}")
+    if body_shape:
+        user_lines.append(f"Body shape hint: {body_shape}")
+    if brand_accent:
+        user_lines.append(f"Brand accent to reflect: {brand_accent}")
+    if hint:
+        user_lines.append(f"Merchandising hint: {hint}")
+    if existing_body:
+        user_lines.append(
+            "Existing short description (use as factual input, rewrite completely):"
+        )
+        user_lines.append(existing_body)
+    if attr_summary:
+        user_lines.append("Useful attributes:\n" + attr_summary)
+
+    user_lines.append(
+        "Write a professional 3-4 paragraph HTML short description (250-400 words). "
+        "Use <p> tags, mention tonewoods, top/back/sides, bracing pattern, neck profile, scale, "
+        "electronics if present, and performance context. Close with the exact sentence "
+        "'Every guitar is inspected and set up by the Max Guitar luthier team.'"
+    )
+
+    system_prompt = (
+        "You are a copywriter for premium acoustic guitars. Use SEO-friendly, musical language, "
+        "stay factual, and avoid inventing specs not provided."
+    )
+
+    english_body = _call_openai_text(
+        ACOUSTIC_EN_MODEL,
+        system_prompt,
+        "\n".join(user_lines),
+        temperature=0.65,
+    )
+
+    nl, de = _translate_description(english_body)
+    final_en = _restore_embed(embed, english_body)
+    return final_en, nl, de
+
+
+def _generate_electric_copy(product: Step3Product) -> tuple[str, str, str]:
+    embed, existing_body = _extract_video_embed(product.short_description)
+    attr_summary = _format_attribute_summary(product.attributes)
+    hint = _normalize_text(product.attributes.get("hint"))
+    brand = _normalize_text(product.attributes.get("brand"))
+
+    user_lines = [
+        f"SKU: {product.sku}",
+        f"Model name: {product.name}",
+    ]
+    if brand:
+        user_lines.append(f"Brand: {brand}")
+    set_name_clean = _normalize_text(product.attribute_set_name)
+    if set_name_clean:
+        user_lines.append(f"Attribute set: {set_name_clean}")
+    if hint:
+        user_lines.append(f"Merchandising hint: {hint}")
+    if existing_body:
+        user_lines.append("Existing short description (reference only, rewrite):")
+        user_lines.append(existing_body)
+    if attr_summary:
+        user_lines.append("Relevant attributes:\n" + attr_summary)
+
+    user_lines.append(
+        "Produce a 250-400 word English HTML description (<p> tags) that naturally uses the phrase "
+        "'electric guitar'. Cover body and neck materials, construction (bolt-on/set), pickup types, "
+        "controls, tonal range (clean to driven), playability (neck profile, radius), and stage/studio use. "
+        "End with 'Every guitar is inspected and set up by the Max Guitar luthier team.'"
+    )
+
+    system_prompt = (
+        "You create SEO-oriented copy for electric guitars. Stay factual, vivid, and musician-focused."
+    )
+
+    english_body = _call_openai_text(
+        ELECTRIC_EN_MODEL,
+        system_prompt,
+        "\n".join(user_lines),
+        temperature=0.7,
+    )
+
+    nl, de = _translate_description(english_body)
+    final_en = _restore_embed(embed, english_body)
+    return final_en, nl, de
+
+
+def _generate_accessory_copy(product: Step3Product) -> tuple[str, str, str]:
+    embed, existing_body = _extract_video_embed(product.short_description)
+    attr_summary = _format_attribute_summary(product.attributes)
+    hint = _normalize_text(product.attributes.get("hint"))
+    brand = _normalize_text(product.attributes.get("brand"))
+
+    intro = _choose_random(ACCESSORY_INTROS, fallback=f"The {product.name} is a guitar accessory built for daily use.")
+    outro = _choose_random(ACCESSORY_OUTROS, fallback="Checked by Max Guitar staff before it leaves the shop.")
+
+    user_lines = [
+        f"SKU: {product.sku}",
+        f"Product name: {product.name}",
+        f"Intro sentence to echo: {intro}",
+        f"Closing sentence to include: {outro}",
+    ]
+    if brand:
+        user_lines.append(f"Brand: {brand}")
+    if hint:
+        user_lines.append(f"Usage hint: {hint}")
+    if existing_body:
+        user_lines.append("Existing description snippet (for facts only):")
+        user_lines.append(existing_body)
+    if attr_summary:
+        user_lines.append("Attributes:\n" + attr_summary)
+
+    user_lines.append(
+        "Write a persuasive 2-3 paragraph HTML (<p>) description, about 150-250 words, mentioning how the accessory "
+        "supports guitarists (protection, convenience, tone, etc.). Use 'guitar accessory' and the accessory type in context."
+    )
+
+    system_prompt = (
+        "You write marketing copy for guitar accessories. Keep tone premium yet practical, remain factual, and avoid hype."
+    )
+
+    english_body = _call_openai_text(
+        ACCESSORY_MODEL,
+        system_prompt,
+        "\n".join(user_lines),
+        temperature=0.6,
+        max_tokens=800,
+    )
+
+    nl, de = _translate_description(english_body)
+    final_en = _restore_embed(embed, english_body)
+    return final_en, nl, de
+
+
+def _generate_bass_copy(product: Step3Product) -> tuple[str, str, str]:
+    embed, existing_body = _extract_video_embed(product.short_description)
+    attr_summary = _format_attribute_summary(product.attributes)
+    hint = _normalize_text(product.attributes.get("hint"))
+    brand = _normalize_text(product.attributes.get("brand")) or product.name
+    intro_template = _choose_random(BASS_INTROS)
+    outro_template = _choose_random(BASS_OUTROS)
+    angle = _choose_random(BASS_ANGLES)
+
+    user_lines = [
+        f"SKU: {product.sku}",
+        f"Bass name: {product.name}",
+        f"Intro to echo: {intro_template.format(name=product.name)}",
+        f"Outro to include: {outro_template.format(brand=brand, name=product.name)}",
+        angle,
+    ]
+    if hint:
+        user_lines.append(f"Retailer hint: {hint}")
+    if existing_body:
+        user_lines.append("Existing text (reference only):")
+        user_lines.append(existing_body)
+    if attr_summary:
+        user_lines.append("Attributes:\n" + attr_summary)
+
+    user_lines.append(
+        "Return JSON with keys en, nl, de. The 'en' value must be 3-4 HTML paragraphs (<p>) "
+        "totalling around 220-320 words. Describe tonewoods, neck feel, pickup configuration, onboard electronics, "
+        "and playing techniques (fingerstyle, pick, slap). The 'nl' and 'de' values should be faithful translations."
+    )
+
+    system_prompt = (
+        "You write marketing copy for electric bass guitars. Use musical vocabulary and stay factual."
+    )
+
+    payload = _call_openai_json(
+        BASS_MODEL,
+        system_prompt,
+        "\n".join(user_lines),
+        temperature=0.6,
+    )
+
+    en_body = _clean_description_value(payload.get("en"))
+    nl_body = _clean_description_value(payload.get("nl"))
+    de_body = _clean_description_value(payload.get("de"))
+    if not en_body:
+        raise RuntimeError("Bass description empty")
+    final_en = _restore_embed(embed, en_body)
+    return final_en, nl_body, de_body
+
+
+def _generate_amp_copy(product: Step3Product) -> tuple[str, str, str]:
+    embed, existing_body = _extract_video_embed(product.short_description)
+    attr_summary = _format_attribute_summary(product.attributes)
+    hint = _normalize_text(product.attributes.get("hint"))
+    intro_template = _choose_random(AMP_INTROS)
+    outro = _choose_random(AMP_OUTROS)
+    angle = _choose_random(AMP_ANGLES)
+
+    user_lines = [
+        f"SKU: {product.sku}",
+        f"Amplifier name: {product.name}",
+        f"Intro to reflect: {intro_template.format(name=product.name)}",
+        f"Outro to include: {outro}",
+        angle,
+    ]
+    if hint:
+        user_lines.append(f"Retailer hint: {hint}")
+    if existing_body:
+        user_lines.append("Existing description (reference only):")
+        user_lines.append(existing_body)
+    if attr_summary:
+        user_lines.append("Attributes:\n" + attr_summary)
+
+    user_lines.append(
+        "Return JSON with keys en, nl, de. The English text should be 3-4 HTML paragraphs (<p>) "
+        "around 220-320 words covering amplifier format (combo/head/cab), power (watts), speaker configuration, "
+        "tube vs. solid-state topology, channel/effects details, and pedalboard friendliness. Ensure the final "
+        "sentence confirms technician inspection as provided. Provide accurate NL and DE translations."
+    )
+
+    system_prompt = "You craft technical yet musical marketing copy for guitar amplifiers."
+
+    payload = _call_openai_json(
+        AMP_MODEL,
+        system_prompt,
+        "\n".join(user_lines),
+        temperature=0.6,
+    )
+
+    en_body = _clean_description_value(payload.get("en"))
+    nl_body = _clean_description_value(payload.get("nl"))
+    de_body = _clean_description_value(payload.get("de"))
+    if not en_body:
+        raise RuntimeError("Amp description empty")
+    final_en = _restore_embed(embed, en_body)
+    return final_en, nl_body, de_body
+
+
+def _generate_effect_copy(product: Step3Product) -> tuple[str, str, str]:
+    embed, existing_body = _extract_video_embed(product.short_description)
+    attr_summary = _format_attribute_summary(product.attributes)
+    hint = _normalize_text(product.attributes.get("hint"))
+    intro_template = _choose_random(EFFECTS_INTROS)
+    outro = _choose_random(EFFECTS_OUTROS)
+    angle = _choose_random(EFFECTS_ANGLES)
+    effect_type = _normalize_text(product.attributes.get("effect_type"))
+
+    user_lines = [
+        f"SKU: {product.sku}",
+        f"Effect name: {product.name}",
+        f"Intro to reflect: {intro_template.format(name=product.name)}",
+        f"Outro to include: {outro}",
+        angle,
+    ]
+    if effect_type:
+        user_lines.append(f"Effect type: {effect_type}")
+    if hint:
+        user_lines.append(f"Retailer hint: {hint}")
+    if existing_body:
+        user_lines.append("Existing copy (reference only):")
+        user_lines.append(existing_body)
+    if attr_summary:
+        user_lines.append("Attributes:\n" + attr_summary)
+
+    user_lines.append(
+        "Return JSON with keys en, nl, de. The English copy must be 2-3 HTML paragraphs (~180-260 words) "
+        "describing circuit topology (analog/digital), control layout, tonal behaviour, power requirements, "
+        "and live performance reliability. Include the keywords 'guitar effects pedal' and 'guitar effect' naturally. "
+        "Provide accurate NL and DE translations, keeping HTML."
+    )
+
+    system_prompt = "You write persuasive yet factual copy for guitar effects pedals."
+
+    payload = _call_openai_json(
+        EFFECT_MODEL,
+        system_prompt,
+        "\n".join(user_lines),
+        temperature=0.55,
+    )
+
+    en_body = _clean_description_value(payload.get("en"))
+    nl_body = _clean_description_value(payload.get("nl"))
+    de_body = _clean_description_value(payload.get("de"))
+    if not en_body:
+        raise RuntimeError("Effect description empty")
+    final_en = _restore_embed(embed, en_body)
+    return final_en, nl_body, de_body
+
+
+def _generate_description_for_product(product: Step3Product) -> tuple[str, str, str]:
+    category = _categorize_product(product)
+    if category == "acoustic":
+        return _generate_acoustic_copy(product)
+    if category == "electric":
+        return _generate_electric_copy(product)
+    if category == "bass":
+        return _generate_bass_copy(product)
+    if category == "amp":
+        return _generate_amp_copy(product)
+    if category == "effect":
+        return _generate_effect_copy(product)
+    return _generate_accessory_copy(product)
+
+
+def _build_step3_products() -> list[Step3Product]:
+    step2_state = _ensure_step2_state()
+    _commit_step2_staged(step2_state)
+
+    set_names = step2_state.get("set_names", {})
+    wide_map = step2_state.get("wide", {})
+    products: list[Step3Product] = []
+
+    for set_id, wide_df in (wide_map or {}).items():
+        if not isinstance(wide_df, pd.DataFrame) or wide_df.empty:
+            continue
+        set_name_value = set_names.get(set_id, set_id)
+        set_name_text = _normalize_text(set_name_value) or str(set_id)
+        for _, row in wide_df.iterrows():
+            row_dict = {key: row.get(key) for key in row.index}
+            sku = _normalize_text(row_dict.get("sku"))
+            if not sku:
+                continue
+            name = _clean_description_value(row_dict.get("name")) or sku
+            attr_set_raw = row_dict.get("attribute_set_id", set_id)
+            try:
+                attr_set_id = int(attr_set_raw) if attr_set_raw not in (None, "") else int(set_id)
+            except (TypeError, ValueError):
+                try:
+                    attr_set_id = int(set_id)
+                except (TypeError, ValueError):
+                    attr_set_id = None
+            generate_flag = _coerce_bool(row_dict.get(GENERATE_DESCRIPTION_COLUMN, True))
+            short_desc = _clean_description_value(row_dict.get("short_description"))
+            attributes = {
+                key: row_dict.get(key)
+                for key in row_dict.keys()
+                if key not in {"sku", "name"}
+            }
+            products.append(
+                Step3Product(
+                    sku=sku,
+                    name=name,
+                    attribute_set_id=attr_set_id,
+                    attribute_set_name=set_name_text,
+                    generate=generate_flag,
+                    short_description=short_desc,
+                    attributes=attributes,
+                )
+            )
+
+    products.sort(key=lambda item: item.sku)
+    return products
+
+
+def _ensure_descriptions_initialized(products: Sequence[Step3Product]) -> None:
+    descriptions = st.session_state.get("descriptions")
+    if not isinstance(descriptions, dict):
+        descriptions = {}
+
+    for product in products:
+        stored = descriptions.get(product.sku)
+        if not isinstance(stored, dict):
+            stored = {}
+        en_text = stored.get("en")
+        nl_text = stored.get("nl")
+        de_text = stored.get("de")
+        if not _clean_description_value(en_text):
+            en_text = product.short_description
+        descriptions[product.sku] = {
+            "en": _clean_description_value(en_text),
+            "nl": _clean_description_value(nl_text),
+            "de": _clean_description_value(de_text),
+        }
+
+    st.session_state["descriptions"] = descriptions
+
+
+def _generate_descriptions_for_products(
+    products: Sequence[Step3Product],
+) -> tuple[dict[str, dict[str, str]], list[str]]:
+    results: dict[str, dict[str, str]] = {}
+    errors: list[str] = []
+    stored = st.session_state.get("descriptions")
+    if not isinstance(stored, dict):
+        stored = {}
+
+    for product in products:
+        previous_entry = stored.get(product.sku, {})
+        if not product.generate:
+            results[product.sku] = {
+                "en": product.short_description,
+                "nl": _clean_description_value(previous_entry.get("nl")),
+                "de": _clean_description_value(previous_entry.get("de")),
+            }
+            continue
+
+        trace({"where": "step3:generate:start", "sku": product.sku})
+        try:
+            en, nl, de = _generate_description_for_product(product)
+            results[product.sku] = {"en": en, "nl": nl, "de": de}
+            trace({"where": "step3:generate:ok", "sku": product.sku})
+        except Exception as exc:
+            fallback_en = product.short_description or previous_entry.get("en", "")
+            results[product.sku] = {
+                "en": _clean_description_value(fallback_en),
+                "nl": _clean_description_value(previous_entry.get("nl")),
+                "de": _clean_description_value(previous_entry.get("de")),
+            }
+            errors.append(f"{product.sku}: {exc}")
+            trace({"where": "step3:generate:error", "sku": product.sku, "err": str(exc)[:200]})
+
+    return results, errors
+
+
+def _apply_descriptions_to_state(descriptions_map: Mapping[str, Mapping[str, object]]) -> set[str]:
+    step2_state = _ensure_step2_state()
+    _commit_step2_staged(step2_state)
+    wide_map = step2_state.get("wide", {})
+    updated_skus: set[str] = set()
+
+    if not isinstance(descriptions_map, Mapping):
+        return updated_skus
+
+    for set_id, wide_df in (wide_map or {}).items():
+        if not isinstance(wide_df, pd.DataFrame) or wide_df.empty:
+            continue
+        df_copy = wide_df.copy()
+        changed = False
+        for idx, row in df_copy.iterrows():
+            sku = _normalize_text(row.get("sku"))
+            if not sku or sku not in descriptions_map:
+                continue
+            en_value = _clean_description_value(descriptions_map[sku].get("en"))
+            current = _clean_description_value(row.get("short_description"))
+            if en_value != current:
+                df_copy.at[idx, "short_description"] = en_value
+                changed = True
+                updated_skus.add(sku)
+        if changed:
+            step2_state["wide"][set_id] = df_copy
+
+    return updated_skus
+
+
+def _store_specific_url(base_url: str, store_code: str, sku: str) -> str:
+    return f"{base_url.rstrip('/')}/rest/{store_code}/V1/products/{quote(str(sku), safe='')}"
+
+
+def _save_translations(
+    descriptions_map: Mapping[str, Mapping[str, object]],
+    *,
+    store_codes: Sequence[str] = ("nl", "de"),
+) -> tuple[set[str], list[str]]:
+    session = st.session_state.get("mg_session")
+    base_url = st.session_state.get("mg_base_url")
+    if not session or not base_url:
+        raise RuntimeError("Magento session is not initialized")
+
+    success: set[str] = set()
+    errors: list[str] = []
+
+    for sku, payload in descriptions_map.items():
+        if not isinstance(payload, Mapping):
+            continue
+        for store_code in store_codes:
+            text_value = _clean_description_value(payload.get(store_code))
+            if not text_value:
+                continue
+            url = _store_specific_url(base_url, store_code, sku)
+            data = {
+                "product": {
+                    "sku": sku,
+                    "custom_attributes": [
+                        {"attribute_code": "short_description", "value": text_value}
+                    ],
+                }
+            }
+            try:
+                resp = session.put(
+                    url,
+                    json=data,
+                    headers=build_magento_headers(session=session),
+                    timeout=30,
+                )
+            except Exception as exc:  # pragma: no cover - network error handling
+                errors.append(f"{sku} ({store_code}): {exc}")
+                trace(
+                    {
+                        "where": "step3:save_translation_error",
+                        "sku": sku,
+                        "store": store_code,
+                        "err": str(exc)[:200],
+                    }
+                )
+                continue
+            if not resp.ok:
+                snippet = resp.text[:200] if hasattr(resp, "text") else str(resp)
+                errors.append(f"{sku} ({store_code}): {resp.status_code} {snippet}")
+                trace(
+                    {
+                        "where": "step3:save_translation_http_error",
+                        "sku": sku,
+                        "store": store_code,
+                        "status": getattr(resp, "status_code", None),
+                        "body": snippet,
+                    }
+                )
+                continue
+            success.add(f"{sku}:{store_code}")
+            trace({"where": "step3:save_translation_ok", "sku": sku, "store": store_code})
+
+    return success, errors
+
+
+def save_step3_to_magento() -> None:
+    descriptions_map = st.session_state.get("descriptions")
+    if not isinstance(descriptions_map, Mapping) or not descriptions_map:
+        st.info("No descriptions to save.")
+        return
+
+    updated_skus = _apply_descriptions_to_state(descriptions_map)
+    trace({"where": "step3:update_applied", "skus": sorted(updated_skus)})
+
+    save_step2_to_magento()
+
+    try:
+        success, errors = _save_translations(descriptions_map)
+    except Exception as exc:
+        st.error(f"Failed to save translations: {exc}")
+        trace({"where": "step3:save_translation_exception", "err": str(exc)[:200]})
+        return
+
+    if success:
+        st.success("Translations saved for: " + ", ".join(sorted(success)))
+    if errors:
+        st.warning("Some translations failed:")
+        st.write("\n".join(f"- {msg}" for msg in errors))
 
 
 def _build_value_column_config(row_meta_map: dict[str, dict]):
@@ -3252,25 +4245,7 @@ def save_step2_to_magento():
         st.error("Magento session is not initialized")
         return
 
-    staged_map = (step2_state.get("staged") or {}).copy()
-    if staged_map:
-        for set_id, draft in staged_map.items():
-            if not isinstance(draft, pd.DataFrame):
-                continue
-            draft_wide = draft.copy(deep=True)
-            step2_state["wide"][set_id] = draft_wide
-            step2_state["wide_orig"][set_id] = draft_wide.copy(deep=True)
-            existing_long = step2_state["dfs"].get(set_id)
-            updated_long = apply_wide_edits_to_long(existing_long, draft_wide)
-            if isinstance(updated_long, pd.DataFrame):
-                if "value" in updated_long.columns:
-                    updated_long["value"] = updated_long["value"].astype(object)
-                step2_state["dfs"][set_id] = updated_long
-                step2_state["original"][set_id] = updated_long.copy(deep=True)
-            else:
-                step2_state["dfs"][set_id] = draft_wide.copy(deep=True)
-                step2_state["original"][set_id] = draft_wide.copy(deep=True)
-        step2_state["staged"].clear()
+    _commit_step2_staged(step2_state)
 
     wide_map: dict[int, pd.DataFrame] = step2_state.get("wide", {})
     wide_meta_map: dict[int, dict[str, dict]] = step2_state.get("wide_meta", {})
@@ -6031,17 +7006,24 @@ if df_original_key in st.session_state:
 
                                     st.markdown("---")
                                     c1, c2 = st.columns([1, 1])
-                                    btn_save = c1.button(
-                                        "💾 Save to Magento",
-                                        key="btn_step2_save_bottom",
+                                    btn_generate = c1.button(
+                                        "🌐 Generate Descriptions/Translation",
+                                        key="btn_step2_generate_bottom",
                                     )
                                     btn_reset = c2.button(
                                         "🔄 Reset all",
                                         key="btn_step2_reset_bottom",
                                     )
 
-                                    if btn_save:
-                                        save_step2_to_magento()
+                                    if btn_generate:
+                                        products = _build_step3_products()
+                                        _ensure_descriptions_initialized(products)
+                                        step3_state = st.session_state.setdefault("step3", {})
+                                        step3_state["products"] = products
+                                        step3_state["errors"] = []
+                                        st.session_state["step3_active"] = True
+                                        st.session_state["step3_generation_pending"] = True
+                                        st.rerun()
 
                                     if btn_reset:
                                         _reset_step2_state()
@@ -6071,3 +7053,89 @@ if df_original_key in st.session_state:
                                         file_name="payload.json",
                                         mime="application/json",
                                     )
+
+        if st.session_state.get("step3_active"):
+            st.markdown("---")
+            st.header("Step 3. Generate and review descriptions")
+
+            step3_state = st.session_state.setdefault("step3", {})
+            products = step3_state.get("products")
+            if not products:
+                products = _build_step3_products()
+                step3_state["products"] = products
+            _ensure_descriptions_initialized(products or [])
+
+            if st.session_state.get("step3_generation_pending") and not products:
+                st.session_state["step3_generation_pending"] = False
+
+            if st.session_state.get("step3_generation_pending") and products:
+                with st.spinner("Generating descriptions and translations…"):
+                    results, errors = _generate_descriptions_for_products(products)
+                descriptions_map = st.session_state.get("descriptions")
+                if not isinstance(descriptions_map, dict):
+                    descriptions_map = {}
+                for sku, payload in results.items():
+                    descriptions_map[sku] = payload
+                st.session_state["descriptions"] = descriptions_map
+                step3_state["errors"] = errors
+                st.session_state["step3_generation_pending"] = False
+
+            errors = step3_state.get("errors") or []
+            if errors:
+                st.warning("Some descriptions could not be generated automatically. Existing text is kept.")
+                st.write("\n".join(f"- {msg}" for msg in errors))
+
+            descriptions_map = st.session_state.get("descriptions", {})
+            table_rows: list[dict[str, object]] = []
+            for product in products or []:
+                entry = descriptions_map.get(product.sku, {}) if isinstance(descriptions_map, Mapping) else {}
+                table_rows.append(
+                    {
+                        "SKU": product.sku,
+                        "Name": product.name,
+                        "EN Description": _clean_description_value(entry.get("en")),
+                        "NL Description": _clean_description_value(entry.get("nl")),
+                        "DE Description": _clean_description_value(entry.get("de")),
+                    }
+                )
+
+            if not table_rows:
+                st.info("No products ready for description generation.")
+            else:
+                df_step3 = pd.DataFrame(table_rows)
+                column_config = {
+                    "SKU": st.column_config.TextColumn("SKU", disabled=True, width="small"),
+                    "Name": st.column_config.TextColumn("Name", disabled=True, width="medium"),
+                    "EN Description": st.column_config.TextColumn("EN Description", width="large"),
+                    "NL Description": st.column_config.TextColumn("NL Description", width="large"),
+                    "DE Description": st.column_config.TextColumn("DE Description", width="large"),
+                }
+                editor_df = st.data_editor(
+                    df_step3,
+                    column_config=column_config,
+                    use_container_width=True,
+                    num_rows="fixed",
+                    key="step3_editor",
+                )
+
+                if isinstance(editor_df, pd.DataFrame):
+                    new_map: dict[str, dict[str, str]] = {}
+                    for row in editor_df.to_dict(orient="records"):
+                        sku = _normalize_text(row.get("SKU"))
+                        if not sku:
+                            continue
+                        new_map[sku] = {
+                            "en": _clean_description_value(row.get("EN Description")),
+                            "nl": _clean_description_value(row.get("NL Description")),
+                            "de": _clean_description_value(row.get("DE Description")),
+                        }
+                    if new_map:
+                        descriptions_map = st.session_state.get("descriptions")
+                        if not isinstance(descriptions_map, dict):
+                            descriptions_map = {}
+                        descriptions_map.update(new_map)
+                        st.session_state["descriptions"] = descriptions_map
+
+                btn_step3_save = st.button("💾 Save to Magento", key="btn_step3_save")
+                if btn_step3_save:
+                    save_step3_to_magento()
