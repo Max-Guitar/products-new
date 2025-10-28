@@ -28,12 +28,17 @@ st.session_state.setdefault("allow_ai_overwrite_text", False)
 st.session_state.setdefault("ai_force_text_override", False)
 st.session_state.setdefault("ai_rerun_requested", False)  # оставляем на случай логики флага
 
+header_ph = st.session_state.setdefault("_header_ph", st.empty())
+if not st.session_state.get("_header_rendered", False):
+    with header_ph:
+        st.title("🤖 Peter v.1.0 (AI Content Manager)")
+    st.session_state["_header_rendered"] = True
+
 st.set_page_config(
     page_title="🤖 Peter v.1.0 (AI Content Manager)",
     page_icon="🤖",
     layout="wide",
 )
-st.title("🤖 Peter v.1.0 (AI Content Manager)")
 
 # --- DEBUG UI PANEL ---
 if "_trace_events" not in st.session_state:
