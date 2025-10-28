@@ -935,6 +935,11 @@ def _strip_html(value: Optional[object]) -> str:
         return ""
 
 
+JSON_ONLY_INSTRUCTION = (
+    "Return ONLY a valid minified JSON object. No markdown, no code fences, no comments."
+)
+
+
 def _caps_for_model(model: str):
     m = (model or "").lower()
     if m.startswith("o4"):
@@ -950,6 +955,61 @@ def _caps_for_model(model: str):
         "supports_json_mode": True,
         "supports_max_completion_tokens": True,
     }
+
+
+def _collect_json_candidates(raw_content: str) -> list[str]:
+    if not isinstance(raw_content, str):
+        raw_text = str(raw_content or "")
+    else:
+        raw_text = raw_content
+
+    candidates: list[str] = []
+
+    def _append(text: str | None):
+        if not text:
+            return
+        candidate = text.strip()
+        if not candidate:
+            return
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    _append(raw_text)
+
+    fence_pattern = re.compile(r"```(?:json)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
+    for match in fence_pattern.finditer(raw_text):
+        _append(match.group(1))
+
+    lower_text = raw_text.lower()
+    if "json" in lower_text:
+        json_index = lower_text.find("json")
+        remainder = raw_text[json_index + len("json") :]
+        _append(remainder)
+
+    first_brace = raw_text.find("{")
+    last_brace = raw_text.rfind("}")
+    if 0 <= first_brace < last_brace:
+        _append(raw_text[first_brace : last_brace + 1])
+
+    sanitized = _sanitize_llm_json(raw_text)
+    if isinstance(sanitized, str):
+        _append(sanitized)
+
+    return candidates
+
+
+def _build_json_error_preview(raw_content: str) -> str:
+    raw_text = raw_content if isinstance(raw_content, str) else str(raw_content or "")
+    masked = re.sub(r'"([^"\\]|\\.)*"', '"…"', raw_text)
+    collapsed = re.sub(r"\s+", " ", masked).strip()
+    if not collapsed:
+        return ""
+    max_len = 400
+    min_len = 200
+    preview = collapsed[:max_len]
+    if len(preview) < min_len and len(collapsed) >= min_len:
+        preview = collapsed[:min_len]
+    return preview
 
 
 def _openai_complete(
@@ -970,6 +1030,17 @@ def _openai_complete(
     else:
         system_messages = [{"role": "system", "content": AI_RULES_TEXT}]
 
+    caps = _caps_for_model(resolved_model)
+
+    if not caps["supports_json_mode"]:
+        existing_texts = {
+            str(message.get("content"))
+            for message in system_messages
+            if isinstance(message, Mapping)
+        }
+        if JSON_ONLY_INSTRUCTION not in existing_texts:
+            system_messages.append({"role": "system", "content": JSON_ONLY_INSTRUCTION})
+
     messages_payload: list[dict[str, str]] = []
     for message in system_messages:
         role = str(message.get("role") or "system")
@@ -984,8 +1055,6 @@ def _openai_complete(
     except Exception as exc:  # pragma: no cover - client init safety
         raise RuntimeError(f"OpenAI request failed: {exc}") from exc
 
-    caps = _caps_for_model(resolved_model)
-
     kwargs: dict[str, object] = {
         "model": resolved_model,
         "messages": messages_payload,
@@ -999,7 +1068,7 @@ def _openai_complete(
         kwargs["max_completion_tokens"] = 1200
 
     if caps["supports_temperature"]:
-        kwargs["temperature"] = 0.2
+        kwargs["temperature"] = 0 if not caps["supports_json_mode"] else 0.2
 
     if caps["supports_top_p"]:
         kwargs["top_p"] = 1
@@ -1053,17 +1122,24 @@ def _openai_complete(
     if not raw_content:
         raise RuntimeError("OpenAI response missing message content")
 
-    try:
-        parsed = json.loads(raw_content)
-    except json.JSONDecodeError:
-        cleaned = _sanitize_llm_json(raw_content)
+    parsed = None
+    last_exc: json.JSONDecodeError | None = None
+    candidates = _collect_json_candidates(raw_content)
+    for candidate in candidates:
         try:
-            parsed = json.loads(cleaned)
+            parsed = json.loads(candidate)
+            break
         except json.JSONDecodeError as exc:
-            error = RuntimeError("OpenAI response was not valid JSON")
-            setattr(error, "raw_response", raw_content)
-            setattr(error, "raw_response_sanitized", cleaned)
-            raise error from exc
+            last_exc = exc
+
+    if parsed is None:
+        preview = _build_json_error_preview(raw_content)
+        error = RuntimeError(f"json-parse-failed: {preview}")
+        setattr(error, "raw_response", raw_content)
+        setattr(error, "json_candidates", candidates)
+        if last_exc is not None:
+            raise error from last_exc
+        raise error
 
     if isinstance(conv, AiConversation):
         conv.conversation_id = None

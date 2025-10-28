@@ -4025,29 +4025,32 @@ st.session_state["ai_api_key"] = ai_api_key_secret
 model_options: list[str] = []
 for option in (
     DEFAULT_OPENAI_MODEL,
-    OPENAI_MODEL_ALIASES.get("5"),
     OPENAI_MODEL_ALIASES.get("5-mini"),
-    OPENAI_MODEL_ALIASES.get("4"),
+    OPENAI_MODEL_ALIASES.get("5"),
     OPENAI_MODEL_ALIASES.get("4-mini"),
-    OPENAI_MODEL_ALIASES.get("o4"),
+    OPENAI_MODEL_ALIASES.get("4"),
     OPENAI_MODEL_ALIASES.get("o4-mini"),
+    OPENAI_MODEL_ALIASES.get("o4"),
 ):
     if option and option not in model_options:
         model_options.append(option)
+if ai_model_secret and ai_model_secret not in model_options:
+    model_options.append(ai_model_secret)
 if not model_options:
     model_options = [DEFAULT_OPENAI_MODEL]
 
-default_model = ai_model_secret if ai_model_secret in model_options else model_options[0]
+default_model = DEFAULT_OPENAI_MODEL
+preferred_model = ai_model_secret if ai_model_secret in model_options else default_model
 stored_model = st.session_state.get("ai_model")
 if not stored_model:
-    st.session_state["ai_model"] = default_model
-    stored_model = default_model
+    st.session_state["ai_model"] = preferred_model
+    stored_model = preferred_model
 current_model = stored_model
 resolved_current = resolve_model_name(current_model, default=default_model)
 if current_model not in model_options and resolved_current in model_options:
     current_model = resolved_current
 if current_model not in model_options:
-    current_model = default_model
+    current_model = preferred_model if preferred_model in model_options else default_model
 
 selected_model = st.sidebar.selectbox(
     "AI model",
