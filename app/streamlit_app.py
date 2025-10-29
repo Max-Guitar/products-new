@@ -943,6 +943,29 @@ def _clean_description_value(value: object) -> str:
     return _normalize_text(value)
 
 
+def _ensure_html_description(value: object) -> str:
+    text = _clean_description_value(value)
+    if not text:
+        return ""
+
+    stripped = text.lstrip()
+    if not stripped.startswith("{"):
+        return text
+
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return text
+
+    if isinstance(parsed, Mapping):
+        for key in ("description", "html", "body", "en"):
+            candidate = parsed.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+
+    return text
+
+
 def _coerce_bool(value: object) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y", "on"}
@@ -1055,11 +1078,12 @@ def _call_openai_text(
 
     resolved_model = resolve_model_name(model, default=model)
     json_suffix = "Respond ONLY with a valid minified JSON. No markdown. No prose. No formatting instructions."
-    if system_prompt:
-        if json_suffix not in system_prompt:
-            system_prompt = f"{system_prompt.rstrip()}\n{json_suffix}"
-    else:
-        system_prompt = json_suffix
+    if response_format:
+        if system_prompt:
+            if json_suffix not in system_prompt:
+                system_prompt = f"{system_prompt.rstrip()}\n{json_suffix}"
+        else:
+            system_prompt = json_suffix
 
     messages: list[dict[str, str]] = []
     if system_prompt:
@@ -1281,6 +1305,7 @@ def _generate_acoustic_copy(product: Step3Product) -> tuple[str, str, str]:
         "\n".join(user_lines),
         temperature=0.65,
     )
+    english_body = _ensure_html_description(english_body)
 
     nl, de = _translate_description(english_body)
     final_en = _restore_embed(embed, english_body)
@@ -1327,6 +1352,7 @@ def _generate_electric_copy(product: Step3Product) -> tuple[str, str, str]:
         "\n".join(user_lines),
         temperature=0.7,
     )
+    english_body = _ensure_html_description(english_body)
 
     nl, de = _translate_description(english_body)
     final_en = _restore_embed(embed, english_body)
@@ -1374,6 +1400,7 @@ def _generate_accessory_copy(product: Step3Product) -> tuple[str, str, str]:
         temperature=0.6,
         max_tokens=800,
     )
+    english_body = _ensure_html_description(english_body)
 
     nl, de = _translate_description(english_body)
     final_en = _restore_embed(embed, english_body)
@@ -1626,7 +1653,15 @@ def _generate_descriptions_for_products(
     if not isinstance(stored, dict):
         stored = {}
 
-    for product in products:
+    total = len(products)
+    progress = None
+    if total:
+        progress = st.progress(
+            0.0,
+            text=f"Generating descriptions and translations… {total} remaining",
+        )
+
+    for index, product in enumerate(products, start=1):
         previous_entry = stored.get(product.sku, {})
         if not product.generate:
             results[product.sku] = {
@@ -1634,22 +1669,39 @@ def _generate_descriptions_for_products(
                 "nl": _clean_description_value(previous_entry.get("nl")),
                 "de": _clean_description_value(previous_entry.get("de")),
             }
-            continue
+        else:
+            trace({"where": "step3:generate:start", "sku": product.sku})
+            try:
+                en, nl, de = _generate_description_for_product(product)
+                results[product.sku] = {"en": en, "nl": nl, "de": de}
+                trace({"where": "step3:generate:ok", "sku": product.sku})
+            except Exception as exc:
+                fallback_en = "AI FAILED TO GENERATE"
+                results[product.sku] = {
+                    "en": _clean_description_value(fallback_en),
+                    "nl": "",
+                    "de": "",
+                }
+                errors.append(f"{product.sku}: {exc}")
+                trace({
+                    "where": "step3:generate:error",
+                    "sku": product.sku,
+                    "err": str(exc)[:200],
+                })
 
-        trace({"where": "step3:generate:start", "sku": product.sku})
-        try:
-            en, nl, de = _generate_description_for_product(product)
-            results[product.sku] = {"en": en, "nl": nl, "de": de}
-            trace({"where": "step3:generate:ok", "sku": product.sku})
-        except Exception as exc:
-            fallback_en = "AI FAILED TO GENERATE"
-            results[product.sku] = {
-                "en": _clean_description_value(fallback_en),
-                "nl": "",
-                "de": "",
-            }
-            errors.append(f"{product.sku}: {exc}")
-            trace({"where": "step3:generate:error", "sku": product.sku, "err": str(exc)[:200]})
+        if progress:
+            remaining = total - index
+            fraction = index / total
+            if remaining <= 0:
+                progress.progress(1.0, text="Generation completed")
+            else:
+                progress.progress(
+                    fraction,
+                    text=f"Generating descriptions and translations… {remaining} remaining",
+                )
+
+    if progress and total:
+        progress.progress(1.0, text="Generation completed")
 
     return results, errors
 
@@ -7091,8 +7143,7 @@ if df_original_key in st.session_state:
                 st.session_state["step3_generation_pending"] = False
 
             if st.session_state.get("step3_generation_pending") and products:
-                with st.spinner("Generating descriptions and translations…"):
-                    results, errors = _generate_descriptions_for_products(products)
+                results, errors = _generate_descriptions_for_products(products)
                 descriptions_map = st.session_state.get("descriptions")
                 if not isinstance(descriptions_map, dict):
                     descriptions_map = {}
