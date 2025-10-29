@@ -247,7 +247,7 @@ ORDER_PRESETS = {
     "amps": [
         "amp_style",
         "series",
-        "amp_type",
+        "type",
         "effect_type",
         "controls",
         "built_in_fx",
