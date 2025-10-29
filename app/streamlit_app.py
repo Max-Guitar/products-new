@@ -1123,6 +1123,7 @@ def _call_openai_json(
     *,
     temperature: float = 0.4,
     timeout: int = 120,
+    required_keys: Iterable[str] | None = ("en",),
 ) -> dict[str, object]:
     raw = _call_openai_text(
         model,
@@ -1132,7 +1133,7 @@ def _call_openai_json(
         timeout=timeout,
         response_format={"type": "json_object"},
     )
-    parsed = extract_json_object(raw, required_keys=["en"])
+    parsed = extract_json_object(raw, required_keys=required_keys)
     if not parsed:
         raise ValueError(
             f"Failed to parse JSON from model: {short_preview_of(raw)}"
@@ -1154,7 +1155,11 @@ def _translate_description(english_text: str) -> tuple[str, str]:
     try:
         payload = _call_openai_json(
             model,
-            "You translate professional musical instrument copy. Return strict JSON.",
+            (
+                "You translate professional musical instrument copy. Respond ONLY "
+                "with JSON: {\"nl\": \"...\", \"de\": \"...\"}. Do not wrap "
+                "inside 'description' or 'name'. No markdown. No prose."
+            ),
             (
                 "Translate the following English guitar product description into "
                 "Dutch (nl) and German (de). Use natural marketing language and keep "
@@ -1162,6 +1167,7 @@ def _translate_description(english_text: str) -> tuple[str, str]:
                 f"TEXT:\n{english_text.strip()}"
             ),
             temperature=0.2,
+            required_keys=("nl", "de"),
         )
     except Exception as exc:
         trace(
@@ -1173,7 +1179,11 @@ def _translate_description(english_text: str) -> tuple[str, str]:
         if TRANSLATION_MODEL_FALLBACK and TRANSLATION_MODEL_FALLBACK != model:
             payload = _call_openai_json(
                 TRANSLATION_MODEL_FALLBACK,
-                "You translate professional musical instrument copy. Return strict JSON.",
+                (
+                    "You translate professional musical instrument copy. Respond ONLY "
+                    "with JSON: {\"nl\": \"...\", \"de\": \"...\"}. Do not wrap "
+                    "inside 'description' or 'name'. No markdown. No prose."
+                ),
                 (
                     "Translate the following English guitar product description into "
                     "Dutch (nl) and German (de). Use natural marketing language and keep "
@@ -1181,6 +1191,7 @@ def _translate_description(english_text: str) -> tuple[str, str]:
                     f"TEXT:\n{english_text.strip()}"
                 ),
                 temperature=0.2,
+                required_keys=("nl", "de"),
             )
         else:
             raise
@@ -1634,8 +1645,8 @@ def _generate_descriptions_for_products(
             fallback_en = "AI FAILED TO GENERATE"
             results[product.sku] = {
                 "en": _clean_description_value(fallback_en),
-                "nl": _clean_description_value(previous_entry.get("nl")),
-                "de": _clean_description_value(previous_entry.get("de")),
+                "nl": "",
+                "de": "",
             }
             errors.append(f"{product.sku}: {exc}")
             trace({"where": "step3:generate:error", "sku": product.sku, "err": str(exc)[:200]})
@@ -7093,7 +7104,10 @@ if df_original_key in st.session_state:
 
             errors = step3_state.get("errors") or []
             if errors:
-                st.warning("Some descriptions could not be generated automatically. Existing text is kept.")
+                st.warning(
+                    "Some descriptions could not be generated automatically. "
+                    "The NL/DE fields for these items have been left blank."
+                )
                 st.write("\n".join(f"- {msg}" for msg in errors))
 
             descriptions_map = st.session_state.get("descriptions", {})
