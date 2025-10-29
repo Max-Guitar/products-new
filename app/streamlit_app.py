@@ -1142,6 +1142,62 @@ def _call_openai_text(
     return content.strip()
 
 
+class JSONPayloadError(ValueError):
+    def __init__(
+        self,
+        message: str,
+        raw: str,
+        *,
+        required_keys: Iterable[str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.raw = raw
+        self.required_keys = tuple(required_keys or ())
+
+
+def extract_json_payload(
+    raw: object, *, required_keys: Iterable[str] | None = None
+) -> Mapping[str, object] | None:
+    if not isinstance(raw, str):
+        return None
+
+    required = tuple(required_keys or ())
+    parsed = extract_json_object(raw, required_keys=required if required else None)
+    if isinstance(parsed, Mapping):
+        return parsed
+
+    if not required:
+        return None
+
+    if all(key in raw for key in required):
+        fallback: dict[str, object] = {}
+        for key in required:
+            pattern = rf'"{re.escape(key)}"\s*:\s*"(.+?)"'
+            match = re.search(pattern, raw, re.DOTALL)
+            if not match:
+                fallback = {}
+                break
+            raw_value = match.group(1).strip()
+            decoded_value: object = raw_value
+            try:
+                decoded_value = json.loads(f'"{raw_value}"')
+            except json.JSONDecodeError:
+                if isinstance(raw_value, str):
+                    decoded_value = (
+                        raw_value.replace("\\\"", '"')
+                        .replace("\\n", "\n")
+                        .replace("\\r", "\r")
+                        .replace("\\t", "\t")
+                    )
+            if isinstance(decoded_value, str):
+                decoded_value = decoded_value.strip()
+            fallback[key] = decoded_value
+        if fallback and len(fallback) == len(required):
+            return fallback
+
+    return None
+
+
 def _call_openai_json(
     model: str,
     system_prompt: str,
@@ -1159,10 +1215,12 @@ def _call_openai_json(
         timeout=timeout,
         response_format={"type": "json_object"},
     )
-    parsed = extract_json_object(raw, required_keys=required_keys)
+    parsed = extract_json_payload(raw, required_keys=required_keys)
     if not parsed:
-        raise ValueError(
-            f"Failed to parse JSON from model: {short_preview_of(raw)}"
+        raise JSONPayloadError(
+            f"Failed to parse JSON from model: {short_preview_of(raw)}",
+            raw,
+            required_keys=required_keys,
         )
     return parsed
 
@@ -1178,33 +1236,17 @@ def _translate_description(english_text: str) -> tuple[str, str]:
     if not english_text:
         return "", ""
     model = TRANSLATION_MODEL
-    try:
-        payload = _call_openai_json(
-            model,
-            (
-                "You translate professional musical instrument copy. Respond ONLY "
-                "with JSON: {\"nl\": \"...\", \"de\": \"...\"}. Do not wrap "
-                "inside 'description' or 'name'. No markdown. No prose."
-            ),
-            (
-                "Translate the following English guitar product description into "
-                "Dutch (nl) and German (de). Use natural marketing language and keep "
-                "line breaks.\n\n"
-                f"TEXT:\n{english_text.strip()}"
-            ),
-            temperature=0.2,
-            required_keys=("nl", "de"),
-        )
-    except Exception as exc:
-        trace(
-            {
-                "where": "step3:translate_error",
-                "err": str(exc)[:200],
-            }
-        )
-        if TRANSLATION_MODEL_FALLBACK and TRANSLATION_MODEL_FALLBACK != model:
-            payload = _call_openai_json(
-                TRANSLATION_MODEL_FALLBACK,
+    fallback_model = (
+        TRANSLATION_MODEL_FALLBACK
+        if TRANSLATION_MODEL_FALLBACK and TRANSLATION_MODEL_FALLBACK != model
+        else None
+    )
+    raw_candidates: list[str] = []
+
+    def _attempt(model_name: str) -> dict[str, object] | None:
+        try:
+            return _call_openai_json(
+                model_name,
                 (
                     "You translate professional musical instrument copy. Respond ONLY "
                     "with JSON: {\"nl\": \"...\", \"de\": \"...\"}. Do not wrap "
@@ -1219,8 +1261,85 @@ def _translate_description(english_text: str) -> tuple[str, str]:
                 temperature=0.2,
                 required_keys=("nl", "de"),
             )
+        except JSONPayloadError as exc:
+            trace(
+                {
+                    "where": "step3:translate_error",
+                    "model": model_name,
+                    "err": str(exc)[:200],
+                    "preview": short_preview_of(exc.raw),
+                }
+            )
+            if exc.raw:
+                raw_candidates.append(exc.raw)
+            return None
+
+    fallback_tried = False
+
+    try:
+        payload = _attempt(model)
+    except Exception as exc:
+        trace(
+            {
+                "where": "step3:translate_error",
+                "model": model,
+                "err": str(exc)[:200],
+            }
+        )
+        if fallback_model:
+            fallback_tried = True
+            try:
+                payload = _attempt(fallback_model)
+            except Exception as fallback_exc:
+                trace(
+                    {
+                        "where": "step3:translate_error",
+                        "model": fallback_model,
+                        "err": str(fallback_exc)[:200],
+                    }
+                )
+                raise
         else:
             raise
+
+    if payload is None and fallback_model and not fallback_tried:
+        try:
+            payload = _attempt(fallback_model)
+            fallback_tried = True
+        except Exception as exc:
+            trace(
+                {
+                    "where": "step3:translate_error",
+                    "model": fallback_model,
+                    "err": str(exc)[:200],
+                }
+            )
+            raise
+
+    if payload is None:
+        nl_value = ""
+        de_value = ""
+        for raw in raw_candidates:
+            if not nl_value:
+                partial_nl = extract_json_payload(raw, required_keys=("nl",))
+                if isinstance(partial_nl, Mapping):
+                    nl_value = _normalize_text(partial_nl.get("nl"))
+            if not de_value:
+                partial_de = extract_json_payload(raw, required_keys=("de",))
+                if isinstance(partial_de, Mapping):
+                    de_value = _normalize_text(partial_de.get("de"))
+            if nl_value and de_value:
+                break
+        if nl_value or de_value:
+            trace(
+                {
+                    "where": "step3:translate_partial",
+                    "nl_available": bool(nl_value),
+                    "de_available": bool(de_value),
+                }
+            )
+            return nl_value, de_value
+        raise RuntimeError("Failed to parse translation JSON")
 
     nl = _normalize_text(payload.get("nl"))
     de = _normalize_text(payload.get("de"))
