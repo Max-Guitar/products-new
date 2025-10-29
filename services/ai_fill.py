@@ -113,6 +113,7 @@ SET_ATTRS: Mapping[str, Set[str]] = {
     },
     "Amps": {
         "amp_style",
+        "series",
         "condition",
         "type",
         "speaker_configuration",
