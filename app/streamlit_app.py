@@ -246,10 +246,12 @@ ORDER_PRESETS = {
     # AMPS
     "amps": [
         "amp_style",
+        "series",
         "amp_type",
         "effect_type",
         "controls",
         "built_in_fx",
+        "speaker_configuration",
         "battery",
         "power",
         "power_polarity",
