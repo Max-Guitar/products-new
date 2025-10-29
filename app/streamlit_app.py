@@ -7368,11 +7368,13 @@ if df_original_key in st.session_state:
                 de_value = _clean_description_value(entry.get("de"))
                 table_rows.append(
                     {
-                        "SKU": product.sku,
                         "Name": product.name,
+                        "SKU": product.sku,
                         "EN Description": _clean_description_value(entry.get("en")),
                         "NL Description": _decorate_truncated_translation(nl_value),
                         "DE Description": _decorate_truncated_translation(de_value),
+                        "ES Description": _clean_description_value(entry.get("es")),
+                        "FR Description": _clean_description_value(entry.get("fr")),
                     }
                 )
 
@@ -7381,11 +7383,13 @@ if df_original_key in st.session_state:
             else:
                 df_step3 = pd.DataFrame(table_rows)
                 column_config = {
-                    "SKU": st.column_config.TextColumn("SKU", disabled=True, width="small"),
                     "Name": st.column_config.TextColumn("Name", disabled=True, width="medium"),
+                    "SKU": st.column_config.TextColumn("SKU", disabled=True, width="small"),
                     "EN Description": st.column_config.TextColumn("EN Description", width="large"),
                     "NL Description": st.column_config.TextColumn("NL Description", width="large"),
                     "DE Description": st.column_config.TextColumn("DE Description", width="large"),
+                    "ES Description": st.column_config.TextColumn("ES Description", width="large"),
+                    "FR Description": st.column_config.TextColumn("FR Description", width="large"),
                 }
                 editor_df = st.data_editor(
                     df_step3,
@@ -7405,6 +7409,8 @@ if df_original_key in st.session_state:
                             "en": _clean_description_value(row.get("EN Description")),
                             "nl": _strip_truncation_warning(row.get("NL Description")),
                             "de": _strip_truncation_warning(row.get("DE Description")),
+                            "es": _clean_description_value(row.get("ES Description")),
+                            "fr": _clean_description_value(row.get("FR Description")),
                         }
                     if new_map:
                         descriptions_map = st.session_state.get("descriptions")
