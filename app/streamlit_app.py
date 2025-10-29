@@ -1265,9 +1265,9 @@ def _choose_random(texts: Sequence[str], fallback: str = "") -> str:
     return random.choice(candidates)
 
 
-def _translate_description(english_text: str) -> tuple[str, str]:
+def _translate_description(english_text: str) -> tuple[str, str, str, str]:
     if not english_text:
-        return "", ""
+        return "", "", "", ""
     model = TRANSLATION_MODEL
     fallback_model = (
         TRANSLATION_MODEL_FALLBACK
@@ -1288,17 +1288,17 @@ def _translate_description(english_text: str) -> tuple[str, str]:
                     model_name,
                     (
                         "You translate professional musical instrument copy. Respond ONLY "
-                        "with JSON: {\"nl\": \"...\", \"de\": \"...\"}. Do not wrap "
+                        "with JSON: {\"nl\": \"...\", \"de\": \"...\", \"es\": \"...\", \"fr\": \"...\"}. Do not wrap "
                         "inside 'description' or 'name'. No markdown. No prose."
                     ),
                     (
                         "Translate the following English guitar product description into "
-                        "Dutch (nl) and German (de). Use natural marketing language and keep "
+                        "Dutch (nl), German (de), Spanish (es), and French (fr). Use natural marketing language and keep "
                         "line breaks.\n\n"
                         f"TEXT:\n{text.strip()}"
                     ),
                     temperature=0.2,
-                    required_keys=("nl", "de"),
+                    required_keys=("nl", "de", "es", "fr"),
                     max_tokens=2000,
                 )
             except JSONPayloadError as exc:
@@ -1377,6 +1377,8 @@ def _translate_description(english_text: str) -> tuple[str, str]:
     if payload is None:
         nl_value = ""
         de_value = ""
+        es_value = ""
+        fr_value = ""
         for raw in raw_candidates:
             parsed_candidate = extract_json_payload(raw)
             if isinstance(parsed_candidate, Mapping):
@@ -1386,6 +1388,12 @@ def _translate_description(english_text: str) -> tuple[str, str]:
                 if not de_value:
                     de_candidate = parsed_candidate.get("de") or parsed_candidate.get("DE")
                     de_value = _normalize_text(de_candidate)
+                if not es_value:
+                    es_candidate = parsed_candidate.get("es") or parsed_candidate.get("ES")
+                    es_value = _normalize_text(es_candidate)
+                if not fr_value:
+                    fr_candidate = parsed_candidate.get("fr") or parsed_candidate.get("FR")
+                    fr_value = _normalize_text(fr_candidate)
             if not nl_value:
                 partial_nl = extract_json_payload(raw, required_keys=("nl",))
                 if isinstance(partial_nl, Mapping):
@@ -1406,22 +1414,46 @@ def _translate_description(english_text: str) -> tuple[str, str]:
                 if isinstance(partial_de_upper, Mapping):
                     de_candidate = partial_de_upper.get("DE") or partial_de_upper.get("de")
                     de_value = _normalize_text(de_candidate)
-            if nl_value and de_value:
+            if not es_value:
+                partial_es = extract_json_payload(raw, required_keys=("es",))
+                if isinstance(partial_es, Mapping):
+                    es_candidate = partial_es.get("es") or partial_es.get("ES")
+                    es_value = _normalize_text(es_candidate)
+            if not es_value:
+                partial_es_upper = extract_json_payload(raw, required_keys=("ES",))
+                if isinstance(partial_es_upper, Mapping):
+                    es_candidate = partial_es_upper.get("ES") or partial_es_upper.get("es")
+                    es_value = _normalize_text(es_candidate)
+            if not fr_value:
+                partial_fr = extract_json_payload(raw, required_keys=("fr",))
+                if isinstance(partial_fr, Mapping):
+                    fr_candidate = partial_fr.get("fr") or partial_fr.get("FR")
+                    fr_value = _normalize_text(fr_candidate)
+            if not fr_value:
+                partial_fr_upper = extract_json_payload(raw, required_keys=("FR",))
+                if isinstance(partial_fr_upper, Mapping):
+                    fr_candidate = partial_fr_upper.get("FR") or partial_fr_upper.get("fr")
+                    fr_value = _normalize_text(fr_candidate)
+            if nl_value and de_value and es_value and fr_value:
                 break
-        if nl_value or de_value:
+        if nl_value or de_value or es_value or fr_value:
             trace(
                 {
                     "where": "step3:translate_partial",
                     "nl_available": bool(nl_value),
                     "de_available": bool(de_value),
+                    "es_available": bool(es_value),
+                    "fr_available": bool(fr_value),
                 }
             )
-            return nl_value, de_value
+            return nl_value, de_value, es_value, fr_value
         raise RuntimeError("Failed to parse translation JSON")
 
     nl = _normalize_text(payload.get("nl") or payload.get("NL"))
     de = _normalize_text(payload.get("de") or payload.get("DE"))
-    return nl, de
+    es = _normalize_text(payload.get("es") or payload.get("ES"))
+    fr = _normalize_text(payload.get("fr") or payload.get("FR"))
+    return nl, de, es, fr
 
 
 def _categorize_product(product: Step3Product) -> str:
@@ -1455,7 +1487,7 @@ def _categorize_product(product: Step3Product) -> str:
     return "accessory"
 
 
-def _generate_acoustic_copy(product: Step3Product) -> tuple[str, str, str]:
+def _generate_acoustic_copy(product: Step3Product) -> tuple[str, str, str, str, str]:
     embed, existing_body = _extract_video_embed(product.short_description)
     attr_summary = _format_attribute_summary(product.attributes)
     hint = _normalize_text(product.attributes.get("hint"))
@@ -1506,12 +1538,12 @@ def _generate_acoustic_copy(product: Step3Product) -> tuple[str, str, str]:
     )
     english_body = _ensure_html_description(english_body)
 
-    nl, de = _translate_description(english_body)
+    nl, de, es, fr = _translate_description(english_body)
     final_en = _restore_embed(embed, english_body)
-    return final_en, nl, de
+    return final_en, nl, de, es, fr
 
 
-def _generate_electric_copy(product: Step3Product) -> tuple[str, str, str]:
+def _generate_electric_copy(product: Step3Product) -> tuple[str, str, str, str, str]:
     embed, existing_body = _extract_video_embed(product.short_description)
     attr_summary = _format_attribute_summary(product.attributes)
     hint = _normalize_text(product.attributes.get("hint"))
@@ -1553,12 +1585,12 @@ def _generate_electric_copy(product: Step3Product) -> tuple[str, str, str]:
     )
     english_body = _ensure_html_description(english_body)
 
-    nl, de = _translate_description(english_body)
+    nl, de, es, fr = _translate_description(english_body)
     final_en = _restore_embed(embed, english_body)
-    return final_en, nl, de
+    return final_en, nl, de, es, fr
 
 
-def _generate_accessory_copy(product: Step3Product) -> tuple[str, str, str]:
+def _generate_accessory_copy(product: Step3Product) -> tuple[str, str, str, str, str]:
     embed, existing_body = _extract_video_embed(product.short_description)
     attr_summary = _format_attribute_summary(product.attributes)
     hint = _normalize_text(product.attributes.get("hint"))
@@ -1601,12 +1633,12 @@ def _generate_accessory_copy(product: Step3Product) -> tuple[str, str, str]:
     )
     english_body = _ensure_html_description(english_body)
 
-    nl, de = _translate_description(english_body)
+    nl, de, es, fr = _translate_description(english_body)
     final_en = _restore_embed(embed, english_body)
-    return final_en, nl, de
+    return final_en, nl, de, es, fr
 
 
-def _generate_bass_copy(product: Step3Product) -> tuple[str, str, str]:
+def _generate_bass_copy(product: Step3Product) -> tuple[str, str, str, str, str]:
     embed, existing_body = _extract_video_embed(product.short_description)
     attr_summary = _format_attribute_summary(product.attributes)
     hint = _normalize_text(product.attributes.get("hint"))
@@ -1631,9 +1663,9 @@ def _generate_bass_copy(product: Step3Product) -> tuple[str, str, str]:
         user_lines.append("Attributes:\n" + attr_summary)
 
     user_lines.append(
-        "Return JSON with keys en, nl, de. The 'en' value must be 3-4 HTML paragraphs (<p>) "
+        "Return JSON with keys en, nl, de, es, fr. The 'en' value must be 3-4 HTML paragraphs (<p>) "
         "totalling around 220-320 words. Describe tonewoods, neck feel, pickup configuration, onboard electronics, "
-        "and playing techniques (fingerstyle, pick, slap). The 'nl' and 'de' values should be faithful translations."
+        "and playing techniques (fingerstyle, pick, slap). The 'nl', 'de', 'es', and 'fr' values should be faithful translations."
     )
 
     system_prompt = (
@@ -1645,18 +1677,21 @@ def _generate_bass_copy(product: Step3Product) -> tuple[str, str, str]:
         system_prompt,
         "\n".join(user_lines),
         temperature=0.6,
+        required_keys=("en", "nl", "de", "es", "fr"),
     )
 
     en_body = _clean_description_value(payload.get("en"))
     nl_body = _clean_description_value(payload.get("nl"))
     de_body = _clean_description_value(payload.get("de"))
+    es_body = _clean_description_value(payload.get("es"))
+    fr_body = _clean_description_value(payload.get("fr"))
     if not en_body:
         raise RuntimeError("Bass description empty")
     final_en = _restore_embed(embed, en_body)
-    return final_en, nl_body, de_body
+    return final_en, nl_body, de_body, es_body, fr_body
 
 
-def _generate_amp_copy(product: Step3Product) -> tuple[str, str, str]:
+def _generate_amp_copy(product: Step3Product) -> tuple[str, str, str, str, str]:
     embed, existing_body = _extract_video_embed(product.short_description)
     attr_summary = _format_attribute_summary(product.attributes)
     hint = _normalize_text(product.attributes.get("hint"))
@@ -1680,10 +1715,10 @@ def _generate_amp_copy(product: Step3Product) -> tuple[str, str, str]:
         user_lines.append("Attributes:\n" + attr_summary)
 
     user_lines.append(
-        "Return JSON with keys en, nl, de. The English text should be 3-4 HTML paragraphs (<p>) "
+        "Return JSON with keys en, nl, de, es, fr. The English text should be 3-4 HTML paragraphs (<p>) "
         "around 220-320 words covering amplifier format (combo/head/cab), power (watts), speaker configuration, "
         "tube vs. solid-state topology, channel/effects details, and pedalboard friendliness. Ensure the final "
-        "sentence confirms technician inspection as provided. Provide accurate NL and DE translations."
+        "sentence confirms technician inspection as provided. Provide accurate NL, DE, ES, and FR translations."
     )
 
     system_prompt = "You craft technical yet musical marketing copy for guitar amplifiers."
@@ -1693,18 +1728,21 @@ def _generate_amp_copy(product: Step3Product) -> tuple[str, str, str]:
         system_prompt,
         "\n".join(user_lines),
         temperature=0.6,
+        required_keys=("en", "nl", "de", "es", "fr"),
     )
 
     en_body = _clean_description_value(payload.get("en"))
     nl_body = _clean_description_value(payload.get("nl"))
     de_body = _clean_description_value(payload.get("de"))
+    es_body = _clean_description_value(payload.get("es"))
+    fr_body = _clean_description_value(payload.get("fr"))
     if not en_body:
         raise RuntimeError("Amp description empty")
     final_en = _restore_embed(embed, en_body)
-    return final_en, nl_body, de_body
+    return final_en, nl_body, de_body, es_body, fr_body
 
 
-def _generate_effect_copy(product: Step3Product) -> tuple[str, str, str]:
+def _generate_effect_copy(product: Step3Product) -> tuple[str, str, str, str, str]:
     embed, existing_body = _extract_video_embed(product.short_description)
     attr_summary = _format_attribute_summary(product.attributes)
     hint = _normalize_text(product.attributes.get("hint"))
@@ -1731,10 +1769,10 @@ def _generate_effect_copy(product: Step3Product) -> tuple[str, str, str]:
         user_lines.append("Attributes:\n" + attr_summary)
 
     user_lines.append(
-        "Return JSON with keys en, nl, de. The English copy must be 2-3 HTML paragraphs (~180-260 words) "
+        "Return JSON with keys en, nl, de, es, fr. The English copy must be 2-3 HTML paragraphs (~180-260 words) "
         "describing circuit topology (analog/digital), control layout, tonal behaviour, power requirements, "
         "and live performance reliability. Include the keywords 'guitar effects pedal' and 'guitar effect' naturally. "
-        "Provide accurate NL and DE translations, keeping HTML."
+        "Provide accurate NL, DE, ES, and FR translations, keeping HTML."
     )
 
     system_prompt = "You write persuasive yet factual copy for guitar effects pedals."
@@ -1744,18 +1782,21 @@ def _generate_effect_copy(product: Step3Product) -> tuple[str, str, str]:
         system_prompt,
         "\n".join(user_lines),
         temperature=0.55,
+        required_keys=("en", "nl", "de", "es", "fr"),
     )
 
     en_body = _clean_description_value(payload.get("en"))
     nl_body = _clean_description_value(payload.get("nl"))
     de_body = _clean_description_value(payload.get("de"))
+    es_body = _clean_description_value(payload.get("es"))
+    fr_body = _clean_description_value(payload.get("fr"))
     if not en_body:
         raise RuntimeError("Effect description empty")
     final_en = _restore_embed(embed, en_body)
-    return final_en, nl_body, de_body
+    return final_en, nl_body, de_body, es_body, fr_body
 
 
-def _generate_description_for_product(product: Step3Product) -> tuple[str, str, str]:
+def _generate_description_for_product(product: Step3Product) -> tuple[str, str, str, str, str]:
     category = _categorize_product(product)
     if category == "acoustic":
         return _generate_acoustic_copy(product)
@@ -1832,12 +1873,16 @@ def _ensure_descriptions_initialized(products: Sequence[Step3Product]) -> None:
         en_text = stored.get("en")
         nl_text = stored.get("nl")
         de_text = stored.get("de")
+        es_text = stored.get("es")
+        fr_text = stored.get("fr")
         if not _clean_description_value(en_text):
             en_text = product.short_description
         descriptions[product.sku] = {
             "en": _clean_description_value(en_text),
             "nl": _clean_description_value(nl_text),
             "de": _clean_description_value(de_text),
+            "es": _clean_description_value(es_text),
+            "fr": _clean_description_value(fr_text),
         }
 
     st.session_state["descriptions"] = descriptions
@@ -1867,12 +1912,20 @@ def _generate_descriptions_for_products(
                 "en": product.short_description,
                 "nl": _clean_description_value(previous_entry.get("nl")),
                 "de": _clean_description_value(previous_entry.get("de")),
+                "es": _clean_description_value(previous_entry.get("es")),
+                "fr": _clean_description_value(previous_entry.get("fr")),
             }
         else:
             trace({"where": "step3:generate:start", "sku": product.sku})
             try:
-                en, nl, de = _generate_description_for_product(product)
-                results[product.sku] = {"en": en, "nl": nl, "de": de}
+                en, nl, de, es, fr = _generate_description_for_product(product)
+                results[product.sku] = {
+                    "en": en,
+                    "nl": nl,
+                    "de": de,
+                    "es": es,
+                    "fr": fr,
+                }
                 trace({"where": "step3:generate:ok", "sku": product.sku})
             except Exception as exc:
                 fallback_en = "AI FAILED TO GENERATE"
@@ -1880,6 +1933,8 @@ def _generate_descriptions_for_products(
                     "en": _clean_description_value(fallback_en),
                     "nl": "",
                     "de": "",
+                    "es": "",
+                    "fr": "",
                 }
                 errors.append(f"{product.sku}: {exc}")
                 trace({
