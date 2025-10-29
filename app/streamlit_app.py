@@ -27,6 +27,8 @@ import pandas as pd
 import streamlit as st
 import random
 
+from utils.json_parse import extract_json_object, short_preview_of
+
 st.session_state.setdefault("allow_ai_overwrite_text", False)
 st.session_state.setdefault("ai_force_text_override", False)
 st.session_state.setdefault("ai_rerun_requested", False)  # оставляем на случай логики флага
@@ -1052,6 +1054,13 @@ def _call_openai_text(
         raise RuntimeError(f"OpenAI client init failed: {exc}") from exc
 
     resolved_model = resolve_model_name(model, default=model)
+    json_suffix = "Respond ONLY with a valid minified JSON. No markdown. No prose. No formatting instructions."
+    if system_prompt:
+        if json_suffix not in system_prompt:
+            system_prompt = f"{system_prompt.rstrip()}\n{json_suffix}"
+    else:
+        system_prompt = json_suffix
+
     messages: list[dict[str, str]] = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
@@ -1064,8 +1073,8 @@ def _call_openai_text(
     }
     if response_format:
         kwargs["response_format"] = response_format
-    if temperature is not None:
-        kwargs["temperature"] = temperature
+    kwargs["temperature"] = 0
+    temperature = 0
     if max_tokens:
         kwargs["max_completion_tokens"] = max_tokens
 
@@ -1123,10 +1132,12 @@ def _call_openai_json(
         timeout=timeout,
         response_format={"type": "json_object"},
     )
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Failed to parse JSON from model: {exc}") from exc
+    parsed = extract_json_object(raw, required_keys=["en"])
+    if not parsed:
+        raise ValueError(
+            f"Failed to parse JSON from model: {short_preview_of(raw)}"
+        )
+    return parsed
 
 
 def _choose_random(texts: Sequence[str], fallback: str = "") -> str:
@@ -1620,7 +1631,7 @@ def _generate_descriptions_for_products(
             results[product.sku] = {"en": en, "nl": nl, "de": de}
             trace({"where": "step3:generate:ok", "sku": product.sku})
         except Exception as exc:
-            fallback_en = product.short_description or previous_entry.get("en", "")
+            fallback_en = "AI FAILED TO GENERATE"
             results[product.sku] = {
                 "en": _clean_description_value(fallback_en),
                 "nl": _clean_description_value(previous_entry.get("nl")),

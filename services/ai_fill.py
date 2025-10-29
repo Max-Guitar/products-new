@@ -16,6 +16,7 @@ import requests
 import streamlit as st
 
 from utils.http import MAGENTO_REST_PATH_CANDIDATES, build_magento_headers
+from utils.json_parse import extract_json_object
 
 from services.llm_extract import (
     RegexExtraction,
@@ -277,7 +278,8 @@ AI_RULES_TEXT = (
     "\"current_attributes\":{\"guitarstylemultiplechoice\":[\"S-Style\"]},\"missing\":[{\"code\":\"neck_radius\"}]}\n"
     "Выход: {\"attributes\":[{\"code\":\"neck_radius\",\"value\":\"9.5\"\",\"reason\":\"spec sheet\"}]}\n"
     "Вход: {\"sku\":\"BASS-1\",\"name\":\"Ibanez SR500 Bass Guitar\",\"missing\":[{\"code\":\"body_material\"},{\"code\":\"scale_mensur\"}]}\n"
-    "Выход: {\"attributes\":[{\"code\":\"body_material\",\"value\":\"mahogany\",\"reason\":\"product description\"},{\"code\":\"scale_mensur\",\"value\":\"34\"\",\"reason\":\"spec sheet\"}]}"
+    "Выход: {\"attributes\":[{\"code\":\"body_material\",\"value\":\"mahogany\",\"reason\":\"product description\"},{\"code\":\"scale_mensur\",\"value\":\"34\"\",\"reason\":\"spec sheet\"}]}\n"
+    "Respond ONLY with a valid minified JSON. No markdown. No prose. No formatting instructions."
 )
 
 AI_RULES_HASH = hashlib.sha256(AI_RULES_TEXT.encode("utf-8")).hexdigest()
@@ -936,7 +938,8 @@ def _strip_html(value: Optional[object]) -> str:
 
 
 JSON_ONLY_INSTRUCTION = (
-    "Return ONLY a valid minified JSON object. No markdown, no code fences, no comments."
+    "Return ONLY a valid minified JSON object. No markdown, no code fences, no comments. "
+    "Respond ONLY with a valid minified JSON. No markdown. No prose. No formatting instructions."
 )
 
 
@@ -1068,7 +1071,7 @@ def _openai_complete(
         kwargs["max_completion_tokens"] = 1200
 
     if caps["supports_temperature"]:
-        kwargs["temperature"] = 0 if not caps["supports_json_mode"] else 0.2
+        kwargs["temperature"] = 0
 
     if caps["supports_top_p"]:
         kwargs["top_p"] = 1
@@ -1122,23 +1125,19 @@ def _openai_complete(
     if not raw_content:
         raise RuntimeError("OpenAI response missing message content")
 
-    parsed = None
-    last_exc: json.JSONDecodeError | None = None
+    parsed = extract_json_object(raw_content)
     candidates = _collect_json_candidates(raw_content)
-    for candidate in candidates:
-        try:
-            parsed = json.loads(candidate)
-            break
-        except json.JSONDecodeError as exc:
-            last_exc = exc
+    if parsed is None:
+        for candidate in candidates:
+            parsed = extract_json_object(candidate)
+            if parsed is not None:
+                break
 
     if parsed is None:
         preview = _build_json_error_preview(raw_content)
         error = RuntimeError(f"json-parse-failed: {preview}")
         setattr(error, "raw_response", raw_content)
         setattr(error, "json_candidates", candidates)
-        if last_exc is not None:
-            raise error from last_exc
         raise error
 
     if isinstance(conv, AiConversation):
