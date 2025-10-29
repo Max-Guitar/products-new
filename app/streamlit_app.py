@@ -945,6 +945,32 @@ def _clean_description_value(value: object) -> str:
     return _normalize_text(value)
 
 
+def _strip_truncation_warning(value: object) -> str:
+    text = _clean_description_value(value)
+    prefix = "⚠️ "
+    if text.startswith(prefix):
+        return text[len(prefix) :]
+    return text
+
+
+def _is_translation_truncated(text: str) -> bool:
+    if not text:
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if "<p" in stripped and not stripped.endswith("</p>"):
+        return True
+    return False
+
+
+def _decorate_truncated_translation(value: object) -> str:
+    text = _strip_truncation_warning(value)
+    if _is_translation_truncated(text):
+        return f"⚠️ {text}"
+    return text
+
+
 def _ensure_html_description(value: object) -> str:
     text = _clean_description_value(value)
     if not text:
@@ -1206,14 +1232,21 @@ def _call_openai_json(
     temperature: float = 0.4,
     timeout: int = 120,
     required_keys: Iterable[str] | None = ("en",),
+    max_tokens: int | None = None,
 ) -> dict[str, object]:
+    text_kwargs: dict[str, object] = {
+        "temperature": temperature,
+        "timeout": timeout,
+        "response_format": {"type": "json_object"},
+    }
+    if max_tokens is not None:
+        text_kwargs["max_tokens"] = max_tokens
+
     raw = _call_openai_text(
         model,
         system_prompt,
         user_prompt,
-        temperature=temperature,
-        timeout=timeout,
-        response_format={"type": "json_object"},
+        **text_kwargs,
     )
     parsed = extract_json_payload(raw, required_keys=required_keys)
     if not parsed:
@@ -1243,91 +1276,136 @@ def _translate_description(english_text: str) -> tuple[str, str]:
     )
     raw_candidates: list[str] = []
 
-    def _attempt(model_name: str) -> dict[str, object] | None:
-        try:
-            return _call_openai_json(
-                model_name,
-                (
-                    "You translate professional musical instrument copy. Respond ONLY "
-                    "with JSON: {\"nl\": \"...\", \"de\": \"...\"}. Do not wrap "
-                    "inside 'description' or 'name'. No markdown. No prose."
-                ),
-                (
-                    "Translate the following English guitar product description into "
-                    "Dutch (nl) and German (de). Use natural marketing language and keep "
-                    "line breaks.\n\n"
-                    f"TEXT:\n{english_text.strip()}"
-                ),
-                temperature=0.2,
-                required_keys=("nl", "de"),
-            )
-        except JSONPayloadError as exc:
-            trace(
-                {
-                    "where": "step3:translate_error",
-                    "model": model_name,
-                    "err": str(exc)[:200],
-                    "preview": short_preview_of(exc.raw),
-                }
-            )
-            if exc.raw:
-                raw_candidates.append(exc.raw)
-            return None
+    def _run_models(
+        text: str,
+        attempt_label: str,
+    ) -> dict[str, object] | None:
+        local_raw: list[str] = []
 
-    fallback_tried = False
-
-    try:
-        payload = _attempt(model)
-    except Exception as exc:
-        trace(
-            {
-                "where": "step3:translate_error",
-                "model": model,
-                "err": str(exc)[:200],
-            }
-        )
-        if fallback_model:
-            fallback_tried = True
+        def _attempt(model_name: str) -> dict[str, object] | None:
             try:
-                payload = _attempt(fallback_model)
-            except Exception as fallback_exc:
+                return _call_openai_json(
+                    model_name,
+                    (
+                        "You translate professional musical instrument copy. Respond ONLY "
+                        "with JSON: {\"nl\": \"...\", \"de\": \"...\"}. Do not wrap "
+                        "inside 'description' or 'name'. No markdown. No prose."
+                    ),
+                    (
+                        "Translate the following English guitar product description into "
+                        "Dutch (nl) and German (de). Use natural marketing language and keep "
+                        "line breaks.\n\n"
+                        f"TEXT:\n{text.strip()}"
+                    ),
+                    temperature=0.2,
+                    required_keys=("nl", "de"),
+                    max_tokens=2000,
+                )
+            except JSONPayloadError as exc:
                 trace(
                     {
                         "where": "step3:translate_error",
-                        "model": fallback_model,
-                        "err": str(fallback_exc)[:200],
+                        "model": model_name,
+                        "err": str(exc)[:200],
+                        "preview": short_preview_of(exc.raw),
+                        "attempt": attempt_label,
                     }
                 )
-                raise
-        else:
-            raise
+                if exc.raw:
+                    local_raw.append(exc.raw)
+                return None
 
-    if payload is None and fallback_model and not fallback_tried:
+        fallback_tried = False
+        payload: dict[str, object] | None = None
+
         try:
-            payload = _attempt(fallback_model)
-            fallback_tried = True
-        except Exception as exc:
-            trace(
-                {
-                    "where": "step3:translate_error",
-                    "model": fallback_model,
-                    "err": str(exc)[:200],
-                }
-            )
-            raise
+            try:
+                payload = _attempt(model)
+            except Exception as exc:
+                trace(
+                    {
+                        "where": "step3:translate_error",
+                        "model": model,
+                        "err": str(exc)[:200],
+                        "attempt": attempt_label,
+                    }
+                )
+                if fallback_model:
+                    fallback_tried = True
+                    try:
+                        payload = _attempt(fallback_model)
+                    except Exception as fallback_exc:
+                        trace(
+                            {
+                                "where": "step3:translate_error",
+                                "model": fallback_model,
+                                "err": str(fallback_exc)[:200],
+                                "attempt": attempt_label,
+                            }
+                        )
+                        raise
+                else:
+                    raise
+
+            if payload is None and fallback_model and not fallback_tried:
+                try:
+                    payload = _attempt(fallback_model)
+                    fallback_tried = True
+                except Exception as exc:
+                    trace(
+                        {
+                            "where": "step3:translate_error",
+                            "model": fallback_model,
+                            "err": str(exc)[:200],
+                            "attempt": attempt_label,
+                        }
+                    )
+                    raise
+        finally:
+            raw_candidates.extend(local_raw)
+
+        return payload
+
+    payload = _run_models(english_text, "full")
+
+    if payload is None and len(english_text) > 4000:
+        paragraphs = english_text.split("\n\n")
+        shortened_text = "\n\n".join(paragraphs[:3]).strip()
+        if shortened_text and len(shortened_text) < len(english_text):
+            payload = _run_models(shortened_text, "shortened")
 
     if payload is None:
         nl_value = ""
         de_value = ""
         for raw in raw_candidates:
+            parsed_candidate = extract_json_payload(raw)
+            if isinstance(parsed_candidate, Mapping):
+                if not nl_value:
+                    nl_candidate = parsed_candidate.get("nl") or parsed_candidate.get("NL")
+                    nl_value = _normalize_text(nl_candidate)
+                if not de_value:
+                    de_candidate = parsed_candidate.get("de") or parsed_candidate.get("DE")
+                    de_value = _normalize_text(de_candidate)
             if not nl_value:
                 partial_nl = extract_json_payload(raw, required_keys=("nl",))
                 if isinstance(partial_nl, Mapping):
-                    nl_value = _normalize_text(partial_nl.get("nl"))
+                    nl_candidate = partial_nl.get("nl") or partial_nl.get("NL")
+                    nl_value = _normalize_text(nl_candidate)
+            if not nl_value:
+                partial_nl_upper = extract_json_payload(raw, required_keys=("NL",))
+                if isinstance(partial_nl_upper, Mapping):
+                    nl_candidate = partial_nl_upper.get("NL") or partial_nl_upper.get("nl")
+                    nl_value = _normalize_text(nl_candidate)
             if not de_value:
                 partial_de = extract_json_payload(raw, required_keys=("de",))
                 if isinstance(partial_de, Mapping):
-                    de_value = _normalize_text(partial_de.get("de"))
+                    de_candidate = partial_de.get("de") or partial_de.get("DE")
+                    de_value = _normalize_text(de_candidate)
+            if not de_value:
+                partial_de_upper = extract_json_payload(raw, required_keys=("DE",))
+                if isinstance(partial_de_upper, Mapping):
+                    de_candidate = partial_de_upper.get("DE") or partial_de_upper.get("de")
+                    de_value = _normalize_text(de_candidate)
             if nl_value and de_value:
                 break
         if nl_value or de_value:
@@ -1341,8 +1419,8 @@ def _translate_description(english_text: str) -> tuple[str, str]:
             return nl_value, de_value
         raise RuntimeError("Failed to parse translation JSON")
 
-    nl = _normalize_text(payload.get("nl"))
-    de = _normalize_text(payload.get("de"))
+    nl = _normalize_text(payload.get("nl") or payload.get("NL"))
+    de = _normalize_text(payload.get("de") or payload.get("DE"))
     return nl, de
 
 
@@ -7286,13 +7364,15 @@ if df_original_key in st.session_state:
             table_rows: list[dict[str, object]] = []
             for product in products or []:
                 entry = descriptions_map.get(product.sku, {}) if isinstance(descriptions_map, Mapping) else {}
+                nl_value = _clean_description_value(entry.get("nl"))
+                de_value = _clean_description_value(entry.get("de"))
                 table_rows.append(
                     {
                         "SKU": product.sku,
                         "Name": product.name,
                         "EN Description": _clean_description_value(entry.get("en")),
-                        "NL Description": _clean_description_value(entry.get("nl")),
-                        "DE Description": _clean_description_value(entry.get("de")),
+                        "NL Description": _decorate_truncated_translation(nl_value),
+                        "DE Description": _decorate_truncated_translation(de_value),
                     }
                 )
 
@@ -7323,8 +7403,8 @@ if df_original_key in st.session_state:
                             continue
                         new_map[sku] = {
                             "en": _clean_description_value(row.get("EN Description")),
-                            "nl": _clean_description_value(row.get("NL Description")),
-                            "de": _clean_description_value(row.get("DE Description")),
+                            "nl": _strip_truncation_warning(row.get("NL Description")),
+                            "de": _strip_truncation_warning(row.get("DE Description")),
                         }
                     if new_map:
                         descriptions_map = st.session_state.get("descriptions")
