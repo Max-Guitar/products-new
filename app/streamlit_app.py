@@ -1098,7 +1098,7 @@ def _call_openai_text(
     temperature: float = 0.7,
     max_tokens: int = 1100,
     response_format: dict[str, object] | None = None,
-    timeout: int = 120,
+    timeout: int = 60,
 ) -> str:
     client_kwargs = _openai_client_kwargs()
     try:
@@ -1141,13 +1141,19 @@ def _call_openai_text(
         }
     )
 
-    try:
-        chat = client.chat.completions.create(**kwargs)
-    except Exception as exc:  # pragma: no cover - API failure handling
-        stripped_kwargs = dict(kwargs)
+    openai_timeout_exc = getattr(getattr(openai, "error", None), "Timeout", None)
+    timeout_errors: tuple[type[Exception], ...] = ()
+    if isinstance(openai_timeout_exc, type) and issubclass(openai_timeout_exc, Exception):
+        timeout_errors += (openai_timeout_exc,)
+    requests_timeout_exc = getattr(requests.exceptions, "Timeout", None)
+    if isinstance(requests_timeout_exc, type) and issubclass(requests_timeout_exc, Exception):
+        timeout_errors += (requests_timeout_exc,)
+
+    def _handle_failure(exc: Exception, current_kwargs: dict[str, object]):
+        stripped_kwargs = dict(current_kwargs)
         for key in ("temperature", "response_format", "max_completion_tokens"):
             stripped_kwargs.pop(key, None)
-        if stripped_kwargs != kwargs:
+        if stripped_kwargs != current_kwargs:
             trace(
                 {
                     "where": "step3:openai_retry",
@@ -1156,11 +1162,32 @@ def _call_openai_text(
                 }
             )
             try:
-                chat = client.chat.completions.create(**stripped_kwargs)
+                return client.chat.completions.create(**stripped_kwargs)
             except Exception as retry_exc:  # pragma: no cover - API failure handling
                 raise RuntimeError(f"OpenAI request failed: {retry_exc}") from retry_exc
-        else:
-            raise RuntimeError(f"OpenAI request failed: {exc}") from exc
+        raise RuntimeError(f"OpenAI request failed: {exc}") from exc
+
+    try:
+        chat = client.chat.completions.create(**kwargs)
+    except timeout_errors as exc:  # pragma: no cover - API failure handling
+        trace(
+            {
+                "where": "step3:openai_timeout",
+                "model": resolved_model,
+                "err": str(exc)[:200],
+                "info": "Timeout occurred, retrying with 90s",
+            }
+        )
+        time.sleep(2)
+        retry_kwargs = dict(kwargs)
+        retry_kwargs["timeout"] = max(90, int(retry_kwargs.get("timeout", 0) or 0))
+        kwargs = retry_kwargs
+        try:
+            chat = client.chat.completions.create(**kwargs)
+        except Exception as retry_exc:  # pragma: no cover - API failure handling
+            chat = _handle_failure(retry_exc, kwargs)
+    except Exception as exc:  # pragma: no cover - API failure handling
+        chat = _handle_failure(exc, kwargs)
 
     try:
         content = chat.choices[0].message.content or ""
