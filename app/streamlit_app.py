@@ -1953,16 +1953,17 @@ def _ensure_descriptions_initialized(products: Sequence[Step3Product]) -> None:
 
 def _generate_descriptions_for_products(
     products: Sequence[Step3Product],
-) -> tuple[dict[str, dict[str, str]], list[str]]:
+) -> tuple[dict[str, dict[str, str]], list[str], list[str]]:
     results: dict[str, dict[str, str]] = {}
     errors: list[str] = []
+    missing_sources: list[str] = []
     stored = st.session_state.get("descriptions")
     if not isinstance(stored, dict):
         stored = {}
 
     total = len(products)
     if not total:
-        return results, errors
+        return results, errors, missing_sources
 
     estimated_total_time_sec = max(1, total * 60)
     start_time = time.time()
@@ -1993,10 +1994,10 @@ def _generate_descriptions_for_products(
         for product in products_to_translate:
             previous_entry = previous_map.get(product.sku, {})
             en_text = _clean_description_value(previous_entry.get("en"))
-            if not en_text:
+            if not en_text.strip():
                 en_text = _clean_description_value(product.short_description)
 
-            if en_text:
+            if en_text.strip():
                 try:
                     nl, de, es, fr = _translate_description(en_text)
                 except Exception as exc:
@@ -2024,6 +2025,13 @@ def _generate_descriptions_for_products(
                         "fr": fr,
                     }
             else:
+                missing_sources.append(product.sku)
+                trace(
+                    {
+                        "where": "step3:translate_missing_source",
+                        "sku": product.sku,
+                    }
+                )
                 results[product.sku] = {
                     "en": en_text,
                     "nl": "",
@@ -2083,7 +2091,7 @@ def _generate_descriptions_for_products(
     eta_placeholder.write(f"Completed in {minutes}:{seconds:02d}")
     timer_placeholder.empty()
 
-    return results, errors
+    return results, errors, missing_sources
 
 
 def _apply_descriptions_to_state(descriptions_map: Mapping[str, Mapping[str, object]]) -> set[str]:
@@ -7523,7 +7531,9 @@ if df_original_key in st.session_state:
                 st.session_state["step3_generation_pending"] = False
 
             if st.session_state.get("step3_generation_pending") and products:
-                results, errors = _generate_descriptions_for_products(products)
+                results, errors, missing_sources = _generate_descriptions_for_products(
+                    products
+                )
                 descriptions_map = st.session_state.get("descriptions")
                 if not isinstance(descriptions_map, dict):
                     descriptions_map = {}
@@ -7531,6 +7541,7 @@ if df_original_key in st.session_state:
                     descriptions_map[sku] = payload
                 st.session_state["descriptions"] = descriptions_map
                 step3_state["errors"] = errors
+                step3_state["missing_sources"] = missing_sources
                 st.session_state["step3_generation_pending"] = False
 
             errors = step3_state.get("errors") or []
@@ -7540,6 +7551,14 @@ if df_original_key in st.session_state:
                     "The NL/DE fields for these items have been left blank."
                 )
                 st.write("\n".join(f"- {msg}" for msg in errors))
+
+            missing_sources = step3_state.get("missing_sources") or []
+            if missing_sources:
+                st.warning(
+                    "Translations were not generated for some products because the "
+                    "English description was empty."
+                )
+                st.write("\n".join(f"- {sku}" for sku in sorted(set(missing_sources))))
 
             descriptions_map = st.session_state.get("descriptions", {})
             table_rows: list[dict[str, object]] = []
