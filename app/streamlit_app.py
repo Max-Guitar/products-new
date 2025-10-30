@@ -7,6 +7,8 @@ import math
 import sys
 from pathlib import Path
 import os
+import threading
+import time
 import traceback
 from string import Template
 
@@ -1932,24 +1934,59 @@ def _generate_descriptions_for_products(
         stored = {}
 
     total = len(products)
-    progress = None
-    if total:
-        progress = st.progress(
-            0.0,
-            text=f"Generating descriptions and translations… {total} remaining",
-        )
+    if not total:
+        return results, errors
 
-    for index, product in enumerate(products, start=1):
-        previous_entry = stored.get(product.sku, {})
-        if not product.generate:
-            en_text = _clean_description_value(previous_entry.get("en"))
-            if not en_text:
-                en_text = _clean_description_value(product.short_description)
+    estimated_total_time_sec = max(1, total * 60)
+    start_time = time.time()
+    progress = st.progress(0.0, text="Generating descriptions and translations…")
+    eta_placeholder = st.empty()
+    timer_placeholder = st.empty()
+    eta_minutes = math.ceil(estimated_total_time_sec / 60)
+    eta_placeholder.write(
+        f"ETA: ~{eta_minutes} minute{'s' if eta_minutes != 1 else ''}"
+    )
+    timer_placeholder.write(
+        f"Time remaining: {estimated_total_time_sec // 60:02d}:{estimated_total_time_sec % 60:02d}"
+    )
 
-            if en_text:
-                try:
-                    nl, de, es, fr = _translate_description(en_text)
-                except Exception as exc:
+    def _run_generation() -> None:
+        nonlocal results, errors
+        for product in products:
+            previous_entry = stored.get(product.sku, {})
+            if not product.generate:
+                en_text = _clean_description_value(previous_entry.get("en"))
+                if not en_text:
+                    en_text = _clean_description_value(product.short_description)
+
+                if en_text:
+                    try:
+                        nl, de, es, fr = _translate_description(en_text)
+                    except Exception as exc:
+                        results[product.sku] = {
+                            "en": en_text,
+                            "nl": "",
+                            "de": "",
+                            "es": "",
+                            "fr": "",
+                        }
+                        errors.append(f"{product.sku}: {exc}")
+                        trace(
+                            {
+                                "where": "step3:translate_error",
+                                "sku": product.sku,
+                                "err": str(exc)[:200],
+                            }
+                        )
+                    else:
+                        results[product.sku] = {
+                            "en": en_text,
+                            "nl": nl,
+                            "de": de,
+                            "es": es,
+                            "fr": fr,
+                        }
+                else:
                     results[product.sku] = {
                         "en": en_text,
                         "nl": "",
@@ -1957,71 +1994,56 @@ def _generate_descriptions_for_products(
                         "es": "",
                         "fr": "",
                     }
-                    errors.append(f"{product.sku}: {exc}")
-                    trace(
-                        {
-                            "where": "step3:translate_error",
-                            "sku": product.sku,
-                            "err": str(exc)[:200],
-                        }
-                    )
-                else:
+            else:
+                trace({"where": "step3:generate:start", "sku": product.sku})
+                try:
+                    en, nl, de, es, fr = _generate_description_for_product(product)
                     results[product.sku] = {
-                        "en": en_text,
+                        "en": en,
                         "nl": nl,
                         "de": de,
                         "es": es,
                         "fr": fr,
                     }
-            else:
-                results[product.sku] = {
-                    "en": en_text,
-                    "nl": "",
-                    "de": "",
-                    "es": "",
-                    "fr": "",
-                }
-        else:
-            trace({"where": "step3:generate:start", "sku": product.sku})
-            try:
-                en, nl, de, es, fr = _generate_description_for_product(product)
-                results[product.sku] = {
-                    "en": en,
-                    "nl": nl,
-                    "de": de,
-                    "es": es,
-                    "fr": fr,
-                }
-                trace({"where": "step3:generate:ok", "sku": product.sku})
-            except Exception as exc:
-                fallback_en = "AI FAILED TO GENERATE"
-                results[product.sku] = {
-                    "en": _clean_description_value(fallback_en),
-                    "nl": "",
-                    "de": "",
-                    "es": "",
-                    "fr": "",
-                }
-                errors.append(f"{product.sku}: {exc}")
-                trace({
-                    "where": "step3:generate:error",
-                    "sku": product.sku,
-                    "err": str(exc)[:200],
-                })
+                    trace({"where": "step3:generate:ok", "sku": product.sku})
+                except Exception as exc:
+                    fallback_en = "AI FAILED TO GENERATE"
+                    results[product.sku] = {
+                        "en": _clean_description_value(fallback_en),
+                        "nl": "",
+                        "de": "",
+                        "es": "",
+                        "fr": "",
+                    }
+                    errors.append(f"{product.sku}: {exc}")
+                    trace({
+                        "where": "step3:generate:error",
+                        "sku": product.sku,
+                        "err": str(exc)[:200],
+                    })
 
-        if progress:
-            remaining = total - index
-            fraction = index / total
-            if remaining <= 0:
-                progress.progress(1.0, text="Generation completed")
-            else:
-                progress.progress(
-                    fraction,
-                    text=f"Generating descriptions and translations… {remaining} remaining",
-                )
+    worker_thread = threading.Thread(target=_run_generation, name="description-generator")
+    worker_thread.start()
 
-    if progress and total:
-        progress.progress(1.0, text="Generation completed")
+    while worker_thread.is_alive():
+        elapsed = time.time() - start_time
+        percent_elapsed = elapsed / estimated_total_time_sec
+        percent_clamped = min(1.0, max(0.0, percent_elapsed))
+        progress.progress(percent_clamped, text="Generating descriptions and translations…")
+        remaining_sec = max(0.0, estimated_total_time_sec - elapsed)
+        timer_placeholder.write(
+            f"Time remaining: {int(remaining_sec // 60):02d}:{int(remaining_sec % 60):02d}"
+        )
+        time.sleep(1)
+
+    worker_thread.join()
+
+    actual_elapsed_time = time.time() - start_time
+    progress.progress(1.0, text="Generating descriptions and translations…")
+    minutes = int(actual_elapsed_time // 60)
+    seconds = int(actual_elapsed_time % 60)
+    eta_placeholder.write(f"Completed in {minutes}:{seconds:02d}")
+    timer_placeholder.empty()
 
     return results, errors
 
