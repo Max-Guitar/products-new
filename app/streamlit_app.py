@@ -1979,41 +1979,27 @@ def _generate_descriptions_for_products(
 
     def _run_generation() -> None:
         nonlocal results, errors
+        previous_map: dict[str, Mapping[str, object]] = {}
         for product in products:
-            previous_entry = stored.get(product.sku, {})
-            if not product.generate:
-                en_text = _clean_description_value(previous_entry.get("en"))
-                if not en_text:
-                    en_text = _clean_description_value(product.short_description)
+            stored_entry = stored.get(product.sku, {})
+            if isinstance(stored_entry, Mapping):
+                previous_map[product.sku] = stored_entry
+            else:
+                previous_map[product.sku] = {}
 
-                if en_text:
-                    try:
-                        nl, de, es, fr = _translate_description(en_text)
-                    except Exception as exc:
-                        results[product.sku] = {
-                            "en": en_text,
-                            "nl": "",
-                            "de": "",
-                            "es": "",
-                            "fr": "",
-                        }
-                        errors.append(f"{product.sku}: {exc}")
-                        trace(
-                            {
-                                "where": "step3:translate_error",
-                                "sku": product.sku,
-                                "err": str(exc)[:200],
-                            }
-                        )
-                    else:
-                        results[product.sku] = {
-                            "en": en_text,
-                            "nl": nl,
-                            "de": de,
-                            "es": es,
-                            "fr": fr,
-                        }
-                else:
+        products_to_translate = [p for p in products if not p.generate]
+        products_to_generate = [p for p in products if p.generate]
+
+        for product in products_to_translate:
+            previous_entry = previous_map.get(product.sku, {})
+            en_text = _clean_description_value(previous_entry.get("en"))
+            if not en_text:
+                en_text = _clean_description_value(product.short_description)
+
+            if en_text:
+                try:
+                    nl, de, es, fr = _translate_description(en_text)
+                except Exception as exc:
                     results[product.sku] = {
                         "en": en_text,
                         "nl": "",
@@ -2021,33 +2007,58 @@ def _generate_descriptions_for_products(
                         "es": "",
                         "fr": "",
                     }
-            else:
-                trace({"where": "step3:generate:start", "sku": product.sku})
-                try:
-                    en, nl, de, es, fr = _generate_description_for_product(product)
+                    errors.append(f"{product.sku}: {exc}")
+                    trace(
+                        {
+                            "where": "step3:translate_error",
+                            "sku": product.sku,
+                            "err": str(exc)[:200],
+                        }
+                    )
+                else:
                     results[product.sku] = {
-                        "en": en,
+                        "en": en_text,
                         "nl": nl,
                         "de": de,
                         "es": es,
                         "fr": fr,
                     }
-                    trace({"where": "step3:generate:ok", "sku": product.sku})
-                except Exception as exc:
-                    fallback_en = "AI FAILED TO GENERATE"
-                    results[product.sku] = {
-                        "en": _clean_description_value(fallback_en),
-                        "nl": "",
-                        "de": "",
-                        "es": "",
-                        "fr": "",
-                    }
-                    errors.append(f"{product.sku}: {exc}")
-                    trace({
-                        "where": "step3:generate:error",
-                        "sku": product.sku,
-                        "err": str(exc)[:200],
-                    })
+            else:
+                results[product.sku] = {
+                    "en": en_text,
+                    "nl": "",
+                    "de": "",
+                    "es": "",
+                    "fr": "",
+                }
+
+        for product in products_to_generate:
+            trace({"where": "step3:generate:start", "sku": product.sku})
+            try:
+                en, nl, de, es, fr = _generate_description_for_product(product)
+                results[product.sku] = {
+                    "en": en,
+                    "nl": nl,
+                    "de": de,
+                    "es": es,
+                    "fr": fr,
+                }
+                trace({"where": "step3:generate:ok", "sku": product.sku})
+            except Exception as exc:
+                fallback_en = "AI FAILED TO GENERATE"
+                results[product.sku] = {
+                    "en": _clean_description_value(fallback_en),
+                    "nl": "",
+                    "de": "",
+                    "es": "",
+                    "fr": "",
+                }
+                errors.append(f"{product.sku}: {exc}")
+                trace({
+                    "where": "step3:generate:error",
+                    "sku": product.sku,
+                    "err": str(exc)[:200],
+                })
 
     worker_thread = threading.Thread(target=_run_generation, name="description-generator")
     worker_thread.start()
