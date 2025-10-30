@@ -1942,13 +1942,45 @@ def _generate_descriptions_for_products(
     for index, product in enumerate(products, start=1):
         previous_entry = stored.get(product.sku, {})
         if not product.generate:
-            results[product.sku] = {
-                "en": product.short_description,
-                "nl": _clean_description_value(previous_entry.get("nl")),
-                "de": _clean_description_value(previous_entry.get("de")),
-                "es": _clean_description_value(previous_entry.get("es")),
-                "fr": _clean_description_value(previous_entry.get("fr")),
-            }
+            en_text = _clean_description_value(previous_entry.get("en"))
+            if not en_text:
+                en_text = _clean_description_value(product.short_description)
+
+            if en_text:
+                try:
+                    nl, de, es, fr = _translate_description(en_text)
+                except Exception as exc:
+                    results[product.sku] = {
+                        "en": en_text,
+                        "nl": "",
+                        "de": "",
+                        "es": "",
+                        "fr": "",
+                    }
+                    errors.append(f"{product.sku}: {exc}")
+                    trace(
+                        {
+                            "where": "step3:translate_error",
+                            "sku": product.sku,
+                            "err": str(exc)[:200],
+                        }
+                    )
+                else:
+                    results[product.sku] = {
+                        "en": en_text,
+                        "nl": nl,
+                        "de": de,
+                        "es": es,
+                        "fr": fr,
+                    }
+            else:
+                results[product.sku] = {
+                    "en": en_text,
+                    "nl": "",
+                    "de": "",
+                    "es": "",
+                    "fr": "",
+                }
         else:
             trace({"where": "step3:generate:start", "sku": product.sku})
             try:
