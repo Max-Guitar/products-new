@@ -1276,30 +1276,52 @@ def _translate_description(english_text: str) -> tuple[str, str, str, str]:
     )
     raw_candidates: list[str] = []
 
+    language_names = {
+        "nl": "Dutch",
+        "de": "German",
+        "es": "Spanish",
+        "fr": "French",
+    }
+
+    def _format_language_list(labels: Sequence[str]) -> str:
+        if not labels:
+            return ""
+        if len(labels) == 1:
+            return labels[0]
+        if len(labels) == 2:
+            return " and ".join(labels)
+        return ", ".join(labels[:-1]) + f", and {labels[-1]}"
+
     def _run_models(
         text: str,
         attempt_label: str,
+        languages: tuple[str, ...],
     ) -> dict[str, object] | None:
         local_raw: list[str] = []
+
+        json_keys = ", ".join(f"\\\"{lang}\\\": \\\"...\\\"" for lang in languages)
+        labels = [f"{language_names.get(lang, lang)} ({lang})" for lang in languages]
+        language_list = _format_language_list(labels)
+        system_prompt = (
+            "You translate professional musical instrument copy. Respond ONLY "
+            f"with JSON: {{{json_keys}}}. Do not wrap inside 'description' or 'name'. "
+            "No markdown. No prose."
+        )
+        user_prompt = (
+            "Translate the following English guitar product description into "
+            f"{language_list}. Use natural marketing language and keep line breaks.\n\n"
+            f"TEXT:\n{text.strip()}"
+        )
 
         def _attempt(model_name: str) -> dict[str, object] | None:
             try:
                 return _call_openai_json(
                     model_name,
-                    (
-                        "You translate professional musical instrument copy. Respond ONLY "
-                        "with JSON: {\"nl\": \"...\", \"de\": \"...\", \"es\": \"...\", \"fr\": \"...\"}. Do not wrap "
-                        "inside 'description' or 'name'. No markdown. No prose."
-                    ),
-                    (
-                        "Translate the following English guitar product description into "
-                        "Dutch (nl), German (de), Spanish (es), and French (fr). Use natural marketing language and keep "
-                        "line breaks.\n\n"
-                        f"TEXT:\n{text.strip()}"
-                    ),
+                    system_prompt,
+                    user_prompt,
                     temperature=0.2,
-                    required_keys=("nl", "de", "es", "fr"),
-                    max_tokens=2000,
+                    required_keys=languages,
+                    max_tokens=2500,
                 )
             except JSONPayloadError as exc:
                 trace(
@@ -1366,19 +1388,30 @@ def _translate_description(english_text: str) -> tuple[str, str, str, str]:
 
         return payload
 
-    payload = _run_models(english_text, "full")
+    results: dict[str, str] = {}
 
-    if payload is None and len(english_text) > 4000:
-        paragraphs = english_text.split("\n\n")
-        shortened_text = "\n\n".join(paragraphs[:3]).strip()
-        if shortened_text and len(shortened_text) < len(english_text):
-            payload = _run_models(shortened_text, "shortened")
+    def _translate_pair(languages: tuple[str, ...]) -> dict[str, object] | None:
+        pair_label = "/".join(languages)
+        payload = _run_models(english_text, f"full:{pair_label}", languages)
+        if payload is None and len(english_text) > 4000:
+            paragraphs = english_text.split("\n\n")
+            shortened_text = "\n\n".join(paragraphs[:3]).strip()
+            if shortened_text and len(shortened_text) < len(english_text):
+                payload = _run_models(shortened_text, f"shortened:{pair_label}", languages)
+        return payload
 
-    if payload is None:
-        nl_value = ""
-        de_value = ""
-        es_value = ""
-        fr_value = ""
+    for language_pair in (("nl", "de"), ("es", "fr")):
+        payload = _translate_pair(language_pair)
+        if payload:
+            for lang in language_pair:
+                value = payload.get(lang) or payload.get(lang.upper())
+                results[lang] = _normalize_text(value)
+
+    if not all(results.get(lang) for lang in ("nl", "de", "es", "fr")):
+        nl_value = results.get("nl", "")
+        de_value = results.get("de", "")
+        es_value = results.get("es", "")
+        fr_value = results.get("fr", "")
         for raw in raw_candidates:
             parsed_candidate = extract_json_payload(raw)
             if isinstance(parsed_candidate, Mapping):
@@ -1449,11 +1482,12 @@ def _translate_description(english_text: str) -> tuple[str, str, str, str]:
             return nl_value, de_value, es_value, fr_value
         raise RuntimeError("Failed to parse translation JSON")
 
-    nl = _normalize_text(payload.get("nl") or payload.get("NL"))
-    de = _normalize_text(payload.get("de") or payload.get("DE"))
-    es = _normalize_text(payload.get("es") or payload.get("ES"))
-    fr = _normalize_text(payload.get("fr") or payload.get("FR"))
-    return nl, de, es, fr
+    return (
+        results.get("nl", ""),
+        results.get("de", ""),
+        results.get("es", ""),
+        results.get("fr", ""),
+    )
 
 
 def _categorize_product(product: Step3Product) -> str:
