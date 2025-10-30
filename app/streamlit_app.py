@@ -1860,6 +1860,20 @@ def _generate_effect_copy(product: Step3Product) -> tuple[str, str, str, str, st
 
 
 def _generate_description_for_product(product: Step3Product) -> tuple[str, str, str, str, str]:
+    if not product.generate:
+        descriptions = st.session_state.get("descriptions")
+        if isinstance(descriptions, Mapping):
+            stored_entry = descriptions.get(product.sku)
+            if isinstance(stored_entry, Mapping):
+                en_body = _clean_description_value(stored_entry.get("en"))
+                if en_body:
+                    return (
+                        en_body,
+                        _clean_description_value(stored_entry.get("nl")),
+                        _clean_description_value(stored_entry.get("de")),
+                        _clean_description_value(stored_entry.get("es")),
+                        _clean_description_value(stored_entry.get("fr")),
+                    )
     category = _categorize_product(product)
     if category == "acoustic":
         return _generate_acoustic_copy(product)
