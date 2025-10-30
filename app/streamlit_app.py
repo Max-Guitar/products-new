@@ -1952,8 +1952,6 @@ def _ensure_descriptions_initialized(products: Sequence[Step3Product]) -> None:
         de_text = stored.get("de")
         es_text = stored.get("es")
         fr_text = stored.get("fr")
-        if not _clean_description_value(en_text):
-            en_text = product.short_description
         descriptions[product.sku] = {
             "en": _clean_description_value(en_text),
             "nl": _clean_description_value(nl_text),
