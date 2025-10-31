@@ -2043,10 +2043,21 @@ def _generate_descriptions_for_products(
         nonlocal results, errors, skipped_items
         items_to_generate: list[Step3Product] = []
         items_to_translate: list[Step3Product] = []
+        skipped_items = []
 
         for product in products:
             generate_flag = product.generate
-            short_text = _clean_description_value(product.short_description)
+            short_text = _clean_description_value(product.short_description or "")
+            sku = product.sku or "UNKNOWN"
+
+            trace(
+                {
+                    "stage": "filter_products_for_step3",
+                    "sku": sku,
+                    "generate": generate_flag,
+                    "short_text_exists": bool(short_text.strip()),
+                }
+            )
 
             if generate_flag is True:
                 items_to_generate.append(product)
@@ -7547,6 +7558,12 @@ if df_original_key in st.session_state:
                                                 st.caption("Payload еще не собирался.")
 
                                     st.markdown("---")
+                                    step3_state = st.session_state.setdefault("step3", {})
+                                    preview_products_seq = step3_state.get("products")
+                                    if preview_products_seq is None:
+                                        preview_products_seq = _build_step3_products()
+                                    preview_products = list(preview_products_seq or [])
+
                                     c1, c2 = st.columns([1, 1])
                                     btn_generate = c1.button(
                                         "🌐 Generate Descriptions/Translation",
@@ -7558,9 +7575,8 @@ if df_original_key in st.session_state:
                                     )
 
                                     if btn_generate:
-                                        products = _build_step3_products()
+                                        products = list(preview_products)
                                         _ensure_descriptions_initialized(products)
-                                        step3_state = st.session_state.setdefault("step3", {})
                                         step3_state["products"] = products
                                         step3_state["errors"] = []
                                         st.session_state["step3_active"] = True
@@ -7570,6 +7586,45 @@ if df_original_key in st.session_state:
                                     if btn_reset:
                                         _reset_step2_state()
                                         st.rerun()
+
+                                    items_to_generate_preview: list[Step3Product] = []
+                                    items_to_translate_preview: list[Step3Product] = []
+                                    skipped_preview: list[Step3Product] = []
+
+                                    for product in preview_products:
+                                        generate_flag = product.generate
+                                        short_text = _clean_description_value(
+                                            product.short_description or ""
+                                        )
+                                        if generate_flag is True:
+                                            items_to_generate_preview.append(product)
+                                        elif short_text.strip():
+                                            items_to_translate_preview.append(product)
+                                        else:
+                                            skipped_preview.append(product)
+
+                                    st.markdown("### ⏱️ Генерация Step 3: отбор товаров")
+
+                                    st.info(
+                                        f"🟢 Will generate descriptions: {len(items_to_generate_preview)}"
+                                    )
+                                    st.info(
+                                        f"🟡 Will translate only (existing text): {len(items_to_translate_preview)}"
+                                    )
+
+                                    if skipped_preview:
+                                        st.warning(
+                                            f"⚠️ Skipped {len(skipped_preview)} item(s): no text and generation disabled"
+                                        )
+                                        with st.expander("Просмотреть список пропущенных SKU"):
+                                            st.code(
+                                                "\n".join(
+                                                    [
+                                                        str(product.sku or "UNKNOWN")
+                                                        for product in skipped_preview
+                                                    ]
+                                                )
+                                            )
 
                                     trace_json = json.dumps(
                                         trace_events,
