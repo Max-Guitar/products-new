@@ -1909,7 +1909,7 @@ def _generate_description_for_product(
         trace(f"[GEN_DONE] SKU: {product.sku} | en length: {len(en_text) if en_text else 0}")
         return result
 
-    # Fallback path is only used when a product is explicitly marked to skip AI
+    # Skip only if generate_description is False
     if not product.generate:
         descriptions = st.session_state.get("descriptions")
         if isinstance(descriptions, Mapping):
@@ -1917,18 +1917,16 @@ def _generate_description_for_product(
             if isinstance(stored_entry, Mapping):
                 en_body = _clean_description_value(stored_entry.get("en"))
                 if en_body:
-                    result = (
+                    trace(
+                        f"[GEN_DONE] SKU: {product.sku} | en length: {len(en_body) if en_body else 0}"
+                    )
+                    return (
                         en_body,
                         _clean_description_value(stored_entry.get("nl")),
                         _clean_description_value(stored_entry.get("de")),
                         _clean_description_value(stored_entry.get("es")),
                         _clean_description_value(stored_entry.get("fr")),
                     )
-                    en_text = result[0]
-                    trace(
-                        f"[GEN_DONE] SKU: {product.sku} | en length: {len(en_text) if en_text else 0}"
-                    )
-                    return result
 
     # Ensure we always return a 5-tuple, even if there is no stored data.
     en_text = _clean_description_value(product.short_description)
