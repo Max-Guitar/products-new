@@ -1902,33 +1902,36 @@ def _generate_description_for_product(
         generator = generators.get(resolved, _generate_accessory_copy)
         return generator(product)
 
-    result: tuple[str, str, str, str, str] | None = None
-
     if product.generate:
         category = _categorize_product(product)
         result = _dispatch(category)
-    else:
-        descriptions = st.session_state.get("descriptions")
-        if isinstance(descriptions, Mapping):
-            stored_entry = descriptions.get(product.sku)
-            if isinstance(stored_entry, Mapping):
-                en_body = _clean_description_value(stored_entry.get("en"))
-                if en_body:
-                    result = (
-                        en_body,
-                        _clean_description_value(stored_entry.get("nl")),
-                        _clean_description_value(stored_entry.get("de")),
-                        _clean_description_value(stored_entry.get("es")),
-                        _clean_description_value(stored_entry.get("fr")),
-                    )
-        if result is None:
-            category = _categorize_product(product)
-            result = _dispatch(category)
+        en_text = result[0] if isinstance(result, tuple) and result else ""
+        trace(f"[GEN_DONE] SKU: {product.sku} | en length: {len(en_text) if en_text else 0}")
+        return result
 
-    if result is None:
-        result = _dispatch(None)
+    # Fallback path is only used when a product is explicitly marked to skip AI
+    descriptions = st.session_state.get("descriptions")
+    if isinstance(descriptions, Mapping):
+        stored_entry = descriptions.get(product.sku)
+        if isinstance(stored_entry, Mapping):
+            en_body = _clean_description_value(stored_entry.get("en"))
+            if en_body:
+                result = (
+                    en_body,
+                    _clean_description_value(stored_entry.get("nl")),
+                    _clean_description_value(stored_entry.get("de")),
+                    _clean_description_value(stored_entry.get("es")),
+                    _clean_description_value(stored_entry.get("fr")),
+                )
+                en_text = result[0]
+                trace(
+                    f"[GEN_DONE] SKU: {product.sku} | en length: {len(en_text) if en_text else 0}"
+                )
+                return result
 
-    en_text = result[0] if isinstance(result, tuple) and result else ""
+    # Ensure we always return a 5-tuple, even if there is no stored data.
+    en_text = _clean_description_value(product.short_description)
+    result = (en_text, "", "", "", "")
     trace(f"[GEN_DONE] SKU: {product.sku} | en length: {len(en_text) if en_text else 0}")
     return result
 
@@ -2048,11 +2051,13 @@ def _generate_descriptions_for_products(
             stored_entry = stored.get(product.sku, {})
             if isinstance(stored_entry, Mapping):
                 previous_entry = stored_entry
-            en_text = _clean_description_value(previous_entry.get("en"))
+
+            en_text = _clean_description_value(product.short_description)
             if not en_text.strip():
-                en_text = _clean_description_value(product.short_description)
+                en_text = _clean_description_value(previous_entry.get("en"))
 
             if en_text.strip():
+                trace({"where": "step3:translate:start", "sku": product.sku})
                 try:
                     nl, de, es, fr = _translate_description(en_text, sku=product.sku)
                 except Exception as exc:
@@ -2082,6 +2087,7 @@ def _generate_descriptions_for_products(
                         "es": es,
                         "fr": fr,
                     }
+                    trace({"where": "step3:translate:ok", "sku": product.sku})
             else:
                 missing_sources.append(product.sku)
                 trace(
