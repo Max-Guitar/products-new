@@ -1860,20 +1860,34 @@ def _generate_effect_copy(product: Step3Product) -> tuple[str, str, str, str, st
 
 
 def _generate_description_for_product(product: Step3Product) -> tuple[str, str, str, str, str]:
-    if not product.generate:
-        descriptions = st.session_state.get("descriptions")
-        if isinstance(descriptions, Mapping):
-            stored_entry = descriptions.get(product.sku)
-            if isinstance(stored_entry, Mapping):
-                en_body = _clean_description_value(stored_entry.get("en"))
-                if en_body:
-                    return (
-                        en_body,
-                        _clean_description_value(stored_entry.get("nl")),
-                        _clean_description_value(stored_entry.get("de")),
-                        _clean_description_value(stored_entry.get("es")),
-                        _clean_description_value(stored_entry.get("fr")),
-                    )
+    if product.generate:
+        category = _categorize_product(product)
+        if category == "acoustic":
+            return _generate_acoustic_copy(product)
+        if category == "electric":
+            return _generate_electric_copy(product)
+        if category == "bass":
+            return _generate_bass_copy(product)
+        if category == "amp":
+            return _generate_amp_copy(product)
+        if category == "effect":
+            return _generate_effect_copy(product)
+        return _generate_accessory_copy(product)
+
+    descriptions = st.session_state.get("descriptions")
+    if isinstance(descriptions, Mapping):
+        stored_entry = descriptions.get(product.sku)
+        if isinstance(stored_entry, Mapping):
+            en_body = _clean_description_value(stored_entry.get("en"))
+            if en_body:
+                return (
+                    en_body,
+                    _clean_description_value(stored_entry.get("nl")),
+                    _clean_description_value(stored_entry.get("de")),
+                    _clean_description_value(stored_entry.get("es")),
+                    _clean_description_value(stored_entry.get("fr")),
+                )
+
     category = _categorize_product(product)
     if category == "acoustic":
         return _generate_acoustic_copy(product)
@@ -1992,19 +2006,14 @@ def _generate_descriptions_for_products(
 
     def _run_generation() -> None:
         nonlocal results, errors
-        previous_map: dict[str, Mapping[str, object]] = {}
-        for product in products:
-            stored_entry = stored.get(product.sku, {})
-            if isinstance(stored_entry, Mapping):
-                previous_map[product.sku] = stored_entry
-            else:
-                previous_map[product.sku] = {}
-
         products_to_translate = [p for p in products if not p.generate]
         products_to_generate = [p for p in products if p.generate]
 
         for product in products_to_translate:
-            previous_entry = previous_map.get(product.sku, {})
+            previous_entry: Mapping[str, object] = {}
+            stored_entry = stored.get(product.sku, {})
+            if isinstance(stored_entry, Mapping):
+                previous_entry = stored_entry
             en_text = _clean_description_value(previous_entry.get("en"))
             if not en_text.strip():
                 en_text = _clean_description_value(product.short_description)
