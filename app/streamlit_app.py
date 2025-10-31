@@ -2040,10 +2040,16 @@ def _generate_descriptions_for_products(
 
     def _run_generation() -> None:
         nonlocal results, errors
-        products_to_translate = [p for p in products if not p.generate]
-        products_to_generate = [p for p in products if p.generate]
+        items_to_translate: list[Step3Product] = []
+        items_to_generate: list[Step3Product] = []
 
-        for product in products_to_translate:
+        for product in products:
+            if product.generate is True:
+                items_to_generate.append(product)
+            else:
+                items_to_translate.append(product)
+
+        for product in items_to_translate:
             trace(
                 f"[GEN] SKU: {product.sku} | generate={product.generate} | attr_set={product.attribute_set_id}"
             )
@@ -2104,7 +2110,7 @@ def _generate_descriptions_for_products(
                     "fr": "",
                 }
 
-        for product in products_to_generate:
+        for product in items_to_generate:
             trace(
                 f"[GEN] SKU: {product.sku} | generate={product.generate} | attr_set={product.attribute_set_id}"
             )
