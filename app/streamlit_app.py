@@ -2013,17 +2013,18 @@ def _ensure_descriptions_initialized(products: Sequence[Step3Product]) -> None:
 
 def _generate_descriptions_for_products(
     products: Sequence[Step3Product],
-) -> tuple[dict[str, dict[str, str]], list[str], list[str]]:
+) -> tuple[dict[str, dict[str, str]], list[str], list[str], list[Step3Product]]:
     results: dict[str, dict[str, str]] = {}
     errors: list[str] = []
     missing_sources: list[str] = []
+    skipped_items: list[Step3Product] = []
     stored = st.session_state.get("descriptions")
     if not isinstance(stored, dict):
         stored = {}
 
     total = len(products)
     if not total:
-        return results, errors, missing_sources
+        return results, errors, missing_sources, skipped_items
 
     estimated_total_time_sec = max(1, total * 60)
     start_time = time.time()
@@ -2039,15 +2040,20 @@ def _generate_descriptions_for_products(
     )
 
     def _run_generation() -> None:
-        nonlocal results, errors
-        items_to_translate: list[Step3Product] = []
+        nonlocal results, errors, skipped_items
         items_to_generate: list[Step3Product] = []
+        items_to_translate: list[Step3Product] = []
 
         for product in products:
-            if product.generate is True:
+            generate_flag = product.generate
+            short_text = _clean_description_value(product.short_description)
+
+            if generate_flag is True:
                 items_to_generate.append(product)
-            else:
+            elif short_text.strip():
                 items_to_translate.append(product)
+            else:
+                skipped_items.append(product)
 
         for product in items_to_translate:
             trace(
@@ -2165,7 +2171,7 @@ def _generate_descriptions_for_products(
     eta_placeholder.write(f"Completed in {minutes}:{seconds:02d}")
     timer_placeholder.empty()
 
-    return results, errors, missing_sources
+    return results, errors, missing_sources, skipped_items
 
 
 def _apply_descriptions_to_state(descriptions_map: Mapping[str, Mapping[str, object]]) -> set[str]:
@@ -7595,6 +7601,7 @@ if df_original_key in st.session_state:
             st.header("Step 3. Generate and review descriptions")
 
             step3_state = st.session_state.setdefault("step3", {})
+            step3_state.setdefault("skipped", [])
             products = step3_state.get("products")
             if not products:
                 products = _build_step3_products()
@@ -7605,9 +7612,12 @@ if df_original_key in st.session_state:
                 st.session_state["step3_generation_pending"] = False
 
             if st.session_state.get("step3_generation_pending") and products:
-                results, errors, missing_sources = _generate_descriptions_for_products(
-                    products
-                )
+                (
+                    results,
+                    errors,
+                    missing_sources,
+                    skipped_items,
+                ) = _generate_descriptions_for_products(products)
                 descriptions_map = st.session_state.get("descriptions")
                 if not isinstance(descriptions_map, dict):
                     descriptions_map = {}
@@ -7616,6 +7626,7 @@ if df_original_key in st.session_state:
                 st.session_state["descriptions"] = descriptions_map
                 step3_state["errors"] = errors
                 step3_state["missing_sources"] = missing_sources
+                step3_state["skipped"] = skipped_items
                 st.session_state["step3_generation_pending"] = False
 
             errors = step3_state.get("errors") or []
@@ -7692,6 +7703,20 @@ if df_original_key in st.session_state:
                             descriptions_map = {}
                         descriptions_map.update(new_map)
                         st.session_state["descriptions"] = descriptions_map
+
+                skipped_products: Sequence[Step3Product] = step3_state.get("skipped") or []
+                if skipped_products:
+                    st.warning(
+                        f"{len(skipped_products)} product(s) were skipped: description generation disabled and no existing text found.",
+                        icon="⚠️",
+                    )
+                    with st.expander("Show skipped SKUs"):
+                        st.code(
+                            ", ".join(
+                                getattr(product, "sku", "UNKNOWN")
+                                for product in skipped_products
+                            )
+                        )
 
                 btn_step3_save = st.button("💾 Save to Magento", key="btn_step3_save")
                 if btn_step3_save:
