@@ -7,8 +7,6 @@ import math
 import sys
 from pathlib import Path
 import os
-import threading
-import time
 import traceback
 from string import Template
 
@@ -1098,7 +1096,7 @@ def _call_openai_text(
     temperature: float = 0.7,
     max_tokens: int = 1100,
     response_format: dict[str, object] | None = None,
-    timeout: int = 60,
+    timeout: int = 120,
 ) -> str:
     client_kwargs = _openai_client_kwargs()
     try:
@@ -1141,19 +1139,13 @@ def _call_openai_text(
         }
     )
 
-    openai_timeout_exc = getattr(getattr(openai, "error", None), "Timeout", None)
-    timeout_errors: tuple[type[Exception], ...] = ()
-    if isinstance(openai_timeout_exc, type) and issubclass(openai_timeout_exc, Exception):
-        timeout_errors += (openai_timeout_exc,)
-    requests_timeout_exc = getattr(requests.exceptions, "Timeout", None)
-    if isinstance(requests_timeout_exc, type) and issubclass(requests_timeout_exc, Exception):
-        timeout_errors += (requests_timeout_exc,)
-
-    def _handle_failure(exc: Exception, current_kwargs: dict[str, object]):
-        stripped_kwargs = dict(current_kwargs)
+    try:
+        chat = client.chat.completions.create(**kwargs)
+    except Exception as exc:  # pragma: no cover - API failure handling
+        stripped_kwargs = dict(kwargs)
         for key in ("temperature", "response_format", "max_completion_tokens"):
             stripped_kwargs.pop(key, None)
-        if stripped_kwargs != current_kwargs:
+        if stripped_kwargs != kwargs:
             trace(
                 {
                     "where": "step3:openai_retry",
@@ -1162,32 +1154,11 @@ def _call_openai_text(
                 }
             )
             try:
-                return client.chat.completions.create(**stripped_kwargs)
+                chat = client.chat.completions.create(**stripped_kwargs)
             except Exception as retry_exc:  # pragma: no cover - API failure handling
                 raise RuntimeError(f"OpenAI request failed: {retry_exc}") from retry_exc
-        raise RuntimeError(f"OpenAI request failed: {exc}") from exc
-
-    try:
-        chat = client.chat.completions.create(**kwargs)
-    except timeout_errors as exc:  # pragma: no cover - API failure handling
-        trace(
-            {
-                "where": "step3:openai_timeout",
-                "model": resolved_model,
-                "err": str(exc)[:200],
-                "info": "Timeout occurred, retrying with 90s",
-            }
-        )
-        time.sleep(2)
-        retry_kwargs = dict(kwargs)
-        retry_kwargs["timeout"] = max(90, int(retry_kwargs.get("timeout", 0) or 0))
-        kwargs = retry_kwargs
-        try:
-            chat = client.chat.completions.create(**kwargs)
-        except Exception as retry_exc:  # pragma: no cover - API failure handling
-            chat = _handle_failure(retry_exc, kwargs)
-    except Exception as exc:  # pragma: no cover - API failure handling
-        chat = _handle_failure(exc, kwargs)
+        else:
+            raise RuntimeError(f"OpenAI request failed: {exc}") from exc
 
     try:
         content = chat.choices[0].message.content or ""
@@ -1961,116 +1932,64 @@ def _generate_descriptions_for_products(
         stored = {}
 
     total = len(products)
-    if not total:
-        return results, errors
-
-    estimated_total_time_sec = max(1, total * 60)
-    start_time = time.time()
-    progress = st.progress(0.0, text="Generating descriptions and translations…")
-    eta_placeholder = st.empty()
-    timer_placeholder = st.empty()
-    eta_minutes = math.ceil(estimated_total_time_sec / 60)
-    eta_placeholder.write(
-        f"ETA: ~{eta_minutes} minute{'s' if eta_minutes != 1 else ''}"
-    )
-    timer_placeholder.write(
-        f"Time remaining: {estimated_total_time_sec // 60:02d}:{estimated_total_time_sec % 60:02d}"
-    )
-
-    def _run_generation() -> None:
-        nonlocal results, errors
-        for product in products:
-            previous_entry = stored.get(product.sku, {})
-            if not product.generate:
-                en_text = _clean_description_value(previous_entry.get("en"))
-                if not en_text:
-                    en_text = _clean_description_value(product.short_description)
-
-                if en_text:
-                    try:
-                        nl, de, es, fr = _translate_description(en_text)
-                    except Exception as exc:
-                        results[product.sku] = {
-                            "en": en_text,
-                            "nl": "",
-                            "de": "",
-                            "es": "",
-                            "fr": "",
-                        }
-                        errors.append(f"{product.sku}: {exc}")
-                        trace(
-                            {
-                                "where": "step3:translate_error",
-                                "sku": product.sku,
-                                "err": str(exc)[:200],
-                            }
-                        )
-                    else:
-                        results[product.sku] = {
-                            "en": en_text,
-                            "nl": nl,
-                            "de": de,
-                            "es": es,
-                            "fr": fr,
-                        }
-                else:
-                    results[product.sku] = {
-                        "en": en_text,
-                        "nl": "",
-                        "de": "",
-                        "es": "",
-                        "fr": "",
-                    }
-            else:
-                trace({"where": "step3:generate:start", "sku": product.sku})
-                try:
-                    en, nl, de, es, fr = _generate_description_for_product(product)
-                    results[product.sku] = {
-                        "en": en,
-                        "nl": nl,
-                        "de": de,
-                        "es": es,
-                        "fr": fr,
-                    }
-                    trace({"where": "step3:generate:ok", "sku": product.sku})
-                except Exception as exc:
-                    fallback_en = "AI FAILED TO GENERATE"
-                    results[product.sku] = {
-                        "en": _clean_description_value(fallback_en),
-                        "nl": "",
-                        "de": "",
-                        "es": "",
-                        "fr": "",
-                    }
-                    errors.append(f"{product.sku}: {exc}")
-                    trace({
-                        "where": "step3:generate:error",
-                        "sku": product.sku,
-                        "err": str(exc)[:200],
-                    })
-
-    worker_thread = threading.Thread(target=_run_generation, name="description-generator")
-    worker_thread.start()
-
-    while worker_thread.is_alive():
-        elapsed = time.time() - start_time
-        percent_elapsed = elapsed / estimated_total_time_sec
-        percent_clamped = min(1.0, max(0.0, percent_elapsed))
-        progress.progress(percent_clamped, text="Generating descriptions and translations…")
-        remaining_sec = max(0.0, estimated_total_time_sec - elapsed)
-        timer_placeholder.write(
-            f"Time remaining: {int(remaining_sec // 60):02d}:{int(remaining_sec % 60):02d}"
+    progress = None
+    if total:
+        progress = st.progress(
+            0.0,
+            text=f"Generating descriptions and translations… {total} remaining",
         )
-        time.sleep(1)
 
-    worker_thread.join()
+    for index, product in enumerate(products, start=1):
+        previous_entry = stored.get(product.sku, {})
+        if not product.generate:
+            results[product.sku] = {
+                "en": product.short_description,
+                "nl": _clean_description_value(previous_entry.get("nl")),
+                "de": _clean_description_value(previous_entry.get("de")),
+                "es": _clean_description_value(previous_entry.get("es")),
+                "fr": _clean_description_value(previous_entry.get("fr")),
+            }
+        else:
+            trace({"where": "step3:generate:start", "sku": product.sku})
+            try:
+                en, nl, de, es, fr = _generate_description_for_product(product)
+                results[product.sku] = {
+                    "en": en,
+                    "nl": nl,
+                    "de": de,
+                    "es": es,
+                    "fr": fr,
+                }
+                trace({"where": "step3:generate:ok", "sku": product.sku})
+            except Exception as exc:
+                fallback_en = "AI FAILED TO GENERATE"
+                results[product.sku] = {
+                    "en": _clean_description_value(fallback_en),
+                    "nl": "",
+                    "de": "",
+                    "es": "",
+                    "fr": "",
+                }
+                errors.append(f"{product.sku}: {exc}")
+                trace({
+                    "where": "step3:generate:error",
+                    "sku": product.sku,
+                    "err": str(exc)[:200],
+                })
 
-    actual_elapsed_time = time.time() - start_time
-    progress.progress(1.0, text="Generating descriptions and translations…")
-    minutes = int(actual_elapsed_time // 60)
-    seconds = int(actual_elapsed_time % 60)
-    eta_placeholder.write(f"Completed in {minutes}:{seconds:02d}")
-    timer_placeholder.empty()
+        if progress:
+            remaining = total - index
+            fraction = index / total
+            if remaining <= 0:
+                progress.progress(1.0, text="Generation completed")
+            else:
+                progress.progress(
+                    fraction,
+                    text=f"Generating descriptions and translations… {remaining} remaining",
+                )
+
+    if progress and total:
+        progress.progress(1.0, text="Generation completed")
 
     return results, errors
 
