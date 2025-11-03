@@ -788,6 +788,25 @@ class Step3Product:
     attributes: dict[str, object]
 
 
+@dataclass
+class Step3GenerationPlan:
+    to_generate: list["Step3Product"]
+    to_translate: list["Step3Product"]
+    skipped_no_text: list["Step3Product"]
+    skipped_unknown_category: list["Step3Product"]
+    category_by_sku: dict[str, str]
+
+
+@dataclass
+class Step3GenerationResult:
+    results: dict[str, dict[str, str]]
+    errors: list[str]
+    missing_sources: list[str]
+    skipped_no_text: list["Step3Product"]
+    translated_only: list["Step3Product"]
+    skipped_unknown_category: list["Step3Product"]
+
+
 ACOUSTIC_SET_NAMES = {"acoustic guitar"}
 ELECTRIC_SET_NAMES = {"electric guitar"}
 BASS_SET_NAMES = {"bass guitar"}
@@ -817,6 +836,35 @@ BRAND_ACCENTS: dict[str, str] = {
         "between sparkle and warmth players expect from the brand."
     ),
 }
+
+PROMPT_PREVIEW_LIMIT = 800
+
+
+def _log_generation_prompt(*, sku: str, category: str, model: str, prompt: str) -> None:
+    trace(
+        {
+            "stage": "step3:openai:prompt",
+            "sku": sku,
+            "category": category,
+            "model": model,
+            "prompt": prompt[:PROMPT_PREVIEW_LIMIT],
+        }
+    )
+
+
+def _log_generation_response(
+    *, sku: str, category: str, en_length: int = 0, error: str | None = None
+) -> None:
+    payload = {
+        "stage": "step3:openai:response" if error is None else "step3:openai:error",
+        "sku": sku,
+        "category": category,
+    }
+    if error is None:
+        payload["en_length"] = en_length
+    else:
+        payload["err"] = error
+    trace(payload)
 
 ACOUSTIC_BODY_KEYWORDS = {
     "dreadnought": "Dreadnought",
@@ -1539,7 +1587,7 @@ def _translate_description(
     )
 
 
-def _categorize_product(product: Step3Product) -> str:
+def _categorize_product(product: Step3Product) -> str | None:
     name_norm = _normalize_text(product.attribute_set_name).lower()
 
     def _matches(candidates: set[str]) -> bool:
@@ -1567,7 +1615,72 @@ def _categorize_product(product: Step3Product) -> str:
         attr_set_id = None
     if attr_set_id is not None and attr_set_id in ELECTRIC_SET_IDS:
         return "electric"
-    return "accessory"
+    return None
+
+
+def _partition_step3_products(
+    products: Sequence[Step3Product],
+) -> Step3GenerationPlan:
+    plan = Step3GenerationPlan([], [], [], [], {})
+
+    for product in products:
+        short_text = _clean_description_value(product.short_description or "")
+        sku = product.sku or "UNKNOWN"
+        generate_flag = bool(product.generate)
+        has_short = bool(short_text.strip())
+
+        trace(
+            {
+                "stage": "filter_products_for_step3",
+                "sku": sku,
+                "generate": generate_flag,
+                "short_text_exists": has_short,
+            }
+        )
+
+        if generate_flag:
+            category = _categorize_product(product)
+            if category:
+                plan.to_generate.append(product)
+                if product.sku:
+                    plan.category_by_sku[product.sku] = category
+                trace(
+                    {
+                        "stage": "filter_products_for_step3",  # reuse stage for consistency
+                        "sku": sku,
+                        "bucket": "generate",
+                        "category": category,
+                    }
+                )
+            else:
+                plan.skipped_unknown_category.append(product)
+                trace(
+                    {
+                        "stage": "filter_products_for_step3",
+                        "sku": sku,
+                        "bucket": "skip_unknown_category",
+                    }
+                )
+        elif has_short:
+            plan.to_translate.append(product)
+            trace(
+                {
+                    "stage": "filter_products_for_step3",
+                    "sku": sku,
+                    "bucket": "translate_only",
+                }
+            )
+        else:
+            plan.skipped_no_text.append(product)
+            trace(
+                {
+                    "stage": "filter_products_for_step3",
+                    "sku": sku,
+                    "bucket": "skip_no_text",
+                }
+            )
+
+    return plan
 
 
 def _generate_acoustic_copy(product: Step3Product) -> tuple[str, str, str, str, str]:
@@ -1613,13 +1726,30 @@ def _generate_acoustic_copy(product: Step3Product) -> tuple[str, str, str, str, 
         "stay factual, and avoid inventing specs not provided."
     )
 
+    prompt_text = "\n".join(user_lines)
+    _log_generation_prompt(
+        sku=product.sku,
+        category="acoustic",
+        model=ACOUSTIC_EN_MODEL,
+        prompt=prompt_text,
+    )
     english_body = _call_openai_text(
         ACOUSTIC_EN_MODEL,
         system_prompt,
-        "\n".join(user_lines),
+        prompt_text,
         temperature=0.65,
     )
     english_body = _ensure_html_description(english_body)
+    if not english_body.strip():
+        _log_generation_response(
+            sku=product.sku, category="acoustic", error="empty_response"
+        )
+        raise RuntimeError("Model response was empty")
+    _log_generation_response(
+        sku=product.sku,
+        category="acoustic",
+        en_length=len(english_body or ""),
+    )
 
     nl, de, es, fr = _translate_description(english_body, sku=product.sku)
     final_en = _restore_embed(embed, english_body)
@@ -1660,13 +1790,30 @@ def _generate_electric_copy(product: Step3Product) -> tuple[str, str, str, str, 
         "You create SEO-oriented copy for electric guitars. Stay factual, vivid, and musician-focused."
     )
 
+    prompt_text = "\n".join(user_lines)
+    _log_generation_prompt(
+        sku=product.sku,
+        category="electric",
+        model=ELECTRIC_EN_MODEL,
+        prompt=prompt_text,
+    )
     english_body = _call_openai_text(
         ELECTRIC_EN_MODEL,
         system_prompt,
-        "\n".join(user_lines),
+        prompt_text,
         temperature=0.7,
     )
     english_body = _ensure_html_description(english_body)
+    if not english_body.strip():
+        _log_generation_response(
+            sku=product.sku, category="electric", error="empty_response"
+        )
+        raise RuntimeError("Model response was empty")
+    _log_generation_response(
+        sku=product.sku,
+        category="electric",
+        en_length=len(english_body or ""),
+    )
 
     nl, de, es, fr = _translate_description(english_body, sku=product.sku)
     final_en = _restore_embed(embed, english_body)
@@ -1707,14 +1854,31 @@ def _generate_accessory_copy(product: Step3Product) -> tuple[str, str, str, str,
         "You write marketing copy for guitar accessories. Keep tone premium yet practical, remain factual, and avoid hype."
     )
 
+    prompt_text = "\n".join(user_lines)
+    _log_generation_prompt(
+        sku=product.sku,
+        category="accessory",
+        model=ACCESSORY_MODEL,
+        prompt=prompt_text,
+    )
     english_body = _call_openai_text(
         ACCESSORY_MODEL,
         system_prompt,
-        "\n".join(user_lines),
+        prompt_text,
         temperature=0.6,
         max_tokens=800,
     )
     english_body = _ensure_html_description(english_body)
+    if not english_body.strip():
+        _log_generation_response(
+            sku=product.sku, category="accessory", error="empty_response"
+        )
+        raise RuntimeError("Model response was empty")
+    _log_generation_response(
+        sku=product.sku,
+        category="accessory",
+        en_length=len(english_body or ""),
+    )
 
     nl, de, es, fr = _translate_description(english_body, sku=product.sku)
     final_en = _restore_embed(embed, english_body)
@@ -1755,10 +1919,17 @@ def _generate_bass_copy(product: Step3Product) -> tuple[str, str, str, str, str]
         "You write marketing copy for electric bass guitars. Use musical vocabulary and stay factual."
     )
 
+    prompt_text = "\n".join(user_lines)
+    _log_generation_prompt(
+        sku=product.sku,
+        category="bass",
+        model=BASS_MODEL,
+        prompt=prompt_text,
+    )
     payload = _call_openai_json(
         BASS_MODEL,
         system_prompt,
-        "\n".join(user_lines),
+        prompt_text,
         temperature=0.6,
         required_keys=("en", "nl", "de", "es", "fr"),
         sku=product.sku,
@@ -1770,7 +1941,15 @@ def _generate_bass_copy(product: Step3Product) -> tuple[str, str, str, str, str]
     es_body = _clean_description_value(payload.get("es"))
     fr_body = _clean_description_value(payload.get("fr"))
     if not en_body:
-        raise RuntimeError("Bass description empty")
+        _log_generation_response(
+            sku=product.sku, category="bass", error="empty_response"
+        )
+        raise RuntimeError("Model response was empty")
+    _log_generation_response(
+        sku=product.sku,
+        category="bass",
+        en_length=len(en_body or ""),
+    )
     final_en = _restore_embed(embed, en_body)
     return final_en, nl_body, de_body, es_body, fr_body
 
@@ -1807,10 +1986,17 @@ def _generate_amp_copy(product: Step3Product) -> tuple[str, str, str, str, str]:
 
     system_prompt = "You craft technical yet musical marketing copy for guitar amplifiers."
 
+    prompt_text = "\n".join(user_lines)
+    _log_generation_prompt(
+        sku=product.sku,
+        category="amp",
+        model=AMP_MODEL,
+        prompt=prompt_text,
+    )
     payload = _call_openai_json(
         AMP_MODEL,
         system_prompt,
-        "\n".join(user_lines),
+        prompt_text,
         temperature=0.6,
         required_keys=("en", "nl", "de", "es", "fr"),
         sku=product.sku,
@@ -1822,7 +2008,15 @@ def _generate_amp_copy(product: Step3Product) -> tuple[str, str, str, str, str]:
     es_body = _clean_description_value(payload.get("es"))
     fr_body = _clean_description_value(payload.get("fr"))
     if not en_body:
-        raise RuntimeError("Amp description empty")
+        _log_generation_response(
+            sku=product.sku, category="amp", error="empty_response"
+        )
+        raise RuntimeError("Model response was empty")
+    _log_generation_response(
+        sku=product.sku,
+        category="amp",
+        en_length=len(en_body or ""),
+    )
     final_en = _restore_embed(embed, en_body)
     return final_en, nl_body, de_body, es_body, fr_body
 
@@ -1862,10 +2056,17 @@ def _generate_effect_copy(product: Step3Product) -> tuple[str, str, str, str, st
 
     system_prompt = "You write persuasive yet factual copy for guitar effects pedals."
 
+    prompt_text = "\n".join(user_lines)
+    _log_generation_prompt(
+        sku=product.sku,
+        category="effect",
+        model=EFFECT_MODEL,
+        prompt=prompt_text,
+    )
     payload = _call_openai_json(
         EFFECT_MODEL,
         system_prompt,
-        "\n".join(user_lines),
+        prompt_text,
         temperature=0.55,
         required_keys=("en", "nl", "de", "es", "fr"),
         sku=product.sku,
@@ -1877,15 +2078,35 @@ def _generate_effect_copy(product: Step3Product) -> tuple[str, str, str, str, st
     es_body = _clean_description_value(payload.get("es"))
     fr_body = _clean_description_value(payload.get("fr"))
     if not en_body:
-        raise RuntimeError("Effect description empty")
+        _log_generation_response(
+            sku=product.sku, category="effect", error="empty_response"
+        )
+        raise RuntimeError("Model response was empty")
+    _log_generation_response(
+        sku=product.sku,
+        category="effect",
+        en_length=len(en_body or ""),
+    )
     final_en = _restore_embed(embed, en_body)
     return final_en, nl_body, de_body, es_body, fr_body
 
 
 def _generate_description_for_product(
     product: Step3Product,
+    *,
+    category: str | None = None,
 ) -> tuple[str, str, str, str, str]:
-    trace(f"[GEN_START] SKU: {product.sku} | generate={product.generate}")
+    short_text = _clean_description_value(product.short_description)
+    trace(
+        {
+            "stage": "step3:generate:init",
+            "sku": product.sku,
+            "generate": bool(product.generate),
+            "attribute_set": product.attribute_set_name,
+            "short_text_length": len(short_text or ""),
+            "short_text_preview": short_text[:120] if short_text else "",
+        }
+    )
 
     generators: dict[str, Callable[[Step3Product], tuple[str, str, str, str, str]]] = {
         "acoustic": _generate_acoustic_copy,
@@ -1896,42 +2117,65 @@ def _generate_description_for_product(
         "accessory": _generate_accessory_copy,
     }
 
-    def _dispatch(category: str | None) -> tuple[str, str, str, str, str]:
-        resolved = category if category in generators else "accessory"
-        trace(f"[GEN_ROUTE] SKU: {product.sku} → route: {resolved}")
-        generator = generators.get(resolved, _generate_accessory_copy)
+    def _dispatch(resolved_category: str) -> tuple[str, str, str, str, str]:
+        trace(f"[GEN_ROUTE] SKU: {product.sku} → route: {resolved_category}")
+        generator = generators.get(resolved_category, _generate_accessory_copy)
         return generator(product)
 
     if product.generate:
-        category = _categorize_product(product)
-        result = _dispatch(category)
+        resolved_category = category or _categorize_product(product)
+        if not resolved_category:
+            trace(
+                {
+                    "stage": "step3:generate:error",
+                    "sku": product.sku,
+                    "err": "category_unresolved",
+                }
+            )
+            raise RuntimeError("Product category could not be determined")
+        result = _dispatch(resolved_category)
         en_text = result[0] if isinstance(result, tuple) and result else ""
-        trace(f"[GEN_DONE] SKU: {product.sku} | en length: {len(en_text) if en_text else 0}")
+        trace(
+            {
+                "stage": "step3:generate:complete",
+                "sku": product.sku,
+                "en_length": len(en_text or ""),
+            }
+        )
         return result
 
     # Skip only if generate_description is False
-    if not product.generate:
-        descriptions = st.session_state.get("descriptions")
-        if isinstance(descriptions, Mapping):
-            stored_entry = descriptions.get(product.sku)
-            if isinstance(stored_entry, Mapping):
-                en_body = _clean_description_value(stored_entry.get("en"))
-                if en_body:
-                    trace(
-                        f"[GEN_DONE] SKU: {product.sku} | en length: {len(en_body) if en_body else 0}"
-                    )
-                    return (
-                        en_body,
-                        _clean_description_value(stored_entry.get("nl")),
-                        _clean_description_value(stored_entry.get("de")),
-                        _clean_description_value(stored_entry.get("es")),
-                        _clean_description_value(stored_entry.get("fr")),
-                    )
+    descriptions = st.session_state.get("descriptions")
+    if isinstance(descriptions, Mapping):
+        stored_entry = descriptions.get(product.sku)
+        if isinstance(stored_entry, Mapping):
+            en_body = _clean_description_value(stored_entry.get("en"))
+            if en_body:
+                trace(
+                    {
+                        "stage": "step3:generate:reuse",
+                        "sku": product.sku,
+                        "en_length": len(en_body or ""),
+                    }
+                )
+                return (
+                    en_body,
+                    _clean_description_value(stored_entry.get("nl")),
+                    _clean_description_value(stored_entry.get("de")),
+                    _clean_description_value(stored_entry.get("es")),
+                    _clean_description_value(stored_entry.get("fr")),
+                )
 
     # Ensure we always return a 5-tuple, even if there is no stored data.
     en_text = _clean_description_value(product.short_description)
     result = (en_text, "", "", "", "")
-    trace(f"[GEN_DONE] SKU: {product.sku} | en length: {len(en_text) if en_text else 0}")
+    trace(
+        {
+            "stage": "step3:generate:complete",
+            "sku": product.sku,
+            "en_length": len(en_text or ""),
+        }
+    )
     return result
 
 
@@ -2012,18 +2256,32 @@ def _ensure_descriptions_initialized(products: Sequence[Step3Product]) -> None:
 
 def _generate_descriptions_for_products(
     products: Sequence[Step3Product],
-) -> tuple[dict[str, dict[str, str]], list[str], list[str], list[Step3Product]]:
+) -> Step3GenerationResult:
     results: dict[str, dict[str, str]] = {}
     errors: list[str] = []
     missing_sources: list[str] = []
-    skipped_items: list[Step3Product] = []
     stored = st.session_state.get("descriptions")
     if not isinstance(stored, dict):
         stored = {}
 
-    total = len(products)
+    plan = _partition_step3_products(products)
+    items_to_generate = list(plan.to_generate)
+    items_to_translate = list(plan.to_translate)
+    skipped_items = list(plan.skipped_no_text)
+    skipped_unknown_category = list(plan.skipped_unknown_category)
+    category_by_sku = dict(plan.category_by_sku)
+    translated_only = list(items_to_translate)
+
+    total = len(items_to_generate) + len(items_to_translate)
     if not total:
-        return results, errors, missing_sources, skipped_items
+        return Step3GenerationResult(
+            results,
+            errors,
+            missing_sources,
+            skipped_items,
+            translated_only,
+            skipped_unknown_category,
+        )
 
     estimated_total_time_sec = max(1, total * 60)
     start_time = time.time()
@@ -2039,36 +2297,9 @@ def _generate_descriptions_for_products(
     )
 
     def _run_generation() -> None:
-        nonlocal results, errors, skipped_items
-        items_to_generate: list[Step3Product] = []
-        items_to_translate: list[Step3Product] = []
-        skipped_items = []
-
-        for product in products:
-            generate_flag = product.generate
-            short_text = _clean_description_value(product.short_description or "")
-            sku = product.sku or "UNKNOWN"
-
-            trace(
-                {
-                    "stage": "filter_products_for_step3",
-                    "sku": sku,
-                    "generate": generate_flag,
-                    "short_text_exists": bool(short_text.strip()),
-                }
-            )
-
-            if generate_flag is True:
-                items_to_generate.append(product)
-            elif short_text.strip():
-                items_to_translate.append(product)
-            else:
-                skipped_items.append(product)
-
+        nonlocal results, errors, missing_sources
         for product in items_to_translate:
-            trace(
-                f"[GEN] SKU: {product.sku} | generate={product.generate} | attr_set={product.attribute_set_id}"
-            )
+            trace({"where": "step3:translate:queue", "sku": product.sku})
             previous_entry: Mapping[str, object] = {}
             stored_entry = stored.get(product.sku, {})
             if isinstance(stored_entry, Mapping):
@@ -2132,7 +2363,10 @@ def _generate_descriptions_for_products(
             )
             trace({"where": "step3:generate:start", "sku": product.sku})
             try:
-                en, nl, de, es, fr = _generate_description_for_product(product)
+                resolved_category = category_by_sku.get(product.sku)
+                en, nl, de, es, fr = _generate_description_for_product(
+                    product, category=resolved_category
+                )
                 results[product.sku] = {
                     "en": en,
                     "nl": nl,
@@ -2152,11 +2386,13 @@ def _generate_descriptions_for_products(
                     "fr": "",
                 }
                 errors.append(f"{product.sku}: {exc}")
-                trace({
-                    "where": "step3:generate:error",
-                    "sku": product.sku,
-                    "err": str(exc)[:200],
-                })
+                trace(
+                    {
+                        "where": "step3:generate:error",
+                        "sku": product.sku,
+                        "err": str(exc)[:200],
+                    }
+                )
 
     worker_thread = threading.Thread(target=_run_generation, name="description-generator")
     worker_thread.start()
@@ -2181,7 +2417,14 @@ def _generate_descriptions_for_products(
     eta_placeholder.write(f"Completed in {minutes}:{seconds:02d}")
     timer_placeholder.empty()
 
-    return results, errors, missing_sources, skipped_items
+    return Step3GenerationResult(
+        results,
+        errors,
+        missing_sources,
+        skipped_items,
+        translated_only,
+        skipped_unknown_category,
+    )
 
 
 def _apply_descriptions_to_state(descriptions_map: Mapping[str, Mapping[str, object]]) -> set[str]:
@@ -7586,21 +7829,19 @@ if df_original_key in st.session_state:
                                         _reset_step2_state()
                                         st.rerun()
 
-                                    items_to_generate_preview: list[Step3Product] = []
-                                    items_to_translate_preview: list[Step3Product] = []
-                                    skipped_preview: list[Step3Product] = []
-
-                                    for product in preview_products:
-                                        generate_flag = product.generate
-                                        short_text = _clean_description_value(
-                                            product.short_description or ""
-                                        )
-                                        if generate_flag is True:
-                                            items_to_generate_preview.append(product)
-                                        elif short_text.strip():
-                                            items_to_translate_preview.append(product)
-                                        else:
-                                            skipped_preview.append(product)
+                                    plan_preview = _partition_step3_products(
+                                        preview_products
+                                    )
+                                    items_to_generate_preview = list(
+                                        plan_preview.to_generate
+                                    )
+                                    items_to_translate_preview = list(
+                                        plan_preview.to_translate
+                                    )
+                                    skipped_preview = list(plan_preview.skipped_no_text)
+                                    skipped_unknown_preview = list(
+                                        plan_preview.skipped_unknown_category
+                                    )
 
                                     st.markdown("### ⏱️ Генерация Step 3: отбор товаров")
 
@@ -7621,6 +7862,22 @@ if df_original_key in st.session_state:
                                                     [
                                                         str(product.sku or "UNKNOWN")
                                                         for product in skipped_preview
+                                                    ]
+                                                )
+                                            )
+
+                                    if skipped_unknown_preview:
+                                        st.warning(
+                                            f"⚠️ Skipped {len(skipped_unknown_preview)} item(s): unknown category"
+                                        )
+                                        with st.expander(
+                                            "Просмотреть SKU без распознанной категории"
+                                        ):
+                                            st.code(
+                                                "\n".join(
+                                                    [
+                                                        str(product.sku or "UNKNOWN")
+                                                        for product in skipped_unknown_preview
                                                     ]
                                                 )
                                             )
@@ -7656,6 +7913,8 @@ if df_original_key in st.session_state:
 
             step3_state = st.session_state.setdefault("step3", {})
             step3_state.setdefault("skipped", [])
+            step3_state.setdefault("translated_only", [])
+            step3_state.setdefault("skipped_unknown_category", [])
             products = step3_state.get("products")
             if not products:
                 products = _build_step3_products()
@@ -7666,21 +7925,20 @@ if df_original_key in st.session_state:
                 st.session_state["step3_generation_pending"] = False
 
             if st.session_state.get("step3_generation_pending") and products:
-                (
-                    results,
-                    errors,
-                    missing_sources,
-                    skipped_items,
-                ) = _generate_descriptions_for_products(products)
+                generation_result = _generate_descriptions_for_products(products)
                 descriptions_map = st.session_state.get("descriptions")
                 if not isinstance(descriptions_map, dict):
                     descriptions_map = {}
-                for sku, payload in results.items():
+                for sku, payload in generation_result.results.items():
                     descriptions_map[sku] = payload
                 st.session_state["descriptions"] = descriptions_map
-                step3_state["errors"] = errors
-                step3_state["missing_sources"] = missing_sources
-                step3_state["skipped"] = skipped_items
+                step3_state["errors"] = generation_result.errors
+                step3_state["missing_sources"] = generation_result.missing_sources
+                step3_state["skipped"] = generation_result.skipped_no_text
+                step3_state["translated_only"] = generation_result.translated_only
+                step3_state["skipped_unknown_category"] = (
+                    generation_result.skipped_unknown_category
+                )
                 st.session_state["step3_generation_pending"] = False
 
             errors = step3_state.get("errors") or []
@@ -7698,6 +7956,22 @@ if df_original_key in st.session_state:
                     "English description was empty."
                 )
                 st.write("\n".join(f"- {sku}" for sku in sorted(set(missing_sources))))
+
+            translated_only_products: Sequence[Step3Product] = (
+                step3_state.get("translated_only") or []
+            )
+            if translated_only_products:
+                st.warning(
+                    "⛔ Пропущено: описание уже существует, а флажок генерации снят.",
+                    icon="⛔",
+                )
+                with st.expander("Показать SKU без новой генерации"):
+                    st.code(
+                        ", ".join(
+                            getattr(product, "sku", "UNKNOWN")
+                            for product in translated_only_products
+                        )
+                    )
 
             descriptions_map = st.session_state.get("descriptions", {})
             table_rows: list[dict[str, object]] = []
@@ -7769,6 +8043,22 @@ if df_original_key in st.session_state:
                             ", ".join(
                                 getattr(product, "sku", "UNKNOWN")
                                 for product in skipped_products
+                            )
+                        )
+
+                skipped_unknown_category: Sequence[Step3Product] = (
+                    step3_state.get("skipped_unknown_category") or []
+                )
+                if skipped_unknown_category:
+                    st.warning(
+                        "⚠️ Пропуск: не удалось определить категорию для товара, поэтому генерация не выполнена.",
+                        icon="⚠️",
+                    )
+                    with st.expander("Показать SKU без категории"):
+                        st.code(
+                            ", ".join(
+                                getattr(product, "sku", "UNKNOWN")
+                                for product in skipped_unknown_category
                             )
                         )
 
