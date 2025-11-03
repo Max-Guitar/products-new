@@ -17,7 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from urllib.parse import quote
 import re
@@ -1262,7 +1262,6 @@ def _call_openai_json(
     timeout: int = 120,
     required_keys: Iterable[str] | None = ("en",),
     max_tokens: int | None = None,
-    sku: str | None = None,
 ) -> dict[str, object]:
     text_kwargs: dict[str, object] = {
         "temperature": temperature,
@@ -1272,21 +1271,12 @@ def _call_openai_json(
     if max_tokens is not None:
         text_kwargs["max_tokens"] = max_tokens
 
-    messages: list[dict[str, str]] = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": user_prompt})
-
-    trace(f"[OPENAI_REQUEST] SKU: {sku or 'unknown'} | model={model}")
-    trace(f"[PROMPT] {json.dumps(messages, indent=2)}")
-
     raw = _call_openai_text(
         model,
         system_prompt,
         user_prompt,
         **text_kwargs,
     )
-    trace(f"[OPENAI_RESPONSE] {raw[:200]}...")
     parsed = extract_json_payload(raw, required_keys=required_keys)
     if not parsed:
         raise JSONPayloadError(
@@ -1304,9 +1294,7 @@ def _choose_random(texts: Sequence[str], fallback: str = "") -> str:
     return random.choice(candidates)
 
 
-def _translate_description(
-    english_text: str, *, sku: str | None = None
-) -> tuple[str, str, str, str]:
+def _translate_description(english_text: str) -> tuple[str, str, str, str]:
     if not english_text:
         return "", "", "", ""
     model = TRANSLATION_MODEL
@@ -1363,7 +1351,6 @@ def _translate_description(
                     temperature=0.2,
                     required_keys=languages,
                     max_tokens=2500,
-                    sku=sku,
                 )
             except JSONPayloadError as exc:
                 trace(
@@ -1386,7 +1373,6 @@ def _translate_description(
             try:
                 payload = _attempt(model)
             except Exception as exc:
-                trace(f"[ERROR] SKU: {sku or 'unknown'} | {type(exc).__name__}: {str(exc)}")
                 trace(
                     {
                         "where": "step3:translate_error",
@@ -1400,9 +1386,6 @@ def _translate_description(
                     try:
                         payload = _attempt(fallback_model)
                     except Exception as fallback_exc:
-                        trace(
-                            f"[ERROR] SKU: {sku or 'unknown'} | {type(fallback_exc).__name__}: {str(fallback_exc)}"
-                        )
                         trace(
                             {
                                 "where": "step3:translate_error",
@@ -1420,9 +1403,6 @@ def _translate_description(
                     payload = _attempt(fallback_model)
                     fallback_tried = True
                 except Exception as exc:
-                    trace(
-                        f"[ERROR] SKU: {sku or 'unknown'} | {type(exc).__name__}: {str(exc)}"
-                    )
                     trace(
                         {
                             "where": "step3:translate_error",
@@ -1621,7 +1601,7 @@ def _generate_acoustic_copy(product: Step3Product) -> tuple[str, str, str, str, 
     )
     english_body = _ensure_html_description(english_body)
 
-    nl, de, es, fr = _translate_description(english_body, sku=product.sku)
+    nl, de, es, fr = _translate_description(english_body)
     final_en = _restore_embed(embed, english_body)
     return final_en, nl, de, es, fr
 
@@ -1668,7 +1648,7 @@ def _generate_electric_copy(product: Step3Product) -> tuple[str, str, str, str, 
     )
     english_body = _ensure_html_description(english_body)
 
-    nl, de, es, fr = _translate_description(english_body, sku=product.sku)
+    nl, de, es, fr = _translate_description(english_body)
     final_en = _restore_embed(embed, english_body)
     return final_en, nl, de, es, fr
 
@@ -1716,7 +1696,7 @@ def _generate_accessory_copy(product: Step3Product) -> tuple[str, str, str, str,
     )
     english_body = _ensure_html_description(english_body)
 
-    nl, de, es, fr = _translate_description(english_body, sku=product.sku)
+    nl, de, es, fr = _translate_description(english_body)
     final_en = _restore_embed(embed, english_body)
     return final_en, nl, de, es, fr
 
@@ -1761,7 +1741,6 @@ def _generate_bass_copy(product: Step3Product) -> tuple[str, str, str, str, str]
         "\n".join(user_lines),
         temperature=0.6,
         required_keys=("en", "nl", "de", "es", "fr"),
-        sku=product.sku,
     )
 
     en_body = _clean_description_value(payload.get("en"))
@@ -1813,7 +1792,6 @@ def _generate_amp_copy(product: Step3Product) -> tuple[str, str, str, str, str]:
         "\n".join(user_lines),
         temperature=0.6,
         required_keys=("en", "nl", "de", "es", "fr"),
-        sku=product.sku,
     )
 
     en_body = _clean_description_value(payload.get("en"))
@@ -1868,7 +1846,6 @@ def _generate_effect_copy(product: Step3Product) -> tuple[str, str, str, str, st
         "\n".join(user_lines),
         temperature=0.55,
         required_keys=("en", "nl", "de", "es", "fr"),
-        sku=product.sku,
     )
 
     en_body = _clean_description_value(payload.get("en"))
@@ -1882,57 +1859,19 @@ def _generate_effect_copy(product: Step3Product) -> tuple[str, str, str, str, st
     return final_en, nl_body, de_body, es_body, fr_body
 
 
-def _generate_description_for_product(
-    product: Step3Product,
-) -> tuple[str, str, str, str, str]:
-    trace(f"[GEN_START] SKU: {product.sku} | generate={product.generate}")
-
-    generators: dict[str, Callable[[Step3Product], tuple[str, str, str, str, str]]] = {
-        "acoustic": _generate_acoustic_copy,
-        "electric": _generate_electric_copy,
-        "bass": _generate_bass_copy,
-        "amp": _generate_amp_copy,
-        "effect": _generate_effect_copy,
-        "accessory": _generate_accessory_copy,
-    }
-
-    def _dispatch(category: str | None) -> tuple[str, str, str, str, str]:
-        resolved = category if category in generators else "accessory"
-        trace(f"[GEN_ROUTE] SKU: {product.sku} → route: {resolved}")
-        generator = generators.get(resolved, _generate_accessory_copy)
-        return generator(product)
-
-    if product.generate:
-        category = _categorize_product(product)
-        result = _dispatch(category)
-        en_text = result[0] if isinstance(result, tuple) and result else ""
-        trace(f"[GEN_DONE] SKU: {product.sku} | en length: {len(en_text) if en_text else 0}")
-        return result
-
-    # Skip only if generate_description is False
-    if not product.generate:
-        descriptions = st.session_state.get("descriptions")
-        if isinstance(descriptions, Mapping):
-            stored_entry = descriptions.get(product.sku)
-            if isinstance(stored_entry, Mapping):
-                en_body = _clean_description_value(stored_entry.get("en"))
-                if en_body:
-                    trace(
-                        f"[GEN_DONE] SKU: {product.sku} | en length: {len(en_body) if en_body else 0}"
-                    )
-                    return (
-                        en_body,
-                        _clean_description_value(stored_entry.get("nl")),
-                        _clean_description_value(stored_entry.get("de")),
-                        _clean_description_value(stored_entry.get("es")),
-                        _clean_description_value(stored_entry.get("fr")),
-                    )
-
-    # Ensure we always return a 5-tuple, even if there is no stored data.
-    en_text = _clean_description_value(product.short_description)
-    result = (en_text, "", "", "", "")
-    trace(f"[GEN_DONE] SKU: {product.sku} | en length: {len(en_text) if en_text else 0}")
-    return result
+def _generate_description_for_product(product: Step3Product) -> tuple[str, str, str, str, str]:
+    category = _categorize_product(product)
+    if category == "acoustic":
+        return _generate_acoustic_copy(product)
+    if category == "electric":
+        return _generate_electric_copy(product)
+    if category == "bass":
+        return _generate_bass_copy(product)
+    if category == "amp":
+        return _generate_amp_copy(product)
+    if category == "effect":
+        return _generate_effect_copy(product)
+    return _generate_accessory_copy(product)
 
 
 def _build_step3_products() -> list[Step3Product]:
@@ -1999,6 +1938,8 @@ def _ensure_descriptions_initialized(products: Sequence[Step3Product]) -> None:
         de_text = stored.get("de")
         es_text = stored.get("es")
         fr_text = stored.get("fr")
+        if not _clean_description_value(en_text):
+            en_text = product.short_description
         descriptions[product.sku] = {
             "en": _clean_description_value(en_text),
             "nl": _clean_description_value(nl_text),
@@ -2012,18 +1953,16 @@ def _ensure_descriptions_initialized(products: Sequence[Step3Product]) -> None:
 
 def _generate_descriptions_for_products(
     products: Sequence[Step3Product],
-) -> tuple[dict[str, dict[str, str]], list[str], list[str], list[Step3Product]]:
+) -> tuple[dict[str, dict[str, str]], list[str]]:
     results: dict[str, dict[str, str]] = {}
     errors: list[str] = []
-    missing_sources: list[str] = []
-    skipped_items: list[Step3Product] = []
     stored = st.session_state.get("descriptions")
     if not isinstance(stored, dict):
         stored = {}
 
     total = len(products)
     if not total:
-        return results, errors, missing_sources, skipped_items
+        return results, errors
 
     estimated_total_time_sec = max(1, total * 60)
     start_time = time.time()
@@ -2039,53 +1978,42 @@ def _generate_descriptions_for_products(
     )
 
     def _run_generation() -> None:
-        nonlocal results, errors, skipped_items
-        items_to_generate: list[Step3Product] = []
-        items_to_translate: list[Step3Product] = []
-        skipped_items = []
-
+        nonlocal results, errors
         for product in products:
-            generate_flag = product.generate
-            short_text = _clean_description_value(product.short_description or "")
-            sku = product.sku or "UNKNOWN"
-
-            trace(
-                {
-                    "stage": "filter_products_for_step3",
-                    "sku": sku,
-                    "generate": generate_flag,
-                    "short_text_exists": bool(short_text.strip()),
-                }
-            )
-
-            if generate_flag is True:
-                items_to_generate.append(product)
-            elif short_text.strip():
-                items_to_translate.append(product)
-            else:
-                skipped_items.append(product)
-
-        for product in items_to_translate:
-            trace(
-                f"[GEN] SKU: {product.sku} | generate={product.generate} | attr_set={product.attribute_set_id}"
-            )
-            previous_entry: Mapping[str, object] = {}
-            stored_entry = stored.get(product.sku, {})
-            if isinstance(stored_entry, Mapping):
-                previous_entry = stored_entry
-
-            en_text = _clean_description_value(product.short_description)
-            if not en_text.strip():
+            previous_entry = stored.get(product.sku, {})
+            if not product.generate:
                 en_text = _clean_description_value(previous_entry.get("en"))
+                if not en_text:
+                    en_text = _clean_description_value(product.short_description)
 
-            if en_text.strip():
-                trace({"where": "step3:translate:start", "sku": product.sku})
-                try:
-                    nl, de, es, fr = _translate_description(en_text, sku=product.sku)
-                except Exception as exc:
-                    trace(
-                        f"[ERROR] SKU: {product.sku} | {type(exc).__name__}: {str(exc)}"
-                    )
+                if en_text:
+                    try:
+                        nl, de, es, fr = _translate_description(en_text)
+                    except Exception as exc:
+                        results[product.sku] = {
+                            "en": en_text,
+                            "nl": "",
+                            "de": "",
+                            "es": "",
+                            "fr": "",
+                        }
+                        errors.append(f"{product.sku}: {exc}")
+                        trace(
+                            {
+                                "where": "step3:translate_error",
+                                "sku": product.sku,
+                                "err": str(exc)[:200],
+                            }
+                        )
+                    else:
+                        results[product.sku] = {
+                            "en": en_text,
+                            "nl": nl,
+                            "de": de,
+                            "es": es,
+                            "fr": fr,
+                        }
+                else:
                     results[product.sku] = {
                         "en": en_text,
                         "nl": "",
@@ -2093,70 +2021,33 @@ def _generate_descriptions_for_products(
                         "es": "",
                         "fr": "",
                     }
-                    errors.append(f"{product.sku}: {exc}")
-                    trace(
-                        {
-                            "where": "step3:translate_error",
-                            "sku": product.sku,
-                            "err": str(exc)[:200],
-                        }
-                    )
-                else:
+            else:
+                trace({"where": "step3:generate:start", "sku": product.sku})
+                try:
+                    en, nl, de, es, fr = _generate_description_for_product(product)
                     results[product.sku] = {
-                        "en": en_text,
+                        "en": en,
                         "nl": nl,
                         "de": de,
                         "es": es,
                         "fr": fr,
                     }
-                    trace({"where": "step3:translate:ok", "sku": product.sku})
-            else:
-                missing_sources.append(product.sku)
-                trace(
-                    {
-                        "where": "step3:translate_missing_source",
-                        "sku": product.sku,
+                    trace({"where": "step3:generate:ok", "sku": product.sku})
+                except Exception as exc:
+                    fallback_en = "AI FAILED TO GENERATE"
+                    results[product.sku] = {
+                        "en": _clean_description_value(fallback_en),
+                        "nl": "",
+                        "de": "",
+                        "es": "",
+                        "fr": "",
                     }
-                )
-                results[product.sku] = {
-                    "en": en_text,
-                    "nl": "",
-                    "de": "",
-                    "es": "",
-                    "fr": "",
-                }
-
-        for product in items_to_generate:
-            trace(
-                f"[GEN] SKU: {product.sku} | generate={product.generate} | attr_set={product.attribute_set_id}"
-            )
-            trace({"where": "step3:generate:start", "sku": product.sku})
-            try:
-                en, nl, de, es, fr = _generate_description_for_product(product)
-                results[product.sku] = {
-                    "en": en,
-                    "nl": nl,
-                    "de": de,
-                    "es": es,
-                    "fr": fr,
-                }
-                trace({"where": "step3:generate:ok", "sku": product.sku})
-            except Exception as exc:
-                trace(f"[ERROR] SKU: {product.sku} | {type(exc).__name__}: {str(exc)}")
-                fallback_en = "AI FAILED TO GENERATE"
-                results[product.sku] = {
-                    "en": _clean_description_value(fallback_en),
-                    "nl": "",
-                    "de": "",
-                    "es": "",
-                    "fr": "",
-                }
-                errors.append(f"{product.sku}: {exc}")
-                trace({
-                    "where": "step3:generate:error",
-                    "sku": product.sku,
-                    "err": str(exc)[:200],
-                })
+                    errors.append(f"{product.sku}: {exc}")
+                    trace({
+                        "where": "step3:generate:error",
+                        "sku": product.sku,
+                        "err": str(exc)[:200],
+                    })
 
     worker_thread = threading.Thread(target=_run_generation, name="description-generator")
     worker_thread.start()
@@ -2181,7 +2072,7 @@ def _generate_descriptions_for_products(
     eta_placeholder.write(f"Completed in {minutes}:{seconds:02d}")
     timer_placeholder.empty()
 
-    return results, errors, missing_sources, skipped_items
+    return results, errors
 
 
 def _apply_descriptions_to_state(descriptions_map: Mapping[str, Mapping[str, object]]) -> set[str]:
@@ -7557,12 +7448,6 @@ if df_original_key in st.session_state:
                                                 st.caption("Payload еще не собирался.")
 
                                     st.markdown("---")
-                                    step3_state = st.session_state.setdefault("step3", {})
-                                    preview_products_seq = step3_state.get("products")
-                                    if preview_products_seq is None:
-                                        preview_products_seq = _build_step3_products()
-                                    preview_products = list(preview_products_seq or [])
-
                                     c1, c2 = st.columns([1, 1])
                                     btn_generate = c1.button(
                                         "🌐 Generate Descriptions/Translation",
@@ -7574,8 +7459,9 @@ if df_original_key in st.session_state:
                                     )
 
                                     if btn_generate:
-                                        products = list(preview_products)
+                                        products = _build_step3_products()
                                         _ensure_descriptions_initialized(products)
+                                        step3_state = st.session_state.setdefault("step3", {})
                                         step3_state["products"] = products
                                         step3_state["errors"] = []
                                         st.session_state["step3_active"] = True
@@ -7585,45 +7471,6 @@ if df_original_key in st.session_state:
                                     if btn_reset:
                                         _reset_step2_state()
                                         st.rerun()
-
-                                    items_to_generate_preview: list[Step3Product] = []
-                                    items_to_translate_preview: list[Step3Product] = []
-                                    skipped_preview: list[Step3Product] = []
-
-                                    for product in preview_products:
-                                        generate_flag = product.generate
-                                        short_text = _clean_description_value(
-                                            product.short_description or ""
-                                        )
-                                        if generate_flag is True:
-                                            items_to_generate_preview.append(product)
-                                        elif short_text.strip():
-                                            items_to_translate_preview.append(product)
-                                        else:
-                                            skipped_preview.append(product)
-
-                                    st.markdown("### ⏱️ Генерация Step 3: отбор товаров")
-
-                                    st.info(
-                                        f"🟢 Will generate descriptions: {len(items_to_generate_preview)}"
-                                    )
-                                    st.info(
-                                        f"🟡 Will translate only (existing text): {len(items_to_translate_preview)}"
-                                    )
-
-                                    if skipped_preview:
-                                        st.warning(
-                                            f"⚠️ Skipped {len(skipped_preview)} item(s): no text and generation disabled"
-                                        )
-                                        with st.expander("Просмотреть список пропущенных SKU"):
-                                            st.code(
-                                                "\n".join(
-                                                    [
-                                                        str(product.sku or "UNKNOWN")
-                                                        for product in skipped_preview
-                                                    ]
-                                                )
-                                            )
 
                                     trace_json = json.dumps(
                                         trace_events,
@@ -7655,7 +7502,6 @@ if df_original_key in st.session_state:
             st.header("Step 3. Generate and review descriptions")
 
             step3_state = st.session_state.setdefault("step3", {})
-            step3_state.setdefault("skipped", [])
             products = step3_state.get("products")
             if not products:
                 products = _build_step3_products()
@@ -7666,12 +7512,7 @@ if df_original_key in st.session_state:
                 st.session_state["step3_generation_pending"] = False
 
             if st.session_state.get("step3_generation_pending") and products:
-                (
-                    results,
-                    errors,
-                    missing_sources,
-                    skipped_items,
-                ) = _generate_descriptions_for_products(products)
+                results, errors = _generate_descriptions_for_products(products)
                 descriptions_map = st.session_state.get("descriptions")
                 if not isinstance(descriptions_map, dict):
                     descriptions_map = {}
@@ -7679,8 +7520,6 @@ if df_original_key in st.session_state:
                     descriptions_map[sku] = payload
                 st.session_state["descriptions"] = descriptions_map
                 step3_state["errors"] = errors
-                step3_state["missing_sources"] = missing_sources
-                step3_state["skipped"] = skipped_items
                 st.session_state["step3_generation_pending"] = False
 
             errors = step3_state.get("errors") or []
@@ -7690,14 +7529,6 @@ if df_original_key in st.session_state:
                     "The NL/DE fields for these items have been left blank."
                 )
                 st.write("\n".join(f"- {msg}" for msg in errors))
-
-            missing_sources = step3_state.get("missing_sources") or []
-            if missing_sources:
-                st.warning(
-                    "Translations were not generated for some products because the "
-                    "English description was empty."
-                )
-                st.write("\n".join(f"- {sku}" for sku in sorted(set(missing_sources))))
 
             descriptions_map = st.session_state.get("descriptions", {})
             table_rows: list[dict[str, object]] = []
@@ -7757,20 +7588,6 @@ if df_original_key in st.session_state:
                             descriptions_map = {}
                         descriptions_map.update(new_map)
                         st.session_state["descriptions"] = descriptions_map
-
-                skipped_products: Sequence[Step3Product] = step3_state.get("skipped") or []
-                if skipped_products:
-                    st.warning(
-                        f"{len(skipped_products)} product(s) were skipped: description generation disabled and no existing text found.",
-                        icon="⚠️",
-                    )
-                    with st.expander("Show skipped SKUs"):
-                        st.code(
-                            ", ".join(
-                                getattr(product, "sku", "UNKNOWN")
-                                for product in skipped_products
-                            )
-                        )
 
                 btn_step3_save = st.button("💾 Save to Magento", key="btn_step3_save")
                 if btn_step3_save:
