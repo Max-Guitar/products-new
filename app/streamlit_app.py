@@ -2037,7 +2037,6 @@ def _ensure_descriptions_initialized(products: Sequence[Step3Product]) -> None:
 def _generate_descriptions_for_products(
     products: Sequence[Step3Product],
 ) -> tuple[dict[str, dict[str, str]], list[str]]:
-    stored = st.session_state.get("step3_data", {})
     results: dict[str, dict[str, str]] = {}
     errors: list[str] = []
     total = len(products)
@@ -2054,7 +2053,12 @@ def _generate_descriptions_for_products(
             "Generating descriptions and translations… "
             f"ETA {eta_label_initial}"
         )
-        progress = st.empty().progress(0.0, text=progress_text_initial)
+        progress = st.progress(0.0, text="Starting generation…")
+        try:
+            progress.progress(0.05, text="Initializing…")
+            progress.progress(0.05, text=progress_text_initial)
+        except Exception:
+            progress = None
         generation_start_time = time.time()
         expected_first_seconds = max(
             1.0, (eta_minutes_initial * 60.0) / max(total, 1)
@@ -2075,7 +2079,7 @@ def _generate_descriptions_for_products(
                 else:
                     fraction = min(0.95, elapsed / expected_first_seconds)
                 try:
-                    progress.progress(fraction, text=progress_text_initial)
+                    progress.progress(max(fraction, 0.05), text=progress_text_initial)
                 except Exception:
                     break
 
@@ -2086,18 +2090,88 @@ def _generate_descriptions_for_products(
         )
         first_item_animation_thread.start()
 
+    def _update_progress_after_iteration(current_index: int) -> None:
+        if current_index == 1 and first_item_animation_stop is not None:
+            first_item_animation_stop.set()
+            if (
+                first_item_animation_thread
+                and first_item_animation_thread.is_alive()
+            ):
+                first_item_animation_thread.join(timeout=0.2)
+
+        if progress:
+            remaining = total - current_index
+            fraction = current_index / max(total, 1)
+            if remaining <= 0:
+                progress.progress(1.0, text="Generation completed")
+            else:
+                if generation_start_time is not None:
+                    elapsed = max(time.time() - generation_start_time, 0.0)
+                    processed = max(current_index, 1)
+                    avg_per_item = elapsed / processed
+                    remaining_minutes = (avg_per_item * remaining) / 60.0
+                    eta_label = _format_eta_label(remaining_minutes)
+                    progress_text = (
+                        "Generating descriptions and translations… "
+                        f"{remaining} left ({eta_label})"
+                    )
+                else:
+                    progress_text = (
+                        "Generating descriptions and translations… "
+                        f"{remaining} left"
+                    )
+                progress.progress(
+                    max(fraction, 0.05),
+                    text=progress_text,
+                )
+
     try:
         for index, product in enumerate(products, start=1):
-            previous_entry = stored.get(product.sku, {})
             if not product.generate:
+                short_description = _clean_description_value(product.short_description)
+                if not short_description:
+                    error_message = (
+                        f"{product.sku}: Missing short description; skipped fallback generation"
+                    )
+                    errors.append(error_message)
+                    trace(
+                        {
+                            "where": "step3:generate:fallback:missing-short-description",
+                            "sku": product.sku,
+                        }
+                    )
+                    _update_progress_after_iteration(index)
+                    continue
+
+                trace({"where": "step3:generate:fallback:start", "sku": product.sku})
+                try:
+                    nl, de, es, fr = _translate_description(
+                        short_description,
+                        sku=product.sku,
+                    )
+                except Exception as exc:
+                    nl = de = es = fr = ""
+                    errors.append(f"{product.sku}: {exc}")
+                    trace(
+                        {
+                            "where": "step3:generate:fallback:error",
+                            "sku": product.sku,
+                            "err": str(exc)[:200],
+                        }
+                    )
+                else:
+                    trace({"where": "step3:generate:fallback:ok", "sku": product.sku})
+
                 results[product.sku] = {
-                    "en": product.short_description,
-                    "nl": _clean_description_value(previous_entry.get("nl")),
-                "de": _clean_description_value(previous_entry.get("de")),
-                "es": _clean_description_value(previous_entry.get("es")),
-                "fr": _clean_description_value(previous_entry.get("fr")),
-            }
-        else:
+                    "en": short_description,
+                    "nl": nl,
+                    "de": de,
+                    "es": es,
+                    "fr": fr,
+                }
+                _update_progress_after_iteration(index)
+                continue
+
             trace({"where": "step3:generate:start", "sku": product.sku})
             try:
                 en, nl, de, es, fr = _generate_description_for_product(product)
@@ -2119,45 +2193,15 @@ def _generate_descriptions_for_products(
                     "fr": "",
                 }
                 errors.append(f"{product.sku}: {exc}")
-                trace({
-                    "where": "step3:generate:error",
-                    "sku": product.sku,
-                    "err": str(exc)[:200],
-                })
-
-        if index == 1 and first_item_animation_stop is not None:
-            first_item_animation_stop.set()
-            if (
-                first_item_animation_thread
-                and first_item_animation_thread.is_alive()
-            ):
-                first_item_animation_thread.join(timeout=0.2)
-
-        if progress:
-            remaining = total - index
-            fraction = index / total
-            if remaining <= 0:
-                progress.progress(1.0, text="Generation completed")
-            else:
-                if generation_start_time is not None:
-                    elapsed = max(time.time() - generation_start_time, 0.0)
-                    processed = max(index, 1)
-                    avg_per_item = elapsed / processed
-                    remaining_minutes = (avg_per_item * remaining) / 60.0
-                    eta_label = _format_eta_label(remaining_minutes)
-                    progress_text = (
-                        "Generating descriptions and translations… "
-                        f"{remaining} left ({eta_label})"
-                    )
-                else:
-                    progress_text = (
-                        "Generating descriptions and translations… "
-                        f"{remaining} left"
-                    )
-                progress.progress(
-                    fraction,
-                    text=progress_text,
+                trace(
+                    {
+                        "where": "step3:generate:error",
+                        "sku": product.sku,
+                        "err": str(exc)[:200],
+                    }
                 )
+
+            _update_progress_after_iteration(index)
     finally:
         if first_item_animation_stop is not None:
             first_item_animation_stop.set()
