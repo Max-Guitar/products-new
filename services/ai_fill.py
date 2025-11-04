@@ -14,6 +14,13 @@ import openai
 import pandas as pd
 import requests
 import streamlit as st
+from tenacity import (
+    RetryCallState,
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from utils.http import MAGENTO_REST_PATH_CANDIDATES, build_magento_headers
 from utils.json_parse import extract_json_object
@@ -198,6 +205,69 @@ SET_ATTRS: Mapping[str, Set[str]] = {
 }
 
 DEFAULT_OPENAI_MODEL = "gpt-5-mini"
+
+
+def _ensure_timeout_seconds(timeout: object, minimum: int = 180) -> int:
+    """Coerce timeout values to an integer threshold suitable for OpenAI calls."""
+
+    try:
+        coerced = int(timeout)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        coerced = 0
+    return max(coerced, minimum)
+
+
+_OPENAI_TIMEOUT_CLASSES: tuple[type, ...] = tuple(
+    cls
+    for cls in (
+        getattr(openai, "APITimeoutError", None),
+        getattr(openai, "APIConnectionError", None),
+    )
+    if isinstance(cls, type)
+)
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    if _OPENAI_TIMEOUT_CLASSES and isinstance(exc, _OPENAI_TIMEOUT_CLASSES):
+        return True
+    message = str(exc).lower()
+    return "request timed out" in message or "timed out" in message
+
+
+def _log_timeout_retry(retry_state: RetryCallState) -> None:
+    outcome = retry_state.outcome
+    exc: Exception | None = outcome.exception() if outcome else None
+    if not exc or not _is_timeout_error(exc):
+        return
+    context = retry_state.kwargs.get("retry_context") or {}
+    sku = context.get("sku") or "unknown SKU"
+    lang = context.get("lang") or "general"
+    try:
+        st.warning(f"⚠️ Retry due to timeout for {sku} ({lang})")
+    except Exception:  # pragma: no cover - Streamlit fallback
+        pass
+
+
+def _chat_completion_with_retry(
+    client: openai.OpenAI,
+    request_kwargs: Mapping[str, object],
+    *,
+    retry_context: Mapping[str, object] | None = None,
+):
+    payload = dict(request_kwargs)
+    context = dict(retry_context or {})
+
+    @retry(
+        wait=wait_exponential(multiplier=2, min=5, max=60),
+        stop=stop_after_attempt(3),
+        retry=retry_if_exception(_is_timeout_error),
+        before_sleep=_log_timeout_retry,
+        reraise=True,
+    )
+    def _invoke(*, retry_context: Mapping[str, object]):
+        return client.chat.completions.create(**payload)
+
+    return _invoke(retry_context=context)
 
 OPENAI_MODEL_ALIASES: Mapping[str, str] = {
     "4": "gpt-4o",
@@ -1021,7 +1091,9 @@ def _openai_complete(
     user_msg: str,
     api_key: str,
     model: str = DEFAULT_OPENAI_MODEL,
-    timeout: int = 60,
+    timeout: int = 180,
+    *,
+    retry_context: Mapping[str, object] | None = None,
 ) -> tuple[dict, str]:
     api_key = api_key or os.getenv("OPENAI_API_KEY")
     if not api_key:
@@ -1054,15 +1126,17 @@ def _openai_complete(
         messages_payload.append({"role": role, "content": str(content)})
     messages_payload.append({"role": "user", "content": user_msg})
 
+    effective_timeout = _ensure_timeout_seconds(timeout)
+
     try:
-        client = openai.OpenAI(api_key=api_key)
+        client = openai.OpenAI(api_key=api_key, timeout=effective_timeout)
     except Exception as exc:  # pragma: no cover - client init safety
         raise RuntimeError(f"OpenAI request failed: {exc}") from exc
 
     kwargs: dict[str, object] = {
         "model": resolved_model,
         "messages": messages_payload,
-        "timeout": timeout,
+        "timeout": effective_timeout,
     }
 
     if caps["supports_json_mode"]:
@@ -1086,7 +1160,11 @@ def _openai_complete(
     )
 
     try:
-        chat = client.chat.completions.create(**kwargs)
+        chat = _chat_completion_with_retry(
+            client,
+            kwargs,
+            retry_context=retry_context,
+        )
     except Exception as exc:  # pragma: no cover - network error handling
         msg = str(exc)
         if (
@@ -1110,7 +1188,11 @@ def _openai_complete(
                     }
                 )
                 try:
-                    chat = client.chat.completions.create(**kwargs)
+                    chat = _chat_completion_with_retry(
+                        client,
+                        kwargs,
+                        retry_context=retry_context,
+                    )
                 except Exception as retry_exc:  # pragma: no cover - network error handling
                     raise RuntimeError(f"OpenAI request failed: {retry_exc}") from retry_exc
             else:
@@ -1429,6 +1511,17 @@ def infer_missing(
     brand_hint_reason: str | None = None
     global _CATEGORIES_CACHE
 
+    raw_sku = product.get("sku")
+    if isinstance(raw_sku, str):
+        sku_label = raw_sku.strip() or "unknown SKU"
+    elif raw_sku not in (None, ""):
+        sku_label = str(raw_sku)
+    else:
+        sku_label = "unknown SKU"
+
+    def _ctx(label: str) -> dict[str, str]:
+        return {"sku": sku_label, "lang": label}
+
     for raw_code, row in df_full.iterrows():
         code = str(raw_code)
         row_type = str(row.get("type") or "").lower()
@@ -1612,7 +1705,13 @@ def infer_missing(
     user_payload["retry_questions"] = build_retry_questions(ai_codes)
 
     payload_json = json.dumps(user_payload, ensure_ascii=False)
-    completion, raw_content = _openai_complete(conv, payload_json, api_key, model=model)
+    completion, raw_content = _openai_complete(
+        conv,
+        payload_json,
+        api_key,
+        model=model,
+        retry_context=_ctx("attributes"),
+    )
     try:
         buf = st.session_state.setdefault("_trace_events", [])
         buf.append(
@@ -1680,7 +1779,11 @@ def infer_missing(
         )
         gap_prompt = "\n".join(part for part in gap_prompt_parts if part)
         completion_gap, raw_gap = _openai_complete(
-            conv, gap_prompt, api_key, model=model
+            conv,
+            gap_prompt,
+            api_key,
+            model=model,
+            retry_context=_ctx("attributes-gap"),
         )
         gap_attrs = completion_gap.get("attributes") if isinstance(completion_gap, Mapping) else []
         gap_df = pd.DataFrame(gap_attrs or [])
@@ -1733,7 +1836,13 @@ def infer_missing(
         retry_payload["remaining_codes"] = remaining_before_retry
         retry_payload["retry_questions"] = build_retry_questions(remaining_before_retry)
         retry_json = json.dumps(retry_payload, ensure_ascii=False)
-        completion_retry, raw_retry = _openai_complete(conv, retry_json, api_key, model=model)
+        completion_retry, raw_retry = _openai_complete(
+            conv,
+            retry_json,
+            api_key,
+            model=model,
+            retry_context=_ctx("attributes-retry"),
+        )
         retry_attributes = (
             completion_retry.get("attributes")
             if isinstance(completion_retry, Mapping)
