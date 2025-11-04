@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 import os
 import traceback
+import time
 from string import Template
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -110,6 +111,21 @@ from utils.http import build_magento_headers, get_session
 
 
 logger = logging.getLogger(__name__)
+
+
+def _format_eta_label(minutes: float | int) -> str:
+    try:
+        minutes_value = float(minutes)
+    except (TypeError, ValueError):
+        minutes_value = 0.0
+    if minutes_value <= 0:
+        return "<1 min"
+    if minutes_value < 1:
+        return "<1 min"
+    rounded = max(1, int(math.ceil(minutes_value)))
+    if rounded == 1:
+        return "~1 min"
+    return f"~{rounded} min"
 
 
 def _force_mark(sku: str, code: str):
@@ -1933,11 +1949,18 @@ def _generate_descriptions_for_products(
 
     total = len(products)
     progress = None
+    generation_start_time: float | None = None
     if total:
+        eta_minutes_initial = total
+        eta_label_initial = _format_eta_label(eta_minutes_initial)
         progress = st.progress(
             0.0,
-            text=f"Generating descriptions and translations… {total} remaining",
+            text=(
+                "Generating descriptions and translations… "
+                f"ETA {eta_label_initial}"
+            ),
         )
+        generation_start_time = time.time()
 
     for index, product in enumerate(products, start=1):
         previous_entry = stored.get(product.sku, {})
@@ -1983,9 +2006,24 @@ def _generate_descriptions_for_products(
             if remaining <= 0:
                 progress.progress(1.0, text="Generation completed")
             else:
+                if generation_start_time is not None:
+                    elapsed = max(time.time() - generation_start_time, 0.0)
+                    processed = max(index, 1)
+                    avg_per_item = elapsed / processed
+                    remaining_minutes = (avg_per_item * remaining) / 60.0
+                    eta_label = _format_eta_label(remaining_minutes)
+                    progress_text = (
+                        "Generating descriptions and translations… "
+                        f"{remaining} remaining (ETA {eta_label})"
+                    )
+                else:
+                    progress_text = (
+                        "Generating descriptions and translations… "
+                        f"{remaining} remaining"
+                    )
                 progress.progress(
                     fraction,
-                    text=f"Generating descriptions and translations… {remaining} remaining",
+                    text=progress_text,
                 )
 
     if progress and total:
@@ -5997,15 +6035,54 @@ if df_original_key in st.session_state:
                             if setup_failed or not api_base or not attr_sets_map:
                                 st.session_state["show_attributes_trigger"] = False
                             else:
+                                product_count = len(df_changed)
+                                eta_minutes_initial = product_count
+                                status_label_base = "Building attribute editor…"
+                                eta_label_initial = _format_eta_label(
+                                    eta_minutes_initial
+                                )
                                 status2 = st.status(
-                                    "Building attribute editor…", expanded=True
+                                    f"{status_label_base} (ETA {eta_label_initial})",
+                                    expanded=True,
                                 )
                                 progress = st.progress(0)
+                                eta_state: dict[str, str | None] = {
+                                    "label": eta_label_initial,
+                                }
+                                last_status_message = {"text": status_label_base}
+                                eta_total_items = max(product_count, 1)
+                                step2_start_time = time.time()
+
+                                def _refresh_eta_label() -> None:
+                                    suffix = (
+                                        f" (ETA {eta_state['label']})"
+                                        if eta_state.get("label")
+                                        else ""
+                                    )
+                                    status2.update(
+                                        label=f"{last_status_message['text']}{suffix}"
+                                    )
+
+                                def _update_eta_minutes(minutes: float) -> None:
+                                    eta_state["label"] = _format_eta_label(minutes)
+                                    _refresh_eta_label()
+
+                                def _estimate_remaining_minutes(
+                                    processed_items: int,
+                                ) -> float:
+                                    processed = max(1, processed_items)
+                                    remaining = max(eta_total_items - processed, 0)
+                                    if remaining <= 0:
+                                        return 0.0
+                                    elapsed = max(time.time() - step2_start_time, 0.0)
+                                    avg_per_item = elapsed / processed
+                                    return (avg_per_item * remaining) / 60.0
 
                                 def _pupdate(pct: int, msg: str) -> None:
                                     clamped = max(0, min(int(pct), 100))
                                     progress.progress(clamped)
-                                    status2.update(label=msg)
+                                    last_status_message["text"] = msg
+                                    _refresh_eta_label()
 
                                 _pupdate(5, "Collecting selected sets…")
                                 selected_set_ids: list[int] = []
@@ -6779,7 +6856,13 @@ if df_original_key in st.session_state:
                                         for df in step2_state["wide"].values()
                                         if isinstance(df, pd.DataFrame)
                                     )
+                                    eta_total_items = max(
+                                        eta_total_items,
+                                        total_rows if total_rows else 0,
+                                        1,
+                                    )
                                     normalized_rows = 0
+                                    eta_updated_after_first = False
                                     if total_rows == 0:
                                         _pupdate(70, "Normalizing values…")
                                     config_stage_logged = False
@@ -6861,6 +6944,23 @@ if df_original_key in st.session_state:
                                             sku_values = df_ref["sku"].tolist()
                                             for idx, sku in enumerate(sku_values, start=1):
                                                 normalized_rows += 1
+                                                processed_for_eta = min(
+                                                    normalized_rows, eta_total_items
+                                                )
+                                                if (
+                                                    processed_for_eta
+                                                    and not eta_updated_after_first
+                                                ):
+                                                    remaining_minutes = (
+                                                        _estimate_remaining_minutes(
+                                                            processed_for_eta
+                                                        )
+                                                    )
+                                                    _update_eta_minutes(
+                                                        remaining_minutes
+                                                    )
+                                                    if processed_for_eta >= 1:
+                                                        eta_updated_after_first = True
                                                 if (
                                                     idx == len(sku_values)
                                                     or idx % 25 == 0
@@ -6876,6 +6976,19 @@ if df_original_key in st.session_state:
                                                         f"Normalizing values… SKU {sku} "
                                                         f"({normalized_rows}/{total_rows})",
                                                     )
+                                                    processed_for_eta = min(
+                                                        normalized_rows,
+                                                        eta_total_items,
+                                                    )
+                                                    if processed_for_eta:
+                                                        remaining_minutes = (
+                                                            _estimate_remaining_minutes(
+                                                                processed_for_eta
+                                                            )
+                                                        )
+                                                        _update_eta_minutes(
+                                                            remaining_minutes
+                                                        )
 
                                         if DEBUG:
                                             st.caption(f"DEBUG set_id={set_id}")
