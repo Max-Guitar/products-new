@@ -2037,6 +2037,7 @@ def _ensure_descriptions_initialized(products: Sequence[Step3Product]) -> None:
 def _generate_descriptions_for_products(
     products: Sequence[Step3Product],
 ) -> tuple[dict[str, dict[str, str]], list[str]]:
+    stored = st.session_state.get("step3_data", {})
     results: dict[str, dict[str, str]] = {}
     errors: list[str] = []
     total = len(products)
