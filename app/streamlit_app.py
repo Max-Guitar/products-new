@@ -2038,10 +2038,6 @@ def _generate_descriptions_for_products(
 ) -> tuple[dict[str, dict[str, str]], list[str]]:
     results: dict[str, dict[str, str]] = {}
     errors: list[str] = []
-    stored = st.session_state.get("descriptions")
-    if not isinstance(stored, dict):
-        stored = {}
-
     total = len(products)
     progress = None
     generation_start_time: float | None = None
@@ -2058,15 +2054,57 @@ def _generate_descriptions_for_products(
         generation_start_time = time.time()
 
     for index, product in enumerate(products, start=1):
-        previous_entry = stored.get(product.sku, {})
         if not product.generate:
-            results[product.sku] = {
-                "en": product.short_description,
-                "nl": _clean_description_value(previous_entry.get("nl")),
-                "de": _clean_description_value(previous_entry.get("de")),
-                "es": _clean_description_value(previous_entry.get("es")),
-                "fr": _clean_description_value(previous_entry.get("fr")),
-            }
+            english_text = _clean_description_value(product.short_description)
+            if not english_text:
+                message = (
+                    f"{product.sku}: no short description provided; "
+                    "skipped description generation."
+                )
+                errors.append(message)
+                trace(
+                    {
+                        "where": "step3:generate:skip",
+                        "sku": product.sku,
+                        "reason": "empty_short_description",
+                    }
+                )
+                continue
+
+            try:
+                nl, de, es, fr = _translate_description(
+                    english_text,
+                    sku=product.sku,
+                )
+                results[product.sku] = {
+                    "en": english_text,
+                    "nl": _clean_description_value(nl),
+                    "de": _clean_description_value(de),
+                    "es": _clean_description_value(es),
+                    "fr": _clean_description_value(fr),
+                }
+                trace(
+                    {
+                        "where": "step3:generate:reuse",
+                        "sku": product.sku,
+                    }
+                )
+            except Exception as exc:
+                results[product.sku] = {
+                    "en": english_text,
+                    "nl": "",
+                    "de": "",
+                    "es": "",
+                    "fr": "",
+                }
+                errors.append(f"{product.sku}: {exc}")
+                trace(
+                    {
+                        "where": "step3:generate:reuse:error",
+                        "sku": product.sku,
+                        "err": str(exc)[:200],
+                    }
+                )
         else:
             trace({"where": "step3:generate:start", "sku": product.sku})
             try:
