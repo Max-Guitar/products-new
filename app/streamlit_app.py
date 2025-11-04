@@ -2039,10 +2039,6 @@ def _generate_descriptions_for_products(
 ) -> tuple[dict[str, dict[str, str]], list[str]]:
     results: dict[str, dict[str, str]] = {}
     errors: list[str] = []
-    stored = st.session_state.get("descriptions")
-    if not isinstance(stored, dict):
-        stored = {}
-
     total = len(products)
     progress = None
     generation_start_time: float | None = None
