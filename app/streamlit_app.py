@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 import os
 import traceback
+import threading
 import time
 from string import Template
 
@@ -2045,24 +2046,56 @@ def _generate_descriptions_for_products(
     total = len(products)
     progress = None
     generation_start_time: float | None = None
+    first_item_animation_stop: threading.Event | None = None
+    first_item_animation_thread: threading.Thread | None = None
+    expected_first_seconds: float | None = None
+    progress_text_initial = ""
     if total:
         eta_minutes_initial = total
         eta_label_initial = _format_eta_label(eta_minutes_initial)
-        progress = st.progress(
-            0.0,
-            text=(
-                "Generating descriptions and translations… "
-                f"ETA {eta_label_initial}"
-            ),
+        progress_text_initial = (
+            "Generating descriptions and translations… "
+            f"ETA {eta_label_initial}"
         )
+        progress = st.empty().progress(0.0, text=progress_text_initial)
         generation_start_time = time.time()
+        expected_first_seconds = max(
+            1.0, (eta_minutes_initial * 60.0) / max(total, 1)
+        )
+        first_item_animation_stop = threading.Event()
 
-    for index, product in enumerate(products, start=1):
-        previous_entry = stored.get(product.sku, {})
-        if not product.generate:
-            results[product.sku] = {
-                "en": product.short_description,
-                "nl": _clean_description_value(previous_entry.get("nl")),
+        def _animate_first_item_progress() -> None:
+            if (
+                expected_first_seconds is None
+                or progress is None
+                or generation_start_time is None
+            ):
+                return
+            while not first_item_animation_stop.wait(timeout=1.0):
+                elapsed = max(time.time() - generation_start_time, 0.0)
+                if expected_first_seconds <= 0:
+                    fraction = 0.95
+                else:
+                    fraction = min(0.95, elapsed / expected_first_seconds)
+                try:
+                    progress.progress(fraction, text=progress_text_initial)
+                except Exception:
+                    break
+
+        first_item_animation_thread = threading.Thread(
+            target=_animate_first_item_progress,
+            name="step3-first-item-progress",
+            daemon=True,
+        )
+        first_item_animation_thread.start()
+
+    try:
+        for index, product in enumerate(products, start=1):
+            previous_entry = stored.get(product.sku, {})
+            if not product.generate:
+                results[product.sku] = {
+                    "en": product.short_description,
+                    "nl": _clean_description_value(previous_entry.get("nl")),
                 "de": _clean_description_value(previous_entry.get("de")),
                 "es": _clean_description_value(previous_entry.get("es")),
                 "fr": _clean_description_value(previous_entry.get("fr")),
@@ -2095,6 +2128,14 @@ def _generate_descriptions_for_products(
                     "err": str(exc)[:200],
                 })
 
+        if index == 1 and first_item_animation_stop is not None:
+            first_item_animation_stop.set()
+            if (
+                first_item_animation_thread
+                and first_item_animation_thread.is_alive()
+            ):
+                first_item_animation_thread.join(timeout=0.2)
+
         if progress:
             remaining = total - index
             fraction = index / total
@@ -2109,20 +2150,28 @@ def _generate_descriptions_for_products(
                     eta_label = _format_eta_label(remaining_minutes)
                     progress_text = (
                         "Generating descriptions and translations… "
-                        f"{remaining} remaining (ETA {eta_label})"
+                        f"{remaining} left ({eta_label})"
                     )
                 else:
                     progress_text = (
                         "Generating descriptions and translations… "
-                        f"{remaining} remaining"
+                        f"{remaining} left"
                     )
                 progress.progress(
                     fraction,
                     text=progress_text,
                 )
+    finally:
+        if first_item_animation_stop is not None:
+            first_item_animation_stop.set()
+        if (
+            first_item_animation_thread
+            and first_item_animation_thread.is_alive()
+        ):
+            first_item_animation_thread.join(timeout=0.2)
 
-    if progress and total:
-        progress.progress(1.0, text="Generation completed")
+        if progress and total:
+            progress.progress(1.0, text="Generation completed")
 
     return results, errors
 
