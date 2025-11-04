@@ -23,6 +23,13 @@ import re
 
 import requests
 import openai
+from tenacity import (
+    RetryCallState,
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 import pandas as pd
 import streamlit as st
@@ -1104,6 +1111,67 @@ def _openai_client_kwargs() -> dict[str, object]:
     return kwargs
 
 
+def _ensure_timeout_seconds(timeout: object, minimum: int = 180) -> int:
+    try:
+        coerced = int(timeout)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        coerced = 0
+    return max(coerced, minimum)
+
+
+_OPENAI_TIMEOUT_CLASSES: tuple[type, ...] = tuple(
+    cls
+    for cls in (
+        getattr(openai, "APITimeoutError", None),
+        getattr(openai, "APIConnectionError", None),
+    )
+    if isinstance(cls, type)
+)
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    if _OPENAI_TIMEOUT_CLASSES and isinstance(exc, _OPENAI_TIMEOUT_CLASSES):
+        return True
+    message = str(exc).lower()
+    return "request timed out" in message or "timed out" in message
+
+
+def _log_timeout_retry(retry_state: RetryCallState) -> None:
+    outcome = retry_state.outcome
+    exc: Exception | None = outcome.exception() if outcome else None
+    if not exc or not _is_timeout_error(exc):
+        return
+    context = retry_state.kwargs.get("retry_context") or {}
+    sku = context.get("sku") or "unknown SKU"
+    lang = context.get("lang") or "general"
+    try:
+        st.warning(f"⚠️ Retry due to timeout for {sku} ({lang})")
+    except Exception:  # pragma: no cover - Streamlit fallback
+        pass
+
+
+def _chat_completion_with_retry(
+    client: openai.OpenAI,
+    request_kwargs: Mapping[str, object],
+    *,
+    retry_context: Mapping[str, object] | None = None,
+):
+    payload = dict(request_kwargs)
+    context = dict(retry_context or {})
+
+    @retry(
+        wait=wait_exponential(multiplier=2, min=5, max=60),
+        stop=stop_after_attempt(3),
+        retry=retry_if_exception(_is_timeout_error),
+        before_sleep=_log_timeout_retry,
+        reraise=True,
+    )
+    def _invoke(*, retry_context: Mapping[str, object]):
+        return client.chat.completions.create(**payload)
+
+    return _invoke(retry_context=context)
+
+
 def _call_openai_text(
     model: str,
     system_prompt: str,
@@ -1112,9 +1180,12 @@ def _call_openai_text(
     temperature: float = 0.7,
     max_tokens: int = 1100,
     response_format: dict[str, object] | None = None,
-    timeout: int = 120,
+    timeout: int = 180,
+    retry_context: Mapping[str, object] | None = None,
 ) -> str:
     client_kwargs = _openai_client_kwargs()
+    effective_timeout = _ensure_timeout_seconds(timeout)
+    client_kwargs.setdefault("timeout", effective_timeout)
     try:
         client = openai.OpenAI(**client_kwargs)
     except Exception as exc:  # pragma: no cover - network client init
@@ -1137,7 +1208,7 @@ def _call_openai_text(
     kwargs: dict[str, object] = {
         "model": resolved_model,
         "messages": messages,
-        "timeout": timeout,
+        "timeout": effective_timeout,
     }
     if response_format:
         kwargs["response_format"] = response_format
@@ -1156,7 +1227,11 @@ def _call_openai_text(
     )
 
     try:
-        chat = client.chat.completions.create(**kwargs)
+        chat = _chat_completion_with_retry(
+            client,
+            kwargs,
+            retry_context=retry_context,
+        )
     except Exception as exc:  # pragma: no cover - API failure handling
         stripped_kwargs = dict(kwargs)
         for key in ("temperature", "response_format", "max_completion_tokens"):
@@ -1170,7 +1245,11 @@ def _call_openai_text(
                 }
             )
             try:
-                chat = client.chat.completions.create(**stripped_kwargs)
+                chat = _chat_completion_with_retry(
+                    client,
+                    stripped_kwargs,
+                    retry_context=retry_context,
+                )
             except Exception as retry_exc:  # pragma: no cover - API failure handling
                 raise RuntimeError(f"OpenAI request failed: {retry_exc}") from retry_exc
         else:
@@ -1246,9 +1325,10 @@ def _call_openai_json(
     user_prompt: str,
     *,
     temperature: float = 0.4,
-    timeout: int = 120,
+    timeout: int = 180,
     required_keys: Iterable[str] | None = ("en",),
     max_tokens: int | None = None,
+    retry_context: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     text_kwargs: dict[str, object] = {
         "temperature": temperature,
@@ -1257,6 +1337,8 @@ def _call_openai_json(
     }
     if max_tokens is not None:
         text_kwargs["max_tokens"] = max_tokens
+    if retry_context is not None:
+        text_kwargs["retry_context"] = retry_context
 
     raw = _call_openai_text(
         model,
@@ -1281,7 +1363,11 @@ def _choose_random(texts: Sequence[str], fallback: str = "") -> str:
     return random.choice(candidates)
 
 
-def _translate_description(english_text: str) -> tuple[str, str, str, str]:
+def _translate_description(
+    english_text: str,
+    *,
+    sku: str | None = None,
+) -> tuple[str, str, str, str]:
     if not english_text:
         return "", "", "", ""
     model = TRANSLATION_MODEL
@@ -1298,6 +1384,8 @@ def _translate_description(english_text: str) -> tuple[str, str, str, str]:
         "es": "Spanish",
         "fr": "French",
     }
+
+    sku_label = sku or "unknown SKU"
 
     def _format_language_list(labels: Sequence[str]) -> str:
         if not labels:
@@ -1338,6 +1426,7 @@ def _translate_description(english_text: str) -> tuple[str, str, str, str]:
                     temperature=0.2,
                     required_keys=languages,
                     max_tokens=2500,
+                    retry_context={"sku": sku_label, "lang": "/".join(languages)},
                 )
             except JSONPayloadError as exc:
                 trace(
@@ -1585,10 +1674,11 @@ def _generate_acoustic_copy(product: Step3Product) -> tuple[str, str, str, str, 
         system_prompt,
         "\n".join(user_lines),
         temperature=0.65,
+        retry_context={"sku": product.sku, "lang": "en"},
     )
     english_body = _ensure_html_description(english_body)
 
-    nl, de, es, fr = _translate_description(english_body)
+    nl, de, es, fr = _translate_description(english_body, sku=product.sku)
     final_en = _restore_embed(embed, english_body)
     return final_en, nl, de, es, fr
 
@@ -1632,10 +1722,11 @@ def _generate_electric_copy(product: Step3Product) -> tuple[str, str, str, str, 
         system_prompt,
         "\n".join(user_lines),
         temperature=0.7,
+        retry_context={"sku": product.sku, "lang": "en"},
     )
     english_body = _ensure_html_description(english_body)
 
-    nl, de, es, fr = _translate_description(english_body)
+    nl, de, es, fr = _translate_description(english_body, sku=product.sku)
     final_en = _restore_embed(embed, english_body)
     return final_en, nl, de, es, fr
 
@@ -1679,11 +1770,12 @@ def _generate_accessory_copy(product: Step3Product) -> tuple[str, str, str, str,
         system_prompt,
         "\n".join(user_lines),
         temperature=0.6,
-        max_tokens=800,
+        max_tokens=1200,
+        retry_context={"sku": product.sku, "lang": "en"},
     )
     english_body = _ensure_html_description(english_body)
 
-    nl, de, es, fr = _translate_description(english_body)
+    nl, de, es, fr = _translate_description(english_body, sku=product.sku)
     final_en = _restore_embed(embed, english_body)
     return final_en, nl, de, es, fr
 
@@ -1728,6 +1820,7 @@ def _generate_bass_copy(product: Step3Product) -> tuple[str, str, str, str, str]
         "\n".join(user_lines),
         temperature=0.6,
         required_keys=("en", "nl", "de", "es", "fr"),
+        retry_context={"sku": product.sku, "lang": "en/nl/de/es/fr"},
     )
 
     en_body = _clean_description_value(payload.get("en"))
@@ -1779,6 +1872,7 @@ def _generate_amp_copy(product: Step3Product) -> tuple[str, str, str, str, str]:
         "\n".join(user_lines),
         temperature=0.6,
         required_keys=("en", "nl", "de", "es", "fr"),
+        retry_context={"sku": product.sku, "lang": "en/nl/de/es/fr"},
     )
 
     en_body = _clean_description_value(payload.get("en"))
@@ -1833,6 +1927,7 @@ def _generate_effect_copy(product: Step3Product) -> tuple[str, str, str, str, st
         "\n".join(user_lines),
         temperature=0.55,
         required_keys=("en", "nl", "de", "es", "fr"),
+        retry_context={"sku": product.sku, "lang": "en/nl/de/es/fr"},
     )
 
     en_body = _clean_description_value(payload.get("en"))
