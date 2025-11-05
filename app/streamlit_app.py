@@ -116,6 +116,7 @@ from services.normalizers import (
     normalize_units,
 )
 from utils.http import build_magento_headers, get_session
+from utils.html_sanitize import sanitize_html
 
 
 logger = logging.getLogger(__name__)
@@ -3619,18 +3620,21 @@ def _inject_ai_highlight_script(payload: dict) -> None:
     payload_json = json.dumps(payload, ensure_ascii=False)
 
     st.markdown(
-        """
+        sanitize_html(
+            """
 <style id="ai-highlight-style">
   [data-ai-filled="true"], [data-ai-filled="true"] * {
     background-color: #fff7ae !important;
   }
 </style>
-""",
+"""
+        ),
         unsafe_allow_html=True,
     )
 
     st.markdown(
-        f"""
+        sanitize_html(
+            f"""
 <script>
 (function() {{
   const cfg = {payload_json};  // {{ targets: [{{row, col, sku}}...], sku_index }}
@@ -3692,7 +3696,8 @@ def _inject_ai_highlight_script(payload: dict) -> None:
   obs.observe(document.body, {{ childList: true, subtree: true }});
 }})();
 </script>
-""",
+"""
+        ),
         unsafe_allow_html=True,
     )
 
