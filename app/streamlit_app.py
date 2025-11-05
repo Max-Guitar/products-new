@@ -127,6 +127,10 @@ from services.normalizers import (
 )
 from utils.http import build_magento_headers, get_session
 from utils.html_sanitize import sanitize_html
+from utils.df_sanitize import find_bad_cols, sanitize_for_arrow
+
+
+AFTER_AI_PREVIEW_HIDE_COLS = {"ai_meta", "errors", "trace", "raw_response"}
 
 
 logger = logging.getLogger(__name__)
@@ -7657,10 +7661,22 @@ if df_original_key in st.session_state:
                                                             "Нет данных DF BEFORE AI"
                                                         )
                                                     if isinstance(after_ai, pd.DataFrame):
-                                                        st.write(
-                                                            "DF AFTER AI",
-                                                            after_ai.head(10),
+                                                        preview_cols = [
+                                                            c
+                                                            for c in after_ai.columns
+                                                            if c not in AFTER_AI_PREVIEW_HIDE_COLS
+                                                        ]
+                                                        preview_source = (
+                                                            after_ai[preview_cols] if preview_cols else after_ai
                                                         )
+                                                        preview = sanitize_for_arrow(preview_source.head(10))
+                                                        st.write("DF AFTER AI", preview)
+                                                        bad_cols = find_bad_cols(after_ai)
+                                                        if bad_cols:
+                                                            st.warning(
+                                                                "Non-Arrow-friendly columns detected:"
+                                                                f" {bad_cols}"
+                                                            )
                                                     else:
                                                         st.caption(
                                                             "Нет данных DF AFTER AI"
