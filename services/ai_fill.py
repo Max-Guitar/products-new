@@ -37,7 +37,6 @@ from services.llm_extract import (
 
 ALWAYS_ATTRS: Set[str] = {
     "brand",
-    "series",
     "condition",
     "categories",
     "country_of_manufacture",
