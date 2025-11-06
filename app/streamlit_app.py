@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from urllib.parse import quote
 import re
 
+from bs4 import BeautifulSoup
 import requests
 import openai
 from tenacity import (
@@ -996,30 +997,100 @@ def _clean_description_value(value: object) -> str:
     return _normalize_text(value)
 
 
-def _strip_truncation_warning(value: object) -> str:
-    text = _clean_description_value(value)
-    prefix = "⚠️ "
-    if text.startswith(prefix):
-        return text[len(prefix) :]
-    return text
-
-
 def _is_translation_truncated(text: str) -> bool:
     if not text:
         return False
     stripped = text.strip()
     if not stripped:
         return False
-    if "<p" in stripped and not stripped.endswith("</p>"):
+    if is_html_like(stripped) and not stripped.endswith("</p>"):
         return True
     return False
 
 
-def _decorate_truncated_translation(value: object) -> str:
-    text = _strip_truncation_warning(value)
-    if _is_translation_truncated(text):
-        return f"⚠️ {text}"
-    return text
+HTML_WARNING_PREFIX = re.compile(r"^\s*⚠️\s*")
+
+ALLOWED_TAGS = {
+    "p",
+    "ul",
+    "ol",
+    "li",
+    "strong",
+    "em",
+    "b",
+    "i",
+    "br",
+    "u",
+    "h3",
+    "h4",
+    "div",
+    "figure",
+    "iframe",
+    "span",
+    "a",
+}
+
+ALLOWED_ATTRS = {
+    "class",
+    "id",
+    "href",
+    "title",
+    "target",
+    "rel",
+    "src",
+    "allow",
+    "allowfullscreen",
+    "frameborder",
+    "width",
+    "height",
+}
+
+
+def is_html_like(s: str) -> bool:
+    if not s:
+        return False
+    return bool(re.search(r"<[a-zA-Z][^>]*>", s))
+
+
+def fix_html(html: str) -> str:
+    cleaned = HTML_WARNING_PREFIX.sub("", html or "")
+    if not is_html_like(cleaned):
+        cleaned = f"<p>{cleaned}</p>"
+
+    soup = BeautifulSoup(cleaned, "html.parser")
+
+    for tag in soup.find_all(True):
+        if tag.name not in ALLOWED_TAGS:
+            tag.unwrap()
+            continue
+        tag.attrs = {k: v for k, v in tag.attrs.items() if k in ALLOWED_ATTRS}
+
+    out = str(soup)
+    out = out.replace("\r\n", "\n").strip()
+    return out
+
+
+def _sanitize_html_and_warn(
+    raw_value: object,
+    *,
+    label: str,
+    existing_warn: object | None = None,
+) -> tuple[str, bool]:
+    text = _clean_description_value(raw_value)
+    if not text:
+        return "", _coerce_bool(existing_warn)
+
+    warn = _is_translation_truncated(text) or _coerce_bool(existing_warn)
+    fixed = fix_html(text)
+    if not is_html_like(fixed):
+        logger.warning("%s html not HTML-like; auto-wrapping", label)
+        fixed = fix_html(f"<p>{_clean_description_value(text)}</p>")
+    try:
+        assert is_html_like(fixed), f"{label} html must be HTML-like"
+    except AssertionError as exc:
+        logger.warning("%s", exc)
+        fixed = "<p></p>"
+    return fixed, warn
 
 
 def _ensure_html_description(value: object) -> str:
@@ -1086,6 +1157,39 @@ def _restore_embed(embed: str, body: str) -> str:
     if not body_clean:
         return embed
     return f"{embed}\n{body_clean}"
+
+
+def _prepare_multilingual_payload(
+    product: Step3Product,
+    *,
+    english_body: str,
+    embed: str = "",
+    error_log: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    english_html, en_warn = _sanitize_html_and_warn(
+        english_body,
+        label=f"{product.sku}:EN draft",
+    )
+    translations = _translate_description(
+        english_html,
+        sku=product.sku,
+        error_log=error_log,
+    )
+    final_en = _restore_embed(embed, english_html)
+    final_en_html, final_en_warn = _sanitize_html_and_warn(
+        final_en,
+        label=f"{product.sku}:EN final",
+        existing_warn=en_warn,
+    )
+
+    payload: dict[str, object] = {
+        "en_html": final_en_html,
+        "en_warn": final_en_warn,
+    }
+    for lang_code, (html, warn) in translations.items():
+        payload[f"{lang_code}_html"] = html
+        payload[f"{lang_code}_warn"] = warn
+    return payload
 
 
 def _detect_body_shape(name: str, attributes: Mapping[str, object]) -> str | None:
@@ -1396,9 +1500,9 @@ def _translate_description(
     *,
     sku: str | None = None,
     error_log: list[dict[str, object]] | None = None,
-) -> tuple[str, str, str, str]:
+) -> dict[str, tuple[str, bool]]:
     if not english_text:
-        return "", "", "", ""
+        return {lang: ("", False) for lang in ("nl", "de", "es", "fr")}
 
     sku_label = sku or "unknown SKU"
     model = TRANSLATION_MODEL
@@ -1415,9 +1519,11 @@ def _translate_description(
         "fr": "French",
     }
 
-    translations: dict[str, str] = {lang: "" for lang in language_names}
+    translations: dict[str, tuple[str, bool]] = {
+        lang: ("", False) for lang in language_names
+    }
 
-    def _translate_single_language(lang: str) -> str:
+    def _translate_single_language(lang: str) -> tuple[str, bool]:
         language_label = language_names.get(lang, lang)
         system_prompt = (
             "You translate professional musical instrument copy. Respond ONLY with JSON "
@@ -1480,7 +1586,11 @@ def _translate_description(
                 translation = payload.get(lang) or payload.get(lang.upper())
             text = _normalize_text(translation)
             if text:
-                return text
+                html, warn = _sanitize_html_and_warn(
+                    text,
+                    label=f"{sku_label}:{lang.upper()} translation",
+                )
+                return html, warn
 
         error_message = errors_local[-1] if errors_local else "unknown error"
         raise RuntimeError(
@@ -1515,13 +1625,9 @@ def _translate_description(
                     )
             except Exception:  # pragma: no cover
                 pass
+            translations[language_code] = ("", False)
 
-    return (
-        translations.get("nl", ""),
-        translations.get("de", ""),
-        translations.get("es", ""),
-        translations.get("fr", ""),
-    )
+    return translations
 
 
 def _categorize_product(product: Step3Product) -> str:
@@ -1559,7 +1665,7 @@ def _generate_acoustic_copy(
     product: Step3Product,
     *,
     error_log: list[dict[str, object]] | None = None,
-) -> tuple[str, str, str, str, str]:
+) -> dict[str, object]:
     embed, existing_body = _extract_video_embed(product.short_description)
     attr_summary = _format_attribute_summary(product.attributes)
     hint = _normalize_text(product.attributes.get("hint"))
@@ -1611,20 +1717,19 @@ def _generate_acoustic_copy(
     )
     english_body = _ensure_html_description(english_body)
 
-    nl, de, es, fr = _translate_description(
-        english_body,
-        sku=product.sku,
+    return _prepare_multilingual_payload(
+        product,
+        english_body=english_body,
+        embed=embed,
         error_log=error_log,
     )
-    final_en = _restore_embed(embed, english_body)
-    return final_en, nl, de, es, fr
 
 
 def _generate_electric_copy(
     product: Step3Product,
     *,
     error_log: list[dict[str, object]] | None = None,
-) -> tuple[str, str, str, str, str]:
+) -> dict[str, object]:
     embed, existing_body = _extract_video_embed(product.short_description)
     attr_summary = _format_attribute_summary(product.attributes)
     hint = _normalize_text(product.attributes.get("hint"))
@@ -1667,20 +1772,19 @@ def _generate_electric_copy(
     )
     english_body = _ensure_html_description(english_body)
 
-    nl, de, es, fr = _translate_description(
-        english_body,
-        sku=product.sku,
+    return _prepare_multilingual_payload(
+        product,
+        english_body=english_body,
+        embed=embed,
         error_log=error_log,
     )
-    final_en = _restore_embed(embed, english_body)
-    return final_en, nl, de, es, fr
 
 
 def _generate_accessory_copy(
     product: Step3Product,
     *,
     error_log: list[dict[str, object]] | None = None,
-) -> tuple[str, str, str, str, str]:
+) -> dict[str, object]:
     embed, existing_body = _extract_video_embed(product.short_description)
     attr_summary = _format_attribute_summary(product.attributes)
     hint = _normalize_text(product.attributes.get("hint"))
@@ -1724,20 +1828,19 @@ def _generate_accessory_copy(
     )
     english_body = _ensure_html_description(english_body)
 
-    nl, de, es, fr = _translate_description(
-        english_body,
-        sku=product.sku,
+    return _prepare_multilingual_payload(
+        product,
+        english_body=english_body,
+        embed=embed,
         error_log=error_log,
     )
-    final_en = _restore_embed(embed, english_body)
-    return final_en, nl, de, es, fr
 
 
 def _generate_bass_copy(
     product: Step3Product,
     *,
     error_log: list[dict[str, object]] | None = None,
-) -> tuple[str, str, str, str, str]:
+) -> dict[str, object]:
     embed, existing_body = _extract_video_embed(product.short_description)
     attr_summary = _format_attribute_summary(product.attributes)
     hint = _normalize_text(product.attributes.get("hint"))
@@ -1780,20 +1883,19 @@ def _generate_bass_copy(
     )
     english_body = _ensure_html_description(english_body)
 
-    nl, de, es, fr = _translate_description(
-        english_body,
-        sku=product.sku,
+    return _prepare_multilingual_payload(
+        product,
+        english_body=english_body,
+        embed=embed,
         error_log=error_log,
     )
-    final_en = _restore_embed(embed, english_body)
-    return final_en, nl, de, es, fr
 
 
 def _generate_amp_copy(
     product: Step3Product,
     *,
     error_log: list[dict[str, object]] | None = None,
-) -> tuple[str, str, str, str, str]:
+) -> dict[str, object]:
     embed, existing_body = _extract_video_embed(product.short_description)
     attr_summary = _format_attribute_summary(product.attributes)
     hint = _normalize_text(product.attributes.get("hint"))
@@ -1833,20 +1935,19 @@ def _generate_amp_copy(
     )
     english_body = _ensure_html_description(english_body)
 
-    nl, de, es, fr = _translate_description(
-        english_body,
-        sku=product.sku,
+    return _prepare_multilingual_payload(
+        product,
+        english_body=english_body,
+        embed=embed,
         error_log=error_log,
     )
-    final_en = _restore_embed(embed, english_body)
-    return final_en, nl, de, es, fr
 
 
 def _generate_effect_copy(
     product: Step3Product,
     *,
     error_log: list[dict[str, object]] | None = None,
-) -> tuple[str, str, str, str, str]:
+) -> dict[str, object]:
     embed, existing_body = _extract_video_embed(product.short_description)
     attr_summary = _format_attribute_summary(product.attributes)
     hint = _normalize_text(product.attributes.get("hint"))
@@ -1889,20 +1990,19 @@ def _generate_effect_copy(
     )
     english_body = _ensure_html_description(english_body)
 
-    nl, de, es, fr = _translate_description(
-        english_body,
-        sku=product.sku,
+    return _prepare_multilingual_payload(
+        product,
+        english_body=english_body,
+        embed=embed,
         error_log=error_log,
     )
-    final_en = _restore_embed(embed, english_body)
-    return final_en, nl, de, es, fr
 
 
 def _generate_description_for_product(
     product: Step3Product,
     *,
     error_log: list[dict[str, object]] | None = None,
-) -> tuple[str, str, str, str, str]:
+) -> dict[str, object]:
     category = _categorize_product(product)
     if category == "acoustic":
         return _generate_acoustic_copy(product, error_log=error_log)
@@ -1976,20 +2076,33 @@ def _ensure_descriptions_initialized(products: Sequence[Step3Product]) -> None:
         stored = descriptions.get(product.sku)
         if not isinstance(stored, dict):
             stored = {}
-        en_text = stored.get("en")
-        nl_text = stored.get("nl")
-        de_text = stored.get("de")
-        es_text = stored.get("es")
-        fr_text = stored.get("fr")
-        if not _clean_description_value(en_text):
-            en_text = product.short_description
-        descriptions[product.sku] = {
-            "en": _clean_description_value(en_text),
-            "nl": _clean_description_value(nl_text),
-            "de": _clean_description_value(de_text),
-            "es": _clean_description_value(es_text),
-            "fr": _clean_description_value(fr_text),
-        }
+        en_source = (
+            stored.get("en_html")
+            or stored.get("en")
+            or product.short_description
+        )
+        en_html, en_warn = _sanitize_html_and_warn(
+            en_source,
+            label=f"{product.sku}:EN init",
+            existing_warn=stored.get("en_warn"),
+        )
+
+        entry: dict[str, object] = {"en_html": en_html}
+        if en_warn:
+            entry["en_warn"] = en_warn
+
+        for lang in ("nl", "de", "es", "fr"):
+            source_value = stored.get(f"{lang}_html") or stored.get(lang)
+            html, warn = _sanitize_html_and_warn(
+                source_value,
+                label=f"{product.sku}:{lang.upper()} init",
+                existing_warn=stored.get(f"{lang}_warn"),
+            )
+            entry[f"{lang}_html"] = html
+            if warn:
+                entry[f"{lang}_warn"] = warn
+
+        descriptions[product.sku] = entry
 
     st.session_state["descriptions"] = descriptions
 
@@ -2147,7 +2260,7 @@ def _generate_descriptions_for_products(
     *,
     run_id: str,
     checkpoint: dict[str, object],
-) -> tuple[dict[str, dict[str, str]], list[str]]:
+) -> tuple[dict[str, dict[str, object]], list[str]]:
     state = checkpoint
     queue = list(state.get("queue") or [])
     if not queue:
@@ -2167,7 +2280,7 @@ def _generate_descriptions_for_products(
         product_lookup.setdefault(product.sku, product)
 
     total = len(queue)
-    results: dict[str, dict[str, str]] = {}
+    results: dict[str, dict[str, object]] = {}
     state_errors: list[dict[str, object]] = state.setdefault("errors", [])  # type: ignore[assignment]
     done_list: list[str] = state.setdefault("done", [])  # type: ignore[assignment]
     cursor = int(state.get("cursor") or 0)
@@ -2179,11 +2292,26 @@ def _generate_descriptions_for_products(
     run_dir = _run_output_dir(run_id)
     for done_sku in done_list:
         safe_name = _sanitize_for_filename(done_sku)
-        entry: dict[str, str] = {}
+        entry: dict[str, object] = {}
         for lang in ("en", "nl", "de", "es", "fr"):
             value = _load_text_if_exists(run_dir / f"{safe_name}_{lang}.html")
             if value:
-                entry[lang] = value
+                html, warn = _sanitize_html_and_warn(
+                    value,
+                    label=f"{done_sku}:{lang.upper()} cached",
+                    existing_warn=_load_text_if_exists(
+                        run_dir / f"{safe_name}_{lang}.warn"
+                    ),
+                )
+                entry[f"{lang}_html"] = html
+                if warn:
+                    entry[f"{lang}_warn"] = warn
+            else:
+                warn_value = _coerce_bool(
+                    _load_text_if_exists(run_dir / f"{safe_name}_{lang}.warn")
+                )
+                if warn_value:
+                    entry[f"{lang}_warn"] = warn_value
         if entry:
             results[done_sku] = entry
 
@@ -2243,7 +2371,7 @@ def _generate_descriptions_for_products(
                 continue
 
             trace({"where": "step3:generate:start", "sku": product.sku})
-            payload: dict[str, str]
+            payload: dict[str, object]
 
             try:
                 if not product.generate:
@@ -2268,31 +2396,17 @@ def _generate_descriptions_for_products(
                         _update_progress(index + 1)
                         continue
                     trace({"where": "step3:generate:fallback:start", "sku": product.sku})
-                    nl, de, es, fr = _translate_description(
-                        short_description,
-                        sku=product.sku,
+                    payload = _prepare_multilingual_payload(
+                        product,
+                        english_body=short_description,
                         error_log=state_errors,
                     )
-                    payload = {
-                        "en": short_description,
-                        "nl": _clean_description_value(nl),
-                        "de": _clean_description_value(de),
-                        "es": _clean_description_value(es),
-                        "fr": _clean_description_value(fr),
-                    }
                     trace({"where": "step3:generate:fallback:ok", "sku": product.sku})
                 else:
-                    en, nl, de, es, fr = _generate_description_for_product(
+                    payload = _generate_description_for_product(
                         product,
                         error_log=state_errors,
                     )
-                    payload = {
-                        "en": _clean_description_value(en),
-                        "nl": _clean_description_value(nl),
-                        "de": _clean_description_value(de),
-                        "es": _clean_description_value(es),
-                        "fr": _clean_description_value(fr),
-                    }
                     trace({"where": "step3:generate:ok", "sku": product.sku})
             except Exception as exc:
                 message = f"{product.sku}: {exc}"
@@ -2300,14 +2414,14 @@ def _generate_descriptions_for_products(
                     {"sku": product.sku, "lang": "general", "error": message}
                 )
                 payload = {
-                    "en": _clean_description_value(
+                    "en_html": _clean_description_value(
                         product.short_description
                     )
                     or "AI FAILED TO GENERATE",
-                    "nl": "",
-                    "de": "",
-                    "es": "",
-                    "fr": "",
+                    "nl_html": "",
+                    "de_html": "",
+                    "es_html": "",
+                    "fr_html": "",
                 }
                 trace(
                     {
@@ -2318,10 +2432,25 @@ def _generate_descriptions_for_products(
                 )
 
             safe_name = _sanitize_for_filename(product.sku)
-            for lang, value in payload.items():
+            for lang in ("en", "nl", "de", "es", "fr"):
+                html_value = _clean_description_value(
+                    payload.get(f"{lang}_html", "")
+                )
+                warn_value = _coerce_bool(payload.get(f"{lang}_warn"))
+                if html_value:
+                    sanitized_html, _ = _sanitize_html_and_warn(
+                        html_value,
+                        label=f"{product.sku}:{lang.upper()} persist",
+                        existing_warn=warn_value,
+                    )
+                else:
+                    sanitized_html = ""
                 output_path = run_dir / f"{safe_name}_{lang}.html"
-                _write_atomic_text(output_path, value or "")
-
+                _write_atomic_text(output_path, sanitized_html)
+                warn_path = run_dir / f"{safe_name}_{lang}.warn"
+                _write_atomic_text(warn_path, "1" if warn_value else "")
+                payload[f"{lang}_html"] = sanitized_html
+            
             results[product.sku] = payload
             if product.sku not in done_list:
                 done_list.append(product.sku)
@@ -2372,7 +2501,9 @@ def _apply_descriptions_to_state(descriptions_map: Mapping[str, Mapping[str, obj
             sku = _normalize_text(row.get("sku"))
             if not sku or sku not in descriptions_map:
                 continue
-            en_value = _clean_description_value(descriptions_map[sku].get("en"))
+            en_value = _clean_description_value(
+                descriptions_map[sku].get("en_html")
+            )
             current = _clean_description_value(row.get("short_description"))
             if en_value != current:
                 df_copy.at[idx, "short_description"] = en_value
@@ -2405,9 +2536,23 @@ def _save_translations(
         if not isinstance(payload, Mapping):
             continue
         for store_code in store_codes:
-            text_value = _clean_description_value(payload.get(store_code))
+            text_value = _clean_description_value(
+                payload.get(f"{store_code}_html")
+            )
             if not text_value:
                 continue
+            sanitized_html, _ = _sanitize_html_and_warn(
+                text_value,
+                label=f"{sku}:{store_code.upper()} export",
+                existing_warn=payload.get(f"{store_code}_warn"),
+            )
+            try:
+                assert is_html_like(sanitized_html), (
+                    f"{sku}:{store_code} html must be HTML-like"
+                )
+            except AssertionError as exc:
+                logger.warning("%s", exc)
+            text_value = sanitized_html
             url = _store_specific_url(base_url, store_code, sku)
             data = {
                 "product": {
@@ -8020,18 +8165,20 @@ if df_original_key in st.session_state:
             descriptions_map = st.session_state.get("descriptions", {})
             table_rows: list[dict[str, object]] = []
             for product in products or []:
-                entry = descriptions_map.get(product.sku, {}) if isinstance(descriptions_map, Mapping) else {}
-                nl_value = _clean_description_value(entry.get("nl"))
-                de_value = _clean_description_value(entry.get("de"))
+                entry = (
+                    descriptions_map.get(product.sku, {})
+                    if isinstance(descriptions_map, Mapping)
+                    else {}
+                )
                 table_rows.append(
                     {
                         "Name": product.name,
                         "SKU": product.sku,
-                        "EN Description": _clean_description_value(entry.get("en")),
-                        "NL Description": _decorate_truncated_translation(nl_value),
-                        "DE Description": _decorate_truncated_translation(de_value),
-                        "ES Description": _clean_description_value(entry.get("es")),
-                        "FR Description": _clean_description_value(entry.get("fr")),
+                        "EN Description": _clean_description_value(entry.get("en_html")),
+                        "NL Description": _clean_description_value(entry.get("nl_html")),
+                        "DE Description": _clean_description_value(entry.get("de_html")),
+                        "ES Description": _clean_description_value(entry.get("es_html")),
+                        "FR Description": _clean_description_value(entry.get("fr_html")),
                     }
                 )
 
@@ -8057,17 +8204,42 @@ if df_original_key in st.session_state:
                 )
 
                 if isinstance(editor_df, pd.DataFrame):
-                    new_map: dict[str, dict[str, str]] = {}
+                    new_map: dict[str, dict[str, object]] = {}
                     for row in editor_df.to_dict(orient="records"):
                         sku = _normalize_text(row.get("SKU"))
                         if not sku:
                             continue
+                        en_html, en_warn = _sanitize_html_and_warn(
+                            row.get("EN Description"),
+                            label=f"{sku}:EN editor",
+                        )
+                        nl_html, nl_warn = _sanitize_html_and_warn(
+                            row.get("NL Description"),
+                            label=f"{sku}:NL editor",
+                        )
+                        de_html, de_warn = _sanitize_html_and_warn(
+                            row.get("DE Description"),
+                            label=f"{sku}:DE editor",
+                        )
+                        es_html, es_warn = _sanitize_html_and_warn(
+                            row.get("ES Description"),
+                            label=f"{sku}:ES editor",
+                        )
+                        fr_html, fr_warn = _sanitize_html_and_warn(
+                            row.get("FR Description"),
+                            label=f"{sku}:FR editor",
+                        )
                         new_map[sku] = {
-                            "en": _clean_description_value(row.get("EN Description")),
-                            "nl": _strip_truncation_warning(row.get("NL Description")),
-                            "de": _strip_truncation_warning(row.get("DE Description")),
-                            "es": _clean_description_value(row.get("ES Description")),
-                            "fr": _clean_description_value(row.get("FR Description")),
+                            "en_html": en_html,
+                            "en_warn": en_warn,
+                            "nl_html": nl_html,
+                            "nl_warn": nl_warn,
+                            "de_html": de_html,
+                            "de_warn": de_warn,
+                            "es_html": es_html,
+                            "es_warn": es_warn,
+                            "fr_html": fr_html,
+                            "fr_warn": fr_warn,
                         }
                     if new_map:
                         descriptions_map = st.session_state.get("descriptions")
@@ -8075,6 +8247,30 @@ if df_original_key in st.session_state:
                             descriptions_map = {}
                         descriptions_map.update(new_map)
                         st.session_state["descriptions"] = descriptions_map
+
+                with st.expander("Preview NL/DE descriptions", expanded=False):
+                    for product in products or []:
+                        entry = (
+                            descriptions_map.get(product.sku, {})
+                            if isinstance(descriptions_map, Mapping)
+                            else {}
+                        )
+                        nl_html = _clean_description_value(entry.get("nl_html"))
+                        de_html = _clean_description_value(entry.get("de_html"))
+                        st.markdown(f"**{product.sku} — {product.name}**")
+                        if nl_html:
+                            st.markdown(nl_html, unsafe_allow_html=True)
+                            if _coerce_bool(entry.get("nl_warn")):
+                                st.caption("⚠️ Автогенерация: проверьте текст (NL)")
+                        else:
+                            st.caption("NL description is empty")
+                        if de_html:
+                            st.markdown(de_html, unsafe_allow_html=True)
+                            if _coerce_bool(entry.get("de_warn")):
+                                st.caption("⚠️ Автогенерация: проверьте текст (DE)")
+                        else:
+                            st.caption("DE description is empty")
+                        st.markdown("---")
 
                 btn_step3_save = st.button("💾 Save to Magento", key="btn_step3_save")
                 if btn_step3_save:
