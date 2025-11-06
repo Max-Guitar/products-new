@@ -26,8 +26,8 @@ The `main` branch has been hard-reset to commit `5d6f692ada4f417250efa75e3950a2a
 
 Создай бэкап-ветку от текущего main: backup/main-$(date +%Y%m%d-%H%M).
 
-От коммита 716e0d9df3ecd3ca5347c50414515b33af7452ea создай ветку restore/716e0d9.
+От коммита c888ffc92787891a03207ed29750549bfa96eed2 создай ветку restore/c888ffc.
 
-Открой PR restore/716e0d9 → main с заголовком “Restore repository to 716e0d9” и описанием “This PR restores the tree to commit 716e0d9 without history rewrite.”
+Открой PR restore/c888ffc → main с заголовком “Restore repository to c888ffc” и описанием “This PR restores the tree to commit c888ffc without history rewrite.”
 
-Убедись, что PR полностью откатывает изменения после 716e0d9 (дифф пустой относительно того снимка), и влей PR (Merge).
+Убедись, что PR полностью откатывает изменения после c888ffc (дифф пустой относительно того снимка), и влей PR (Merge).
