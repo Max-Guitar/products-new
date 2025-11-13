@@ -1,17 +1,13 @@
 from __future__ import annotations
 
-import gc
 import hashlib
 import json
 import logging
 import math
-import os
 import sys
-import traceback
-import time
-import uuid
-from datetime import datetime
 from pathlib import Path
+import os
+import traceback
 from string import Template
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,25 +22,10 @@ import re
 
 import requests
 import openai
-from tenacity import (
-    RetryCallState,
-    retry,
-    retry_if_exception,
-    stop_after_attempt,
-    wait_exponential,
-    wait_random,
-)
 
 import pandas as pd
 import streamlit as st
 import random
-
-OUTPUT_DIR = Path(os.getenv("TMPDIR", "/tmp")) / "peter_outputs"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-LOG_DIR = OUTPUT_DIR / "logs"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
-CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
 from utils.json_parse import extract_json_object, short_preview_of
 
@@ -126,41 +107,9 @@ from services.normalizers import (
     normalize_units,
 )
 from utils.http import build_magento_headers, get_session
-from utils.html_sanitize import sanitize_html
-from utils.df_sanitize import find_bad_cols, sanitize_for_arrow
-
-
-AFTER_AI_PREVIEW_HIDE_COLS = {"ai_meta", "errors", "trace", "raw_response"}
 
 
 logger = logging.getLogger(__name__)
-
-
-if "boot_id" not in st.session_state:
-    st.session_state["boot_id"] = str(uuid.uuid4())
-    try:
-        boots_log_path = LOG_DIR / "boots.log"
-        with open(boots_log_path, "a", encoding="utf-8") as boots_log:
-            boots_log.write(
-                f"{time.time()} NEW_BOOT {st.session_state['boot_id']}\n"
-            )
-    except Exception as exc:  # pragma: no cover - filesystem issues
-        logger.warning("Failed to record boot marker: %s", exc)
-
-
-def _format_eta_label(minutes: float | int) -> str:
-    try:
-        minutes_value = float(minutes)
-    except (TypeError, ValueError):
-        minutes_value = 0.0
-    if minutes_value <= 0:
-        return "<1 min"
-    if minutes_value < 1:
-        return "<1 min"
-    rounded = max(1, int(math.ceil(minutes_value)))
-    if rounded == 1:
-        return "~1 min"
-    return f"~{rounded} min"
 
 
 def _force_mark(sku: str, code: str):
@@ -1139,67 +1088,6 @@ def _openai_client_kwargs() -> dict[str, object]:
     return kwargs
 
 
-def _ensure_timeout_seconds(timeout: object, minimum: int = 180) -> int:
-    try:
-        coerced = int(timeout)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        coerced = 0
-    return max(coerced, minimum)
-
-
-_OPENAI_TIMEOUT_CLASSES: tuple[type, ...] = tuple(
-    cls
-    for cls in (
-        getattr(openai, "APITimeoutError", None),
-        getattr(openai, "APIConnectionError", None),
-    )
-    if isinstance(cls, type)
-)
-
-
-def _is_timeout_error(exc: Exception) -> bool:
-    if _OPENAI_TIMEOUT_CLASSES and isinstance(exc, _OPENAI_TIMEOUT_CLASSES):
-        return True
-    message = str(exc).lower()
-    return "request timed out" in message or "timed out" in message
-
-
-def _log_timeout_retry(retry_state: RetryCallState) -> None:
-    outcome = retry_state.outcome
-    exc: Exception | None = outcome.exception() if outcome else None
-    if not exc or not _is_timeout_error(exc):
-        return
-    context = retry_state.kwargs.get("retry_context") or {}
-    sku = context.get("sku") or "unknown SKU"
-    lang = context.get("lang") or "general"
-    try:
-        st.warning(f"⚠️ Retry due to timeout for {sku} ({lang})")
-    except Exception:  # pragma: no cover - Streamlit fallback
-        pass
-
-
-def _chat_completion_with_retry(
-    client: openai.OpenAI,
-    request_kwargs: Mapping[str, object],
-    *,
-    retry_context: Mapping[str, object] | None = None,
-):
-    payload = dict(request_kwargs)
-    context = dict(retry_context or {})
-
-    @retry(
-        wait=wait_exponential(multiplier=2, min=5, max=60) + wait_random(0, 5),
-        stop=stop_after_attempt(5),
-        retry=retry_if_exception(_is_timeout_error),
-        before_sleep=_log_timeout_retry,
-        reraise=True,
-    )
-    def _invoke(*, retry_context: Mapping[str, object]):
-        return client.chat.completions.create(**payload)
-
-    return _invoke(retry_context=context)
-
-
 def _call_openai_text(
     model: str,
     system_prompt: str,
@@ -1208,12 +1096,9 @@ def _call_openai_text(
     temperature: float = 0.7,
     max_tokens: int = 1100,
     response_format: dict[str, object] | None = None,
-    timeout: int = 180,
-    retry_context: Mapping[str, object] | None = None,
+    timeout: int = 120,
 ) -> str:
     client_kwargs = _openai_client_kwargs()
-    effective_timeout = _ensure_timeout_seconds(timeout)
-    client_kwargs.setdefault("timeout", effective_timeout)
     try:
         client = openai.OpenAI(**client_kwargs)
     except Exception as exc:  # pragma: no cover - network client init
@@ -1236,7 +1121,7 @@ def _call_openai_text(
     kwargs: dict[str, object] = {
         "model": resolved_model,
         "messages": messages,
-        "timeout": effective_timeout,
+        "timeout": timeout,
     }
     if response_format:
         kwargs["response_format"] = response_format
@@ -1255,11 +1140,7 @@ def _call_openai_text(
     )
 
     try:
-        chat = _chat_completion_with_retry(
-            client,
-            kwargs,
-            retry_context=retry_context,
-        )
+        chat = client.chat.completions.create(**kwargs)
     except Exception as exc:  # pragma: no cover - API failure handling
         stripped_kwargs = dict(kwargs)
         for key in ("temperature", "response_format", "max_completion_tokens"):
@@ -1273,11 +1154,7 @@ def _call_openai_text(
                 }
             )
             try:
-                chat = _chat_completion_with_retry(
-                    client,
-                    stripped_kwargs,
-                    retry_context=retry_context,
-                )
+                chat = client.chat.completions.create(**stripped_kwargs)
             except Exception as retry_exc:  # pragma: no cover - API failure handling
                 raise RuntimeError(f"OpenAI request failed: {retry_exc}") from retry_exc
         else:
@@ -1353,10 +1230,9 @@ def _call_openai_json(
     user_prompt: str,
     *,
     temperature: float = 0.4,
-    timeout: int = 180,
+    timeout: int = 120,
     required_keys: Iterable[str] | None = ("en",),
     max_tokens: int | None = None,
-    retry_context: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     text_kwargs: dict[str, object] = {
         "temperature": temperature,
@@ -1365,8 +1241,6 @@ def _call_openai_json(
     }
     if max_tokens is not None:
         text_kwargs["max_tokens"] = max_tokens
-    if retry_context is not None:
-        text_kwargs["retry_context"] = retry_context
 
     raw = _call_openai_text(
         model,
@@ -1391,22 +1265,16 @@ def _choose_random(texts: Sequence[str], fallback: str = "") -> str:
     return random.choice(candidates)
 
 
-def _translate_description(
-    english_text: str,
-    *,
-    sku: str | None = None,
-    error_log: list[dict[str, object]] | None = None,
-) -> tuple[str, str, str, str]:
+def _translate_description(english_text: str) -> tuple[str, str, str, str]:
     if not english_text:
         return "", "", "", ""
-
-    sku_label = sku or "unknown SKU"
     model = TRANSLATION_MODEL
     fallback_model = (
         TRANSLATION_MODEL_FALLBACK
         if TRANSLATION_MODEL_FALLBACK and TRANSLATION_MODEL_FALLBACK != model
         else None
     )
+    raw_candidates: list[str] = []
 
     language_names = {
         "nl": "Dutch",
@@ -1415,112 +1283,210 @@ def _translate_description(
         "fr": "French",
     }
 
-    translations: dict[str, str] = {lang: "" for lang in language_names}
+    def _format_language_list(labels: Sequence[str]) -> str:
+        if not labels:
+            return ""
+        if len(labels) == 1:
+            return labels[0]
+        if len(labels) == 2:
+            return " and ".join(labels)
+        return ", ".join(labels[:-1]) + f", and {labels[-1]}"
 
-    def _translate_single_language(lang: str) -> str:
-        language_label = language_names.get(lang, lang)
+    def _run_models(
+        text: str,
+        attempt_label: str,
+        languages: tuple[str, ...],
+    ) -> dict[str, object] | None:
+        local_raw: list[str] = []
+
+        json_keys = ", ".join(f"\\\"{lang}\\\": \\\"...\\\"" for lang in languages)
+        labels = [f"{language_names.get(lang, lang)} ({lang})" for lang in languages]
+        language_list = _format_language_list(labels)
         system_prompt = (
-            "You translate professional musical instrument copy. Respond ONLY with JSON "
-            "{\"translation\": \"...\"}. No markdown. No prose."
+            "You translate professional musical instrument copy. Respond ONLY "
+            f"with JSON: {{{json_keys}}}. Do not wrap inside 'description' or 'name'. "
+            "No markdown. No prose."
         )
         user_prompt = (
-            f"Translate the following English guitar product description into {language_label} ({lang}). "
-            "Use natural marketing language and keep original line breaks.\n\n"
-            f"TEXT:\n{english_text.strip()}"
+            "Translate the following English guitar product description into "
+            f"{language_list}. Use natural marketing language and keep line breaks.\n\n"
+            f"TEXT:\n{text.strip()}"
         )
 
-        errors_local: list[str] = []
-        for model_name in filter(None, (model, fallback_model)):
+        def _attempt(model_name: str) -> dict[str, object] | None:
             try:
-                payload = _call_openai_json(
+                return _call_openai_json(
                     model_name,
                     system_prompt,
                     user_prompt,
                     temperature=0.2,
-                    required_keys=("translation",),
+                    required_keys=languages,
                     max_tokens=2500,
-                    retry_context={"sku": sku_label, "lang": lang, "model": model_name},
                 )
             except JSONPayloadError as exc:
-                errors_local.append(str(exc))
                 trace(
                     {
                         "where": "step3:translate_error",
                         "model": model_name,
-                        "lang": lang,
-                        "sku": sku_label,
                         "err": str(exc)[:200],
+                        "preview": short_preview_of(exc.raw),
+                        "attempt": attempt_label,
                     }
                 )
-                continue
-            except Exception as exc:
-                errors_local.append(str(exc))
-                trace(
-                    {
-                        "where": "step3:translate_error",
-                        "model": model_name,
-                        "lang": lang,
-                        "sku": sku_label,
-                        "err": str(exc)[:200],
-                    }
-                )
-                if _is_timeout_error(exc):
-                    try:
-                        st.warning(f"Timeout on {sku_label} ({lang}), recorded and continuing.")
-                    except Exception:  # pragma: no cover
-                        pass
-                continue
+                if exc.raw:
+                    local_raw.append(exc.raw)
+                return None
 
-            translation = (
-                payload.get("translation")
-                if isinstance(payload, Mapping)
-                else None
-            )
-            if not translation and isinstance(payload, Mapping):
-                translation = payload.get(lang) or payload.get(lang.upper())
-            text = _normalize_text(translation)
-            if text:
-                return text
+        fallback_tried = False
+        payload: dict[str, object] | None = None
 
-        error_message = errors_local[-1] if errors_local else "unknown error"
-        raise RuntimeError(
-            f"Failed to translate {sku_label} to {language_label}: {error_message}"
-        )
-
-    for language_code in translations:
         try:
-            translations[language_code] = _translate_single_language(language_code)
-        except Exception as exc:
-            message = str(exc)
-            if error_log is not None:
-                error_log.append(
+            try:
+                payload = _attempt(model)
+            except Exception as exc:
+                trace(
                     {
-                        "sku": sku_label,
-                        "lang": language_code,
-                        "error": message,
+                        "where": "step3:translate_error",
+                        "model": model,
+                        "err": str(exc)[:200],
+                        "attempt": attempt_label,
                     }
                 )
+                if fallback_model:
+                    fallback_tried = True
+                    try:
+                        payload = _attempt(fallback_model)
+                    except Exception as fallback_exc:
+                        trace(
+                            {
+                                "where": "step3:translate_error",
+                                "model": fallback_model,
+                                "err": str(fallback_exc)[:200],
+                                "attempt": attempt_label,
+                            }
+                        )
+                        raise
+                else:
+                    raise
+
+            if payload is None and fallback_model and not fallback_tried:
+                try:
+                    payload = _attempt(fallback_model)
+                    fallback_tried = True
+                except Exception as exc:
+                    trace(
+                        {
+                            "where": "step3:translate_error",
+                            "model": fallback_model,
+                            "err": str(exc)[:200],
+                            "attempt": attempt_label,
+                        }
+                    )
+                    raise
+        finally:
+            raw_candidates.extend(local_raw)
+
+        return payload
+
+    results: dict[str, str] = {}
+
+    def _translate_pair(languages: tuple[str, ...]) -> dict[str, object] | None:
+        pair_label = "/".join(languages)
+        payload = _run_models(english_text, f"full:{pair_label}", languages)
+        if payload is None and len(english_text) > 4000:
+            paragraphs = english_text.split("\n\n")
+            shortened_text = "\n\n".join(paragraphs[:3]).strip()
+            if shortened_text and len(shortened_text) < len(english_text):
+                payload = _run_models(shortened_text, f"shortened:{pair_label}", languages)
+        return payload
+
+    for language_pair in (("nl", "de"), ("es", "fr")):
+        payload = _translate_pair(language_pair)
+        if payload:
+            for lang in language_pair:
+                value = payload.get(lang) or payload.get(lang.upper())
+                results[lang] = _normalize_text(value)
+
+    if not all(results.get(lang) for lang in ("nl", "de", "es", "fr")):
+        nl_value = results.get("nl", "")
+        de_value = results.get("de", "")
+        es_value = results.get("es", "")
+        fr_value = results.get("fr", "")
+        for raw in raw_candidates:
+            parsed_candidate = extract_json_payload(raw)
+            if isinstance(parsed_candidate, Mapping):
+                if not nl_value:
+                    nl_candidate = parsed_candidate.get("nl") or parsed_candidate.get("NL")
+                    nl_value = _normalize_text(nl_candidate)
+                if not de_value:
+                    de_candidate = parsed_candidate.get("de") or parsed_candidate.get("DE")
+                    de_value = _normalize_text(de_candidate)
+                if not es_value:
+                    es_candidate = parsed_candidate.get("es") or parsed_candidate.get("ES")
+                    es_value = _normalize_text(es_candidate)
+                if not fr_value:
+                    fr_candidate = parsed_candidate.get("fr") or parsed_candidate.get("FR")
+                    fr_value = _normalize_text(fr_candidate)
+            if not nl_value:
+                partial_nl = extract_json_payload(raw, required_keys=("nl",))
+                if isinstance(partial_nl, Mapping):
+                    nl_candidate = partial_nl.get("nl") or partial_nl.get("NL")
+                    nl_value = _normalize_text(nl_candidate)
+            if not nl_value:
+                partial_nl_upper = extract_json_payload(raw, required_keys=("NL",))
+                if isinstance(partial_nl_upper, Mapping):
+                    nl_candidate = partial_nl_upper.get("NL") or partial_nl_upper.get("nl")
+                    nl_value = _normalize_text(nl_candidate)
+            if not de_value:
+                partial_de = extract_json_payload(raw, required_keys=("de",))
+                if isinstance(partial_de, Mapping):
+                    de_candidate = partial_de.get("de") or partial_de.get("DE")
+                    de_value = _normalize_text(de_candidate)
+            if not de_value:
+                partial_de_upper = extract_json_payload(raw, required_keys=("DE",))
+                if isinstance(partial_de_upper, Mapping):
+                    de_candidate = partial_de_upper.get("DE") or partial_de_upper.get("de")
+                    de_value = _normalize_text(de_candidate)
+            if not es_value:
+                partial_es = extract_json_payload(raw, required_keys=("es",))
+                if isinstance(partial_es, Mapping):
+                    es_candidate = partial_es.get("es") or partial_es.get("ES")
+                    es_value = _normalize_text(es_candidate)
+            if not es_value:
+                partial_es_upper = extract_json_payload(raw, required_keys=("ES",))
+                if isinstance(partial_es_upper, Mapping):
+                    es_candidate = partial_es_upper.get("ES") or partial_es_upper.get("es")
+                    es_value = _normalize_text(es_candidate)
+            if not fr_value:
+                partial_fr = extract_json_payload(raw, required_keys=("fr",))
+                if isinstance(partial_fr, Mapping):
+                    fr_candidate = partial_fr.get("fr") or partial_fr.get("FR")
+                    fr_value = _normalize_text(fr_candidate)
+            if not fr_value:
+                partial_fr_upper = extract_json_payload(raw, required_keys=("FR",))
+                if isinstance(partial_fr_upper, Mapping):
+                    fr_candidate = partial_fr_upper.get("FR") or partial_fr_upper.get("fr")
+                    fr_value = _normalize_text(fr_candidate)
+            if nl_value and de_value and es_value and fr_value:
+                break
+        if nl_value or de_value or es_value or fr_value:
             trace(
                 {
-                    "where": "step3:translate_failed",
-                    "sku": sku_label,
-                    "lang": language_code,
-                    "err": message[:200],
+                    "where": "step3:translate_partial",
+                    "nl_available": bool(nl_value),
+                    "de_available": bool(de_value),
+                    "es_available": bool(es_value),
+                    "fr_available": bool(fr_value),
                 }
             )
-            try:
-                if _is_timeout_error(exc):
-                    st.warning(
-                        f"Timeout on {sku_label} ({language_code}), recorded and continuing."
-                    )
-            except Exception:  # pragma: no cover
-                pass
+            return nl_value, de_value, es_value, fr_value
+        raise RuntimeError("Failed to parse translation JSON")
 
     return (
-        translations.get("nl", ""),
-        translations.get("de", ""),
-        translations.get("es", ""),
-        translations.get("fr", ""),
+        results.get("nl", ""),
+        results.get("de", ""),
+        results.get("es", ""),
+        results.get("fr", ""),
     )
 
 
@@ -1555,11 +1521,7 @@ def _categorize_product(product: Step3Product) -> str:
     return "accessory"
 
 
-def _generate_acoustic_copy(
-    product: Step3Product,
-    *,
-    error_log: list[dict[str, object]] | None = None,
-) -> tuple[str, str, str, str, str]:
+def _generate_acoustic_copy(product: Step3Product) -> tuple[str, str, str, str, str]:
     embed, existing_body = _extract_video_embed(product.short_description)
     attr_summary = _format_attribute_summary(product.attributes)
     hint = _normalize_text(product.attributes.get("hint"))
@@ -1607,24 +1569,15 @@ def _generate_acoustic_copy(
         system_prompt,
         "\n".join(user_lines),
         temperature=0.65,
-        retry_context={"sku": product.sku, "lang": "en"},
     )
     english_body = _ensure_html_description(english_body)
 
-    nl, de, es, fr = _translate_description(
-        english_body,
-        sku=product.sku,
-        error_log=error_log,
-    )
+    nl, de, es, fr = _translate_description(english_body)
     final_en = _restore_embed(embed, english_body)
     return final_en, nl, de, es, fr
 
 
-def _generate_electric_copy(
-    product: Step3Product,
-    *,
-    error_log: list[dict[str, object]] | None = None,
-) -> tuple[str, str, str, str, str]:
+def _generate_electric_copy(product: Step3Product) -> tuple[str, str, str, str, str]:
     embed, existing_body = _extract_video_embed(product.short_description)
     attr_summary = _format_attribute_summary(product.attributes)
     hint = _normalize_text(product.attributes.get("hint"))
@@ -1663,24 +1616,15 @@ def _generate_electric_copy(
         system_prompt,
         "\n".join(user_lines),
         temperature=0.7,
-        retry_context={"sku": product.sku, "lang": "en"},
     )
     english_body = _ensure_html_description(english_body)
 
-    nl, de, es, fr = _translate_description(
-        english_body,
-        sku=product.sku,
-        error_log=error_log,
-    )
+    nl, de, es, fr = _translate_description(english_body)
     final_en = _restore_embed(embed, english_body)
     return final_en, nl, de, es, fr
 
 
-def _generate_accessory_copy(
-    product: Step3Product,
-    *,
-    error_log: list[dict[str, object]] | None = None,
-) -> tuple[str, str, str, str, str]:
+def _generate_accessory_copy(product: Step3Product) -> tuple[str, str, str, str, str]:
     embed, existing_body = _extract_video_embed(product.short_description)
     attr_summary = _format_attribute_summary(product.attributes)
     hint = _normalize_text(product.attributes.get("hint"))
@@ -1719,25 +1663,16 @@ def _generate_accessory_copy(
         system_prompt,
         "\n".join(user_lines),
         temperature=0.6,
-        max_tokens=1200,
-        retry_context={"sku": product.sku, "lang": "en"},
+        max_tokens=800,
     )
     english_body = _ensure_html_description(english_body)
 
-    nl, de, es, fr = _translate_description(
-        english_body,
-        sku=product.sku,
-        error_log=error_log,
-    )
+    nl, de, es, fr = _translate_description(english_body)
     final_en = _restore_embed(embed, english_body)
     return final_en, nl, de, es, fr
 
 
-def _generate_bass_copy(
-    product: Step3Product,
-    *,
-    error_log: list[dict[str, object]] | None = None,
-) -> tuple[str, str, str, str, str]:
+def _generate_bass_copy(product: Step3Product) -> tuple[str, str, str, str, str]:
     embed, existing_body = _extract_video_embed(product.short_description)
     attr_summary = _format_attribute_summary(product.attributes)
     hint = _normalize_text(product.attributes.get("hint"))
@@ -1762,38 +1697,35 @@ def _generate_bass_copy(
         user_lines.append("Attributes:\n" + attr_summary)
 
     user_lines.append(
-        "Write a 3-4 paragraph HTML short description (220-320 words) using <p> tags. Describe tonewoods, neck feel, "
-        "pickup configuration, onboard electronics, and how it performs for fingerstyle, pick, and slap techniques. "
-        "Close with the provided outro line."
+        "Return JSON with keys en, nl, de, es, fr. The 'en' value must be 3-4 HTML paragraphs (<p>) "
+        "totalling around 220-320 words. Describe tonewoods, neck feel, pickup configuration, onboard electronics, "
+        "and playing techniques (fingerstyle, pick, slap). The 'nl', 'de', 'es', and 'fr' values should be faithful translations."
     )
 
     system_prompt = (
         "You write marketing copy for electric bass guitars. Use musical vocabulary and stay factual."
     )
 
-    english_body = _call_openai_text(
+    payload = _call_openai_json(
         BASS_MODEL,
         system_prompt,
         "\n".join(user_lines),
         temperature=0.6,
-        retry_context={"sku": product.sku, "lang": "en"},
+        required_keys=("en", "nl", "de", "es", "fr"),
     )
-    english_body = _ensure_html_description(english_body)
 
-    nl, de, es, fr = _translate_description(
-        english_body,
-        sku=product.sku,
-        error_log=error_log,
-    )
-    final_en = _restore_embed(embed, english_body)
-    return final_en, nl, de, es, fr
+    en_body = _clean_description_value(payload.get("en"))
+    nl_body = _clean_description_value(payload.get("nl"))
+    de_body = _clean_description_value(payload.get("de"))
+    es_body = _clean_description_value(payload.get("es"))
+    fr_body = _clean_description_value(payload.get("fr"))
+    if not en_body:
+        raise RuntimeError("Bass description empty")
+    final_en = _restore_embed(embed, en_body)
+    return final_en, nl_body, de_body, es_body, fr_body
 
 
-def _generate_amp_copy(
-    product: Step3Product,
-    *,
-    error_log: list[dict[str, object]] | None = None,
-) -> tuple[str, str, str, str, str]:
+def _generate_amp_copy(product: Step3Product) -> tuple[str, str, str, str, str]:
     embed, existing_body = _extract_video_embed(product.short_description)
     attr_summary = _format_attribute_summary(product.attributes)
     hint = _normalize_text(product.attributes.get("hint"))
@@ -1817,36 +1749,34 @@ def _generate_amp_copy(
         user_lines.append("Attributes:\n" + attr_summary)
 
     user_lines.append(
-        "Write a 3-4 paragraph HTML short description (220-320 words) with <p> tags covering amplifier format, power, "
-        "speaker configuration, tube vs. solid-state topology, channel/effects features, and pedalboard friendliness. "
-        "Close with the provided outro line."
+        "Return JSON with keys en, nl, de, es, fr. The English text should be 3-4 HTML paragraphs (<p>) "
+        "around 220-320 words covering amplifier format (combo/head/cab), power (watts), speaker configuration, "
+        "tube vs. solid-state topology, channel/effects details, and pedalboard friendliness. Ensure the final "
+        "sentence confirms technician inspection as provided. Provide accurate NL, DE, ES, and FR translations."
     )
 
     system_prompt = "You craft technical yet musical marketing copy for guitar amplifiers."
 
-    english_body = _call_openai_text(
+    payload = _call_openai_json(
         AMP_MODEL,
         system_prompt,
         "\n".join(user_lines),
         temperature=0.6,
-        retry_context={"sku": product.sku, "lang": "en"},
+        required_keys=("en", "nl", "de", "es", "fr"),
     )
-    english_body = _ensure_html_description(english_body)
 
-    nl, de, es, fr = _translate_description(
-        english_body,
-        sku=product.sku,
-        error_log=error_log,
-    )
-    final_en = _restore_embed(embed, english_body)
-    return final_en, nl, de, es, fr
+    en_body = _clean_description_value(payload.get("en"))
+    nl_body = _clean_description_value(payload.get("nl"))
+    de_body = _clean_description_value(payload.get("de"))
+    es_body = _clean_description_value(payload.get("es"))
+    fr_body = _clean_description_value(payload.get("fr"))
+    if not en_body:
+        raise RuntimeError("Amp description empty")
+    final_en = _restore_embed(embed, en_body)
+    return final_en, nl_body, de_body, es_body, fr_body
 
 
-def _generate_effect_copy(
-    product: Step3Product,
-    *,
-    error_log: list[dict[str, object]] | None = None,
-) -> tuple[str, str, str, str, str]:
+def _generate_effect_copy(product: Step3Product) -> tuple[str, str, str, str, str]:
     embed, existing_body = _extract_video_embed(product.short_description)
     attr_summary = _format_attribute_summary(product.attributes)
     hint = _normalize_text(product.attributes.get("hint"))
@@ -1873,48 +1803,46 @@ def _generate_effect_copy(
         user_lines.append("Attributes:\n" + attr_summary)
 
     user_lines.append(
-        "Write a 2-3 paragraph HTML description (~180-260 words) using <p> tags. Describe circuit topology (analog/digital), "
-        "control layout, tonal behaviour, power requirements, and live performance reliability. Include the phrases 'guitar effects pedal' "
-        "and 'guitar effect' naturally, and close with the provided outro line."
+        "Return JSON with keys en, nl, de, es, fr. The English copy must be 2-3 HTML paragraphs (~180-260 words) "
+        "describing circuit topology (analog/digital), control layout, tonal behaviour, power requirements, "
+        "and live performance reliability. Include the keywords 'guitar effects pedal' and 'guitar effect' naturally. "
+        "Provide accurate NL, DE, ES, and FR translations, keeping HTML."
     )
 
     system_prompt = "You write persuasive yet factual copy for guitar effects pedals."
 
-    english_body = _call_openai_text(
+    payload = _call_openai_json(
         EFFECT_MODEL,
         system_prompt,
         "\n".join(user_lines),
         temperature=0.55,
-        retry_context={"sku": product.sku, "lang": "en"},
+        required_keys=("en", "nl", "de", "es", "fr"),
     )
-    english_body = _ensure_html_description(english_body)
 
-    nl, de, es, fr = _translate_description(
-        english_body,
-        sku=product.sku,
-        error_log=error_log,
-    )
-    final_en = _restore_embed(embed, english_body)
-    return final_en, nl, de, es, fr
+    en_body = _clean_description_value(payload.get("en"))
+    nl_body = _clean_description_value(payload.get("nl"))
+    de_body = _clean_description_value(payload.get("de"))
+    es_body = _clean_description_value(payload.get("es"))
+    fr_body = _clean_description_value(payload.get("fr"))
+    if not en_body:
+        raise RuntimeError("Effect description empty")
+    final_en = _restore_embed(embed, en_body)
+    return final_en, nl_body, de_body, es_body, fr_body
 
 
-def _generate_description_for_product(
-    product: Step3Product,
-    *,
-    error_log: list[dict[str, object]] | None = None,
-) -> tuple[str, str, str, str, str]:
+def _generate_description_for_product(product: Step3Product) -> tuple[str, str, str, str, str]:
     category = _categorize_product(product)
     if category == "acoustic":
-        return _generate_acoustic_copy(product, error_log=error_log)
+        return _generate_acoustic_copy(product)
     if category == "electric":
-        return _generate_electric_copy(product, error_log=error_log)
+        return _generate_electric_copy(product)
     if category == "bass":
-        return _generate_bass_copy(product, error_log=error_log)
+        return _generate_bass_copy(product)
     if category == "amp":
-        return _generate_amp_copy(product, error_log=error_log)
+        return _generate_amp_copy(product)
     if category == "effect":
-        return _generate_effect_copy(product, error_log=error_log)
-    return _generate_accessory_copy(product, error_log=error_log)
+        return _generate_effect_copy(product)
+    return _generate_accessory_copy(product)
 
 
 def _build_step3_products() -> list[Step3Product]:
@@ -1994,364 +1922,76 @@ def _ensure_descriptions_initialized(products: Sequence[Step3Product]) -> None:
     st.session_state["descriptions"] = descriptions
 
 
-def _sanitize_for_filename(value: str) -> str:
-    normalized = _normalize_text(value) or "item"
-    return re.sub(r"[^0-9A-Za-z_.-]+", "_", normalized)
-
-
-def _run_output_dir(run_id: str) -> Path:
-    run_dir = OUTPUT_DIR / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-    return run_dir
-
-
-def _write_atomic_text(path: Path, content: str) -> None:
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(content or "", encoding="utf-8")
-    tmp_path.replace(path)
-
-
-def _load_text_if_exists(path: Path) -> str:
-    if not path.exists():
-        return ""
-    try:
-        return path.read_text(encoding="utf-8")
-    except Exception:
-        return ""
-
-
-def _checkpoint_path(run_id: str) -> Path:
-    return CHECKPOINT_DIR / f"{run_id}.json"
-
-
-def _load_checkpoint(run_id: str) -> dict[str, object] | None:
-    path = _checkpoint_path(run_id)
-    if not path.exists():
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as fp:
-            data = json.load(fp)
-    except Exception:
-        return None
-    data.setdefault("run_id", run_id)
-    data.setdefault("errors", [])
-    data.setdefault("done", [])
-    data.setdefault("queue", [])
-    data.setdefault("cursor", 0)
-    return data
-
-
-def _save_checkpoint(run_id: str, data: Mapping[str, object]) -> None:
-    payload = dict(data)
-    payload.setdefault("run_id", run_id)
-    path = _checkpoint_path(run_id)
-    tmp_path = path.with_suffix(".tmp")
-    tmp_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8",
-    )
-    tmp_path.replace(path)
-
-
-def _compute_products_fingerprint(products: Sequence[Step3Product]) -> str:
-    queue = [
-        _normalize_text(product.sku)
-        for product in products
-        if _normalize_text(product.sku)
-    ]
-    joined = "|".join(sorted(queue))
-    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
-
-
-def _initialize_checkpoint(
-    run_id: str,
-    *,
-    queue: Sequence[str],
-    fingerprint: str,
-) -> dict[str, object]:
-    state = {
-        "run_id": run_id,
-        "queue": list(queue),
-        "done": [],
-        "cursor": 0,
-        "errors": [],
-        "fingerprint": fingerprint,
-        "started_at": datetime.utcnow().isoformat() + "Z",
-    }
-    _save_checkpoint(run_id, state)
-    return state
-
-
-def _find_resume_checkpoint(
-    fingerprint: str,
-) -> tuple[str, dict[str, object]] | None:
-    if not CHECKPOINT_DIR.exists():
-        return None
-    latest: tuple[float, str, dict[str, object]] | None = None
-    for path in CHECKPOINT_DIR.glob("*.json"):
-        try:
-            with open(path, "r", encoding="utf-8") as fp:
-                data = json.load(fp)
-        except Exception:
-            continue
-        if data.get("fingerprint") != fingerprint:
-            continue
-        queue = data.get("queue") or []
-        cursor = int(data.get("cursor") or 0)
-        if cursor >= len(queue):
-            continue
-        run_id = data.get("run_id") or path.stem
-        stat = path.stat()
-        candidate = (stat.st_mtime, run_id, data)
-        if latest is None or candidate[0] > latest[0]:
-            latest = candidate
-    if latest is None:
-        return None
-    _, run_id, payload = latest
-    payload.setdefault("run_id", run_id)
-    return run_id, payload
-
-
-def _new_run_id(fingerprint: str) -> str:
-    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    random_part = uuid.uuid4().hex[:8]
-    return f"{timestamp}-{random_part}-{fingerprint[:12]}"
-
-
-def _load_results_from_checkpoint(
-    run_id: str,
-    checkpoint: Mapping[str, object],
-) -> dict[str, dict[str, str]]:
-    run_dir = _run_output_dir(run_id)
-    collected: dict[str, dict[str, str]] = {}
-    done_items = checkpoint.get("done")
-    if not isinstance(done_items, Sequence):
-        return collected
-    for item in done_items:
-        sku = _normalize_text(item)
-        if not sku:
-            continue
-        safe_name = _sanitize_for_filename(sku)
-        payload: dict[str, str] = {}
-        for lang in ("en", "nl", "de", "es", "fr"):
-            text_value = _load_text_if_exists(run_dir / f"{safe_name}_{lang}.html")
-            if text_value:
-                payload[lang] = text_value
-        if payload:
-            collected[sku] = payload
-    return collected
-
-
 def _generate_descriptions_for_products(
     products: Sequence[Step3Product],
-    *,
-    run_id: str,
-    checkpoint: dict[str, object],
 ) -> tuple[dict[str, dict[str, str]], list[str]]:
-    state = checkpoint
-    queue = list(state.get("queue") or [])
-    if not queue:
-        queue = [
-            product.sku
-            for product in products
-            if _normalize_text(product.sku)
-        ]
-        queue = list(dict.fromkeys(queue))
-        state["queue"] = queue
-
-    product_lookup: dict[str, Step3Product] = {}
-    for product in products:
-        sku_norm = _normalize_text(product.sku)
-        if sku_norm:
-            product_lookup[sku_norm] = product
-        product_lookup.setdefault(product.sku, product)
-
-    total = len(queue)
     results: dict[str, dict[str, str]] = {}
-    state_errors: list[dict[str, object]] = state.setdefault("errors", [])  # type: ignore[assignment]
-    done_list: list[str] = state.setdefault("done", [])  # type: ignore[assignment]
-    cursor = int(state.get("cursor") or 0)
-    cursor = max(cursor, 0)
-    cursor = min(cursor, total)
-    cursor = max(cursor, len(done_list))
-    state["cursor"] = cursor
+    errors: list[str] = []
+    stored = st.session_state.get("descriptions")
+    if not isinstance(stored, dict):
+        stored = {}
 
-    run_dir = _run_output_dir(run_id)
-    for done_sku in done_list:
-        safe_name = _sanitize_for_filename(done_sku)
-        entry: dict[str, str] = {}
-        for lang in ("en", "nl", "de", "es", "fr"):
-            value = _load_text_if_exists(run_dir / f"{safe_name}_{lang}.html")
-            if value:
-                entry[lang] = value
-        if entry:
-            results[done_sku] = entry
-
+    total = len(products)
     progress = None
-    generation_start_time = time.time() if total else None
-
-    def _update_progress(processed: int) -> None:
-        if not progress:
-            return
-        remaining = max(total - processed, 0)
-        fraction = processed / max(total, 1)
-        if remaining <= 0:
-            progress.progress(1.0, text="Generation completed")
-            return
-        if generation_start_time and processed:
-            elapsed = max(time.time() - generation_start_time, 0.0)
-            avg_per_item = elapsed / processed if processed else 0.0
-            remaining_minutes = (avg_per_item * remaining) / 60.0 if processed else 0.0
-            eta_label = _format_eta_label(remaining_minutes)
-            text = (
-                "Generating descriptions and translations… "
-                f"{remaining} left ({eta_label})"
-            )
-        else:
-            text = (
-                "Generating descriptions and translations… "
-                f"{remaining} left"
-            )
-        progress.progress(max(fraction, 0.0), text=text)
-
     if total:
-        try:
-            progress = st.progress(
-                cursor / max(total, 1),
-                text=(
-                    "Generation completed"
-                    if cursor >= total
-                    else (
-                        "Generating descriptions and translations… "
-                        f"{max(total - cursor, 0)} left"
-                    )
-                ),
-            )
-        except Exception:  # pragma: no cover - Streamlit fallback
-            progress = None
+        progress = st.progress(
+            0.0,
+            text=f"Generating descriptions and translations… {total} remaining",
+        )
 
-    try:
-        for index in range(cursor, total):
-            sku = queue[index]
-            sku_norm = _normalize_text(sku)
-            product = product_lookup.get(sku_norm or sku)
-            if not product:
-                message = f"{sku}: product data missing"
-                state_errors.append({"sku": sku, "lang": "general", "error": message})
-                _save_checkpoint(run_id, state)
-                _update_progress(index + 1)
-                continue
-
+    for index, product in enumerate(products, start=1):
+        previous_entry = stored.get(product.sku, {})
+        if not product.generate:
+            results[product.sku] = {
+                "en": product.short_description,
+                "nl": _clean_description_value(previous_entry.get("nl")),
+                "de": _clean_description_value(previous_entry.get("de")),
+                "es": _clean_description_value(previous_entry.get("es")),
+                "fr": _clean_description_value(previous_entry.get("fr")),
+            }
+        else:
             trace({"where": "step3:generate:start", "sku": product.sku})
-            payload: dict[str, str]
-
             try:
-                if not product.generate:
-                    short_description = _clean_description_value(
-                        product.short_description
-                    )
-                    if not short_description:
-                        message = (
-                            f"{product.sku}: Missing short description; skipped fallback generation"
-                        )
-                        state_errors.append(
-                            {"sku": product.sku, "lang": "general", "error": message}
-                        )
-                        trace(
-                            {
-                                "where": "step3:generate:fallback:missing-short-description",
-                                "sku": product.sku,
-                            }
-                        )
-                        state["cursor"] = index + 1
-                        _save_checkpoint(run_id, state)
-                        _update_progress(index + 1)
-                        continue
-                    trace({"where": "step3:generate:fallback:start", "sku": product.sku})
-                    nl, de, es, fr = _translate_description(
-                        short_description,
-                        sku=product.sku,
-                        error_log=state_errors,
-                    )
-                    payload = {
-                        "en": short_description,
-                        "nl": _clean_description_value(nl),
-                        "de": _clean_description_value(de),
-                        "es": _clean_description_value(es),
-                        "fr": _clean_description_value(fr),
-                    }
-                    trace({"where": "step3:generate:fallback:ok", "sku": product.sku})
-                else:
-                    en, nl, de, es, fr = _generate_description_for_product(
-                        product,
-                        error_log=state_errors,
-                    )
-                    payload = {
-                        "en": _clean_description_value(en),
-                        "nl": _clean_description_value(nl),
-                        "de": _clean_description_value(de),
-                        "es": _clean_description_value(es),
-                        "fr": _clean_description_value(fr),
-                    }
-                    trace({"where": "step3:generate:ok", "sku": product.sku})
+                en, nl, de, es, fr = _generate_description_for_product(product)
+                results[product.sku] = {
+                    "en": en,
+                    "nl": nl,
+                    "de": de,
+                    "es": es,
+                    "fr": fr,
+                }
+                trace({"where": "step3:generate:ok", "sku": product.sku})
             except Exception as exc:
-                message = f"{product.sku}: {exc}"
-                state_errors.append(
-                    {"sku": product.sku, "lang": "general", "error": message}
-                )
-                payload = {
-                    "en": _clean_description_value(
-                        product.short_description
-                    )
-                    or "AI FAILED TO GENERATE",
+                fallback_en = "AI FAILED TO GENERATE"
+                results[product.sku] = {
+                    "en": _clean_description_value(fallback_en),
                     "nl": "",
                     "de": "",
                     "es": "",
                     "fr": "",
                 }
-                trace(
-                    {
-                        "where": "step3:generate:error",
-                        "sku": product.sku,
-                        "err": str(exc)[:200],
-                    }
+                errors.append(f"{product.sku}: {exc}")
+                trace({
+                    "where": "step3:generate:error",
+                    "sku": product.sku,
+                    "err": str(exc)[:200],
+                })
+
+        if progress:
+            remaining = total - index
+            fraction = index / total
+            if remaining <= 0:
+                progress.progress(1.0, text="Generation completed")
+            else:
+                progress.progress(
+                    fraction,
+                    text=f"Generating descriptions and translations… {remaining} remaining",
                 )
 
-            safe_name = _sanitize_for_filename(product.sku)
-            for lang, value in payload.items():
-                output_path = run_dir / f"{safe_name}_{lang}.html"
-                _write_atomic_text(output_path, value or "")
+    if progress and total:
+        progress.progress(1.0, text="Generation completed")
 
-            results[product.sku] = payload
-            if product.sku not in done_list:
-                done_list.append(product.sku)
-            state["cursor"] = index + 1
-            _save_checkpoint(run_id, state)
-            _update_progress(state["cursor"])
-            gc.collect()
-    except Exception:
-        _save_checkpoint(run_id, state)
-        raise
-    finally:
-        if total:
-            _update_progress(state.get("cursor", total))
-
-    formatted_errors: list[str] = []
-    seen_errors: set[str] = set()
-    for entry in state_errors:
-        if not isinstance(entry, Mapping):
-            continue
-        sku_label = _normalize_text(entry.get("sku")) or str(entry.get("sku", "unknown"))
-        lang_label = entry.get("lang") or "general"
-        message_text = _clean_description_value(entry.get("error"))
-        if not message_text:
-            continue
-        formatted = f"{sku_label} ({lang_label}): {message_text}"
-        if formatted not in seen_errors:
-            formatted_errors.append(formatted)
-            seen_errors.add(formatted)
-
-    return results, formatted_errors
+    return results, errors
 
 
 def _apply_descriptions_to_state(descriptions_map: Mapping[str, Mapping[str, object]]) -> set[str]:
@@ -3756,21 +3396,18 @@ def _inject_ai_highlight_script(payload: dict) -> None:
     payload_json = json.dumps(payload, ensure_ascii=False)
 
     st.markdown(
-        sanitize_html(
-            """
+        """
 <style id="ai-highlight-style">
   [data-ai-filled="true"], [data-ai-filled="true"] * {
     background-color: #fff7ae !important;
   }
 </style>
-"""
-        ),
+""",
         unsafe_allow_html=True,
     )
 
     st.markdown(
-        sanitize_html(
-            f"""
+        f"""
 <script>
 (function() {{
   const cfg = {payload_json};  // {{ targets: [{{row, col, sku}}...], sku_index }}
@@ -3832,8 +3469,7 @@ def _inject_ai_highlight_script(payload: dict) -> None:
   obs.observe(document.body, {{ childList: true, subtree: true }});
 }})();
 </script>
-"""
-        ),
+""",
         unsafe_allow_html=True,
     )
 
@@ -6361,54 +5997,15 @@ if df_original_key in st.session_state:
                             if setup_failed or not api_base or not attr_sets_map:
                                 st.session_state["show_attributes_trigger"] = False
                             else:
-                                product_count = len(df_changed)
-                                eta_minutes_initial = product_count
-                                status_label_base = "Building attribute editor…"
-                                eta_label_initial = _format_eta_label(
-                                    eta_minutes_initial
-                                )
                                 status2 = st.status(
-                                    f"{status_label_base} (ETA {eta_label_initial})",
-                                    expanded=True,
+                                    "Building attribute editor…", expanded=True
                                 )
                                 progress = st.progress(0)
-                                eta_state: dict[str, str | None] = {
-                                    "label": eta_label_initial,
-                                }
-                                last_status_message = {"text": status_label_base}
-                                eta_total_items = max(product_count, 1)
-                                step2_start_time = time.time()
-
-                                def _refresh_eta_label() -> None:
-                                    suffix = (
-                                        f" (ETA {eta_state['label']})"
-                                        if eta_state.get("label")
-                                        else ""
-                                    )
-                                    status2.update(
-                                        label=f"{last_status_message['text']}{suffix}"
-                                    )
-
-                                def _update_eta_minutes(minutes: float) -> None:
-                                    eta_state["label"] = _format_eta_label(minutes)
-                                    _refresh_eta_label()
-
-                                def _estimate_remaining_minutes(
-                                    processed_items: int,
-                                ) -> float:
-                                    processed = max(1, processed_items)
-                                    remaining = max(eta_total_items - processed, 0)
-                                    if remaining <= 0:
-                                        return 0.0
-                                    elapsed = max(time.time() - step2_start_time, 0.0)
-                                    avg_per_item = elapsed / processed
-                                    return (avg_per_item * remaining) / 60.0
 
                                 def _pupdate(pct: int, msg: str) -> None:
                                     clamped = max(0, min(int(pct), 100))
                                     progress.progress(clamped)
-                                    last_status_message["text"] = msg
-                                    _refresh_eta_label()
+                                    status2.update(label=msg)
 
                                 _pupdate(5, "Collecting selected sets…")
                                 selected_set_ids: list[int] = []
@@ -7182,13 +6779,7 @@ if df_original_key in st.session_state:
                                         for df in step2_state["wide"].values()
                                         if isinstance(df, pd.DataFrame)
                                     )
-                                    eta_total_items = max(
-                                        eta_total_items,
-                                        total_rows if total_rows else 0,
-                                        1,
-                                    )
                                     normalized_rows = 0
-                                    eta_updated_after_first = False
                                     if total_rows == 0:
                                         _pupdate(70, "Normalizing values…")
                                     config_stage_logged = False
@@ -7270,23 +6861,6 @@ if df_original_key in st.session_state:
                                             sku_values = df_ref["sku"].tolist()
                                             for idx, sku in enumerate(sku_values, start=1):
                                                 normalized_rows += 1
-                                                processed_for_eta = min(
-                                                    normalized_rows, eta_total_items
-                                                )
-                                                if (
-                                                    processed_for_eta
-                                                    and not eta_updated_after_first
-                                                ):
-                                                    remaining_minutes = (
-                                                        _estimate_remaining_minutes(
-                                                            processed_for_eta
-                                                        )
-                                                    )
-                                                    _update_eta_minutes(
-                                                        remaining_minutes
-                                                    )
-                                                    if processed_for_eta >= 1:
-                                                        eta_updated_after_first = True
                                                 if (
                                                     idx == len(sku_values)
                                                     or idx % 25 == 0
@@ -7302,19 +6876,6 @@ if df_original_key in st.session_state:
                                                         f"Normalizing values… SKU {sku} "
                                                         f"({normalized_rows}/{total_rows})",
                                                     )
-                                                    processed_for_eta = min(
-                                                        normalized_rows,
-                                                        eta_total_items,
-                                                    )
-                                                    if processed_for_eta:
-                                                        remaining_minutes = (
-                                                            _estimate_remaining_minutes(
-                                                                processed_for_eta
-                                                            )
-                                                        )
-                                                        _update_eta_minutes(
-                                                            remaining_minutes
-                                                        )
 
                                         if DEBUG:
                                             st.caption(f"DEBUG set_id={set_id}")
@@ -7661,22 +7222,10 @@ if df_original_key in st.session_state:
                                                             "Нет данных DF BEFORE AI"
                                                         )
                                                     if isinstance(after_ai, pd.DataFrame):
-                                                        preview_cols = [
-                                                            c
-                                                            for c in after_ai.columns
-                                                            if c not in AFTER_AI_PREVIEW_HIDE_COLS
-                                                        ]
-                                                        preview_source = (
-                                                            after_ai[preview_cols] if preview_cols else after_ai
+                                                        st.write(
+                                                            "DF AFTER AI",
+                                                            after_ai.head(10),
                                                         )
-                                                        preview = sanitize_for_arrow(preview_source.head(10))
-                                                        st.write("DF AFTER AI", preview)
-                                                        bad_cols = find_bad_cols(after_ai)
-                                                        if bad_cols:
-                                                            st.warning(
-                                                                "Non-Arrow-friendly columns detected:"
-                                                                f" {bad_cols}"
-                                                            )
                                                     else:
                                                         st.caption(
                                                             "Нет данных DF AFTER AI"
@@ -7818,65 +7367,22 @@ if df_original_key in st.session_state:
                                                 st.caption("Payload еще не собирался.")
 
                                     st.markdown("---")
-                                    step3_state = st.session_state.setdefault("step3", {})
-                                    products_for_step3 = _build_step3_products()
-                                    fingerprint_value = (
-                                        _compute_products_fingerprint(products_for_step3)
-                                        if products_for_step3
-                                        else ""
-                                    )
-                                    resume_candidate = (
-                                        _find_resume_checkpoint(fingerprint_value)
-                                        if fingerprint_value
-                                        else None
-                                    )
-
-                                    c1, c2, c3 = st.columns([1, 1, 1])
+                                    c1, c2 = st.columns([1, 1])
                                     btn_generate = c1.button(
                                         "🌐 Generate Descriptions/Translation",
                                         key="btn_step2_generate_bottom",
                                     )
-                                    btn_resume = c2.button(
-                                        "▶️ Resume generation",
-                                        key="btn_step2_resume",
-                                        disabled=resume_candidate is None,
-                                    )
-                                    btn_reset = c3.button(
+                                    btn_reset = c2.button(
                                         "🔄 Reset all",
                                         key="btn_step2_reset_bottom",
                                     )
 
-                                    if btn_generate and products_for_step3:
-                                        _ensure_descriptions_initialized(products_for_step3)
-                                        queue = [
-                                            product.sku
-                                            for product in products_for_step3
-                                            if _normalize_text(product.sku)
-                                        ]
-                                        run_id = _new_run_id(fingerprint_value)
-                                        checkpoint_state = _initialize_checkpoint(
-                                            run_id,
-                                            queue=queue,
-                                            fingerprint=fingerprint_value,
-                                        )
-                                        step3_state["products"] = products_for_step3
+                                    if btn_generate:
+                                        products = _build_step3_products()
+                                        _ensure_descriptions_initialized(products)
+                                        step3_state = st.session_state.setdefault("step3", {})
+                                        step3_state["products"] = products
                                         step3_state["errors"] = []
-                                        step3_state["run_id"] = run_id
-                                        step3_state["checkpoint"] = checkpoint_state
-                                        step3_state["fingerprint"] = fingerprint_value
-                                        st.session_state["step3_active"] = True
-                                        st.session_state["step3_generation_pending"] = True
-                                        st.rerun()
-
-                                    if btn_resume and resume_candidate and products_for_step3:
-                                        _ensure_descriptions_initialized(products_for_step3)
-                                        run_id, resume_state = resume_candidate
-                                        checkpoint_state = _load_checkpoint(run_id) or resume_state
-                                        step3_state["products"] = products_for_step3
-                                        step3_state["errors"] = []
-                                        step3_state["run_id"] = run_id
-                                        step3_state["checkpoint"] = checkpoint_state
-                                        step3_state["fingerprint"] = fingerprint_value
                                         st.session_state["step3_active"] = True
                                         st.session_state["step3_generation_pending"] = True
                                         st.rerun()
@@ -7924,90 +7430,16 @@ if df_original_key in st.session_state:
             if st.session_state.get("step3_generation_pending") and not products:
                 st.session_state["step3_generation_pending"] = False
 
-            run_id = step3_state.get("run_id")
-            checkpoint_state = step3_state.get("checkpoint")
-            fingerprint = step3_state.get("fingerprint")
-
-            if products and not fingerprint:
-                fingerprint = _compute_products_fingerprint(products)
-                step3_state["fingerprint"] = fingerprint
-
-            if (
-                st.session_state.get("step3_generation_pending")
-                and products
-                and fingerprint
-            ):
-                if not run_id:
-                    run_id = _new_run_id(fingerprint)
-                    step3_state["run_id"] = run_id
-                if not isinstance(checkpoint_state, dict):
-                    queue = [
-                        product.sku
-                        for product in products
-                        if _normalize_text(product.sku)
-                    ]
-                    checkpoint_state = _initialize_checkpoint(
-                        run_id,
-                        queue=queue,
-                        fingerprint=fingerprint,
-                    )
-                    step3_state["checkpoint"] = checkpoint_state
-
-            if (
-                st.session_state.get("step3_generation_pending")
-                and products
-                and run_id
-                and isinstance(checkpoint_state, dict)
-            ):
-                try:
-                    results, errors = _generate_descriptions_for_products(
-                        products,
-                        run_id=run_id,
-                        checkpoint=checkpoint_state,
-                    )
-                except Exception as exc:
-                    st.error(f"Fatal error during generation: {exc}")
-                    existing_errors = list(step3_state.get("errors") or [])
-                    existing_errors.append(str(exc))
-                    step3_state["errors"] = existing_errors
-                else:
-                    descriptions_map = st.session_state.get("descriptions")
-                    if not isinstance(descriptions_map, dict):
-                        descriptions_map = {}
-                    for sku, payload in results.items():
-                        descriptions_map[sku] = payload
-                    st.session_state["descriptions"] = descriptions_map
-                    step3_state["errors"] = errors
-                finally:
-                    step3_state["checkpoint"] = checkpoint_state
-                    st.session_state["step3_generation_pending"] = False
-
-            if run_id and isinstance(checkpoint_state, dict):
-                disk_results = _load_results_from_checkpoint(run_id, checkpoint_state)
-                if disk_results:
-                    descriptions_map = st.session_state.get("descriptions")
-                    if not isinstance(descriptions_map, dict):
-                        descriptions_map = {}
-                    descriptions_map.update(disk_results)
-                    st.session_state["descriptions"] = descriptions_map
-                formatted_errors = []
-                seen_messages: set[str] = set()
-                checkpoint_errors = checkpoint_state.get("errors")
-                if isinstance(checkpoint_errors, Sequence):
-                    for entry in checkpoint_errors:
-                        if not isinstance(entry, Mapping):
-                            continue
-                        sku_label = _normalize_text(entry.get("sku")) or str(entry.get("sku", "unknown"))
-                        lang_label = entry.get("lang") or "general"
-                        message_text = _clean_description_value(entry.get("error"))
-                        if not message_text:
-                            continue
-                        formatted = f"{sku_label} ({lang_label}): {message_text}"
-                        if formatted not in seen_messages:
-                            formatted_errors.append(formatted)
-                            seen_messages.add(formatted)
-                if formatted_errors:
-                    step3_state["errors"] = formatted_errors
+            if st.session_state.get("step3_generation_pending") and products:
+                results, errors = _generate_descriptions_for_products(products)
+                descriptions_map = st.session_state.get("descriptions")
+                if not isinstance(descriptions_map, dict):
+                    descriptions_map = {}
+                for sku, payload in results.items():
+                    descriptions_map[sku] = payload
+                st.session_state["descriptions"] = descriptions_map
+                step3_state["errors"] = errors
+                st.session_state["step3_generation_pending"] = False
 
             errors = step3_state.get("errors") or []
             if errors:
