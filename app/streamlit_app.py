@@ -41,11 +41,11 @@ st.session_state.setdefault("step3_output_rows", [])
 header_ph = st.session_state.setdefault("_header_ph", st.empty())
 if not st.session_state.get("_header_rendered", False):
     with header_ph:
-        st.title("🤖 Peter v.1.1 (AI Content Manager)")
+        st.title("🤖 Peter v.1.2 (AI Content Manager)")
     st.session_state["_header_rendered"] = True
 
 st.set_page_config(
-    page_title="🤖 Peter v.1.1 (AI Content Manager)",
+    page_title="🤖 Peter v.1.2 (AI Content Manager)",
     page_icon="🤖",
     layout="wide",
 )
