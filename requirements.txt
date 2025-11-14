@@ -3,4 +3,3 @@ requests
 pandas
 urllib3
 openai>=1.0.0
-tenacity
