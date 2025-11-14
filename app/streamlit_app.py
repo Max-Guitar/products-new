@@ -36,6 +36,7 @@ st.session_state.setdefault("step3_active", False)
 st.session_state.setdefault("descriptions", {})
 st.session_state.setdefault("step3", {})
 st.session_state.setdefault("step3_generation_pending", False)
+st.session_state.setdefault("step3_output_rows", [])
 
 header_ph = st.session_state.setdefault("_header_ph", st.empty())
 if not st.session_state.get("_header_rendered", False):
@@ -118,6 +119,7 @@ def _force_mark(sku: str, code: str):
 
 
 _DEF_ATTR_SET_NAME = "Default"
+STEP3_AUTOSAVE_PATH = Path(".cache/step3_autosave.json")
 _ALLOWED_TYPES = {"simple", "configurable"}
 
 
@@ -786,6 +788,87 @@ class Step3Product:
     attributes: dict[str, object]
 
 
+def _save_step3_autosave(
+    descriptions: Mapping[str, Mapping[str, object]] | None,
+    rows: Sequence[Mapping[str, object]] | None = None,
+) -> None:
+    if not isinstance(descriptions, Mapping) or not descriptions:
+        return
+
+    sanitized: dict[str, dict[str, str]] = {}
+    for sku, payload in descriptions.items():
+        if not isinstance(payload, Mapping):
+            continue
+        sanitized[str(sku)] = {
+            lang: _clean_description_value(value)
+            for lang, value in payload.items()
+            if isinstance(lang, str)
+        }
+
+    if not sanitized:
+        return
+
+    data: dict[str, object] = {"descriptions": sanitized}
+
+    if rows:
+        serialized_rows: list[dict[str, str]] = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            serialized_rows.append(
+                {str(key): _clean_description_value(value) for key, value in row.items()}
+            )
+        if serialized_rows:
+            data["products"] = serialized_rows
+
+    try:
+        STEP3_AUTOSAVE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with STEP3_AUTOSAVE_PATH.open("w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False)
+    except Exception as exc:  # pragma: no cover - file system failures
+        logger.warning("Failed to persist Step 3 autosave: %s", exc)
+
+
+def _try_restore_step3_autosave() -> None:
+    descriptions = st.session_state.get("descriptions")
+    if isinstance(descriptions, Mapping) and descriptions:
+        return
+
+    if not STEP3_AUTOSAVE_PATH.exists():
+        return
+
+    try:
+        with STEP3_AUTOSAVE_PATH.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except Exception as exc:  # pragma: no cover - file system failures
+        logger.warning("Failed to load Step 3 autosave: %s", exc)
+        return
+
+    if not isinstance(payload, Mapping):
+        return
+
+    restored_descriptions: dict[str, dict[str, str]] = {}
+    raw_descriptions = payload.get("descriptions")
+    if isinstance(raw_descriptions, Mapping):
+        for sku, values in raw_descriptions.items():
+            if not isinstance(values, Mapping):
+                continue
+            restored_descriptions[str(sku)] = {
+                lang: _clean_description_value(value)
+                for lang, value in values.items()
+                if isinstance(lang, str)
+            }
+
+    rows_payload = payload.get("products")
+    if isinstance(rows_payload, list):
+        st.session_state["step3_output_rows"] = rows_payload
+
+    if restored_descriptions:
+        st.session_state["descriptions"] = restored_descriptions
+        st.info("✅ Step 3 data restored from autosave.")
+    elif isinstance(rows_payload, list) and rows_payload:
+        st.info("✅ Step 3 data restored from autosave.")
+
 ACOUSTIC_SET_NAMES = {"acoustic guitar"}
 ELECTRIC_SET_NAMES = {"electric guitar"}
 BASS_SET_NAMES = {"bass guitar"}
@@ -1035,6 +1118,19 @@ def _restore_embed(embed: str, body: str) -> str:
     if not body_clean:
         return embed
     return f"{embed}\n{body_clean}"
+
+
+def _prepend_embed_if_valid(embed: str, text: str) -> str:
+    embed_clean = (embed or "").strip()
+    if not embed_clean or "<iframe" not in embed_clean.lower():
+        return _clean_description_value(text)
+
+    text_clean = _clean_description_value(text)
+    if not text_clean:
+        return embed_clean
+    if embed_clean in text_clean:
+        return text_clean
+    return f"{embed_clean}\n{text_clean}"
 
 
 def _detect_body_shape(name: str, attributes: Mapping[str, object]) -> str | None:
@@ -1573,6 +1669,8 @@ def _generate_acoustic_copy(product: Step3Product) -> tuple[str, str, str, str, 
     english_body = _ensure_html_description(english_body)
 
     nl, de, es, fr = _translate_description(english_body)
+    es = _prepend_embed_if_valid(embed, es)
+    fr = _prepend_embed_if_valid(embed, fr)
     final_en = _restore_embed(embed, english_body)
     return final_en, nl, de, es, fr
 
@@ -1620,6 +1718,8 @@ def _generate_electric_copy(product: Step3Product) -> tuple[str, str, str, str, 
     english_body = _ensure_html_description(english_body)
 
     nl, de, es, fr = _translate_description(english_body)
+    es = _prepend_embed_if_valid(embed, es)
+    fr = _prepend_embed_if_valid(embed, fr)
     final_en = _restore_embed(embed, english_body)
     return final_en, nl, de, es, fr
 
@@ -1668,6 +1768,8 @@ def _generate_accessory_copy(product: Step3Product) -> tuple[str, str, str, str,
     english_body = _ensure_html_description(english_body)
 
     nl, de, es, fr = _translate_description(english_body)
+    es = _prepend_embed_if_valid(embed, es)
+    fr = _prepend_embed_if_valid(embed, fr)
     final_en = _restore_embed(embed, english_body)
     return final_en, nl, de, es, fr
 
@@ -1721,6 +1823,8 @@ def _generate_bass_copy(product: Step3Product) -> tuple[str, str, str, str, str]
     fr_body = _clean_description_value(payload.get("fr"))
     if not en_body:
         raise RuntimeError("Bass description empty")
+    es_body = _prepend_embed_if_valid(embed, es_body)
+    fr_body = _prepend_embed_if_valid(embed, fr_body)
     final_en = _restore_embed(embed, en_body)
     return final_en, nl_body, de_body, es_body, fr_body
 
@@ -1772,6 +1876,8 @@ def _generate_amp_copy(product: Step3Product) -> tuple[str, str, str, str, str]:
     fr_body = _clean_description_value(payload.get("fr"))
     if not en_body:
         raise RuntimeError("Amp description empty")
+    es_body = _prepend_embed_if_valid(embed, es_body)
+    fr_body = _prepend_embed_if_valid(embed, fr_body)
     final_en = _restore_embed(embed, en_body)
     return final_en, nl_body, de_body, es_body, fr_body
 
@@ -1826,6 +1932,8 @@ def _generate_effect_copy(product: Step3Product) -> tuple[str, str, str, str, st
     fr_body = _clean_description_value(payload.get("fr"))
     if not en_body:
         raise RuntimeError("Effect description empty")
+    es_body = _prepend_embed_if_valid(embed, es_body)
+    fr_body = _prepend_embed_if_valid(embed, fr_body)
     final_en = _restore_embed(embed, en_body)
     return final_en, nl_body, de_body, es_body, fr_body
 
@@ -2097,7 +2205,7 @@ def _save_translations(
 def save_step3_to_magento() -> None:
     descriptions_map = st.session_state.get("descriptions")
     if not isinstance(descriptions_map, Mapping) or not descriptions_map:
-        st.info("No descriptions to save.")
+        st.warning("⚠️ Nothing to save. Please repeat Step 3.")
         return
 
     updated_skus = _apply_descriptions_to_state(descriptions_map)
@@ -7421,6 +7529,7 @@ if df_original_key in st.session_state:
             st.header("Step 3. Generate and review descriptions")
 
             step3_state = st.session_state.setdefault("step3", {})
+            _try_restore_step3_autosave()
             products = step3_state.get("products")
             if not products:
                 products = _build_step3_products()
@@ -7467,6 +7576,10 @@ if df_original_key in st.session_state:
                     }
                 )
 
+            st.session_state["step3_output_rows"] = table_rows
+            if isinstance(descriptions_map, Mapping) and descriptions_map:
+                _save_step3_autosave(descriptions_map, table_rows)
+
             if not table_rows:
                 st.info("No products ready for description generation.")
             else:
@@ -7507,6 +7620,7 @@ if df_original_key in st.session_state:
                             descriptions_map = {}
                         descriptions_map.update(new_map)
                         st.session_state["descriptions"] = descriptions_map
+                        _save_step3_autosave(descriptions_map)
 
                 btn_step3_save = st.button("💾 Save to Magento", key="btn_step3_save")
                 if btn_step3_save:
