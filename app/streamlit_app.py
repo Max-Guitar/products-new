@@ -46,7 +46,7 @@ if not st.session_state.get("_header_rendered", False):
     st.session_state["_header_rendered"] = True
 
 st.set_page_config(
-    page_title="🤖 Peter v.1.3 (AI Content Manager)",
+    page_title="MaxGuitar AI - v3.9.5",
     page_icon="🤖",
     layout="wide",
 )
@@ -4696,6 +4696,63 @@ def apply_product_update(
         )
 
 
+def _collect_step2_products_rows() -> list[dict[str, object]]:
+    products = st.session_state.get("step2_products")
+    df: pd.DataFrame
+
+    if isinstance(products, pd.DataFrame):
+        df = products
+    elif isinstance(products, (list, tuple)):
+        try:
+            df = pd.DataFrame(products)
+        except Exception:
+            return []
+    elif isinstance(products, Mapping):
+        try:
+            df = pd.DataFrame([products])
+        except Exception:
+            return []
+    else:
+        return []
+
+    attr_cols = [
+        col
+        for col in df.columns
+        if col not in {"sku", "name", "attribute_set_id", GENERATE_DESCRIPTION_COLUMN}
+    ]
+
+    rows: list[dict[str, object]] = []
+    attr_set_by_sku: dict[str, object] = {}
+
+    for _, row in df.iterrows():
+        sku = _normalize_text(row.get("sku"))
+        if not sku:
+            continue
+
+        attr_set_value = row.get("attribute_set_id")
+        if not _is_blank_value(attr_set_value):
+            attr_set_by_sku[sku] = attr_set_value
+
+        for col in attr_cols:
+            value = row.get(col)
+            if _is_blank_value(value):
+                continue
+            rows.append(
+                {
+                    "sku": sku,
+                    "store_view_code": "all",
+                    "attribute_code": col,
+                    "value": value,
+                }
+            )
+
+    if attr_set_by_sku:
+        step2_state = _ensure_step2_state()
+        step2_state.setdefault("attr_set_by_sku", {}).update(attr_set_by_sku)
+
+    return rows
+
+
 def _collect_step2_output_rows() -> list[dict[str, object]]:
     step2_state = _ensure_step2_state()
     _commit_step2_staged(step2_state)
@@ -4745,10 +4802,17 @@ def _collect_step2_output_rows() -> list[dict[str, object]]:
     return rows
 
 
-def _save_specs_step2_to_magento() -> None:
-    rows = st.session_state.get("step2_output_rows")
+def _save_specs_step2_to_magento(
+    rows: Sequence[Mapping[str, object]] | None = None,
+) -> None:
+    if rows is None:
+        rows = st.session_state.get("step2_output_rows")
+
+    if isinstance(rows, pd.DataFrame):
+        rows = rows.to_dict(orient="records")
+
     if not isinstance(rows, list) or not rows:
-        rows = _collect_step2_output_rows()
+        rows = _collect_step2_products_rows() or _collect_step2_output_rows()
     if not rows:
         st.info("No specs to save.")
         return
@@ -4829,6 +4893,14 @@ def _save_specs_step2_to_magento() -> None:
         return
 
     st.success(f"✅ Specs saved to Magento ({processed_rows} rows)")
+
+
+def _save_rows_to_magento(rows: Sequence[Mapping[str, object]] | None = None) -> None:
+    _save_specs_step2_to_magento(rows)
+
+
+def save_rows_to_magento(rows: Sequence[Mapping[str, object]] | None = None) -> None:
+    _save_rows_to_magento(rows)
 
 
 def save_step2_to_magento():
@@ -7340,6 +7412,9 @@ if df_original_key in st.session_state:
                                                     editor_df[column] = editor_df[
                                                         column
                                                     ].astype(object)
+                                                st.session_state["step2_products"] = (
+                                                    editor_df.copy(deep=True)
+                                                )
                                                 _sync_ai_highlight_state(
                                                     step2_state,
                                                     current_set_id,
@@ -7636,7 +7711,9 @@ if df_original_key in st.session_state:
                                         st.rerun()
 
                                     if btn_save_specs:
-                                        _save_specs_step2_to_magento()
+                                        save_rows_to_magento(
+                                            _collect_step2_products_rows()
+                                        )
 
                                     if btn_reset:
                                         _reset_step2_state()
