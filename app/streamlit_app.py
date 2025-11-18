@@ -39,6 +39,7 @@ st.session_state.setdefault("step3", {})
 st.session_state.setdefault("step3_generation_pending", False)
 st.session_state.setdefault("step3_output_rows", [])
 st.session_state.setdefault("step2_output_rows", [])
+st.session_state.setdefault("step2_products", [])
 
 header_ph = st.session_state.setdefault("_header_ph", st.empty())
 if not st.session_state.get("_header_rendered", False):
@@ -47,7 +48,7 @@ if not st.session_state.get("_header_rendered", False):
     st.session_state["_header_rendered"] = True
 
 st.set_page_config(
-    page_title="🤖 Peter v.1.4 (AI Content Manager)",
+    page_title="MaxGuitar AI - v3.9.5",
     page_icon="🤖",
     layout="wide",
 )
@@ -4746,8 +4747,44 @@ def _collect_step2_output_rows() -> list[dict[str, object]]:
     return rows
 
 
+def _save_rows_to_magento(rows: Sequence[Mapping[str, object]]) -> int:
+    session = st.session_state.get("mg_session")
+    base_url = st.session_state.get("mg_base_url")
+    if not session or not base_url:
+        raise RuntimeError("Magento session is not initialized")
+
+    api_base = st.session_state.get("ai_api_base") or get_api_base(base_url)
+    st.session_state["ai_api_base"] = api_base
+
+    df_payload = pd.DataFrame(
+        rows, columns=["sku", "attribute_code", "value", "store_view_code"]
+    )
+    csv_buffer = io.StringIO()
+    df_payload.to_csv(csv_buffer, index=False)
+    csv_bytes = csv_buffer.getvalue().encode("utf-8")
+
+    url = f"{api_base.rstrip('/')}/import/csv"
+    headers = build_magento_headers(session=session)
+    headers["Content-Type"] = "text/csv"
+
+    try:
+        resp = session.post(url, data=csv_bytes, headers=headers, timeout=60)
+    except Exception as exc:  # pragma: no cover - network interaction
+        raise RuntimeError(f"❌ Failed to save specs: {exc}")
+
+    if not resp.ok:
+        snippet = resp.text[:200] if hasattr(resp, "text") else str(resp)
+        raise RuntimeError(f"❌ Failed to save specs: {resp.status_code} {snippet}")
+
+    return len(df_payload)
+
+
+def save_rows_to_magento(rows: Sequence[Mapping[str, object]]) -> int:
+    return _save_rows_to_magento(rows)
+
+
 def _save_specs_step2_to_magento() -> None:
-    raw_rows = st.session_state.get("step2_output_rows")
+    raw_rows = st.session_state.get("step2_products")
 
     rows: list[Mapping[str, object]] = []
     if isinstance(raw_rows, pd.DataFrame):
@@ -4775,7 +4812,7 @@ def _save_specs_step2_to_magento() -> None:
                 "sku": sku,
                 "attribute_code": attr_code,
                 "value": value,
-                "store_view_code": "en",
+                "store_view_code": "all",
             }
         )
 
@@ -4783,38 +4820,13 @@ def _save_specs_step2_to_magento() -> None:
         st.info("No specs to save.")
         return
 
-    session = st.session_state.get("mg_session")
-    base_url = st.session_state.get("mg_base_url")
-    if not session or not base_url:
-        st.error("Magento session is not initialized")
-        return
-
-    api_base = st.session_state.get("ai_api_base") or get_api_base(base_url)
-    st.session_state["ai_api_base"] = api_base
-
-    df_payload = pd.DataFrame(
-        payload_rows, columns=["sku", "attribute_code", "value", "store_view_code"]
-    )
-    csv_buffer = io.StringIO()
-    df_payload.to_csv(csv_buffer, index=False)
-    csv_bytes = csv_buffer.getvalue().encode("utf-8")
-
-    url = f"{api_base.rstrip('/')}/import/csv"
-    headers = build_magento_headers(session=session)
-    headers["Content-Type"] = "text/csv"
-
     try:
-        resp = session.post(url, data=csv_bytes, headers=headers, timeout=60)
+        saved_rows = save_rows_to_magento(payload_rows)
     except Exception as exc:  # pragma: no cover - network interaction
-        st.error(f"❌ Failed to save specs: {exc}")
+        st.error(str(exc))
         return
 
-    if not resp.ok:
-        snippet = resp.text[:200] if hasattr(resp, "text") else str(resp)
-        st.error(f"❌ Failed to save specs: {resp.status_code} {snippet}")
-        return
-
-    st.success(f"✅ Specs saved to Magento ({len(payload_rows)} rows)")
+    st.success(f"✅ Specs saved to Magento ({saved_rows} rows)")
 
 
 def save_step2_to_magento():
@@ -7601,14 +7613,18 @@ if df_original_key in st.session_state:
                                             _collect_step2_output_rows()
                                         )
 
+                                    if not st.session_state.get("step2_products"):
+                                        st.session_state["step2_products"] = (
+                                            st.session_state.get("step2_output_rows", [])
+                                        )
+
                                     edited_rows = st.data_editor(
-                                        st.session_state.get(
-                                            "step2_output_rows", []
-                                        ),
+                                        st.session_state.get("step2_products", []),
                                         use_container_width=True,
                                         num_rows="dynamic",
                                         key="step2_editor",
                                     )
+                                    st.session_state["step2_products"] = edited_rows
                                     st.session_state["step2_output_rows"] = edited_rows
 
                                     st.markdown("---")
