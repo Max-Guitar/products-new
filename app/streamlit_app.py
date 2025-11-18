@@ -4697,7 +4697,7 @@ def apply_product_update(
 
 
 def _collect_step2_products_rows() -> list[dict[str, object]]:
-    products = st.session_state.get("step2_products")
+    products = st.session_state.get("step2_output_rows", [])
     df: pd.DataFrame
 
     if isinstance(products, pd.DataFrame):
