@@ -6,7 +6,6 @@ import logging
 import math
 import sys
 from pathlib import Path
-import io
 import os
 import traceback
 from string import Template
@@ -43,11 +42,11 @@ st.session_state.setdefault("step2_output_rows", [])
 header_ph = st.session_state.setdefault("_header_ph", st.empty())
 if not st.session_state.get("_header_rendered", False):
     with header_ph:
-        st.title("🤖 Peter v.1.4 (AI Content Manager)")
+        st.title("🤖 Peter v.1.3 (AI Content Manager)")
     st.session_state["_header_rendered"] = True
 
 st.set_page_config(
-    page_title="🤖 Peter v.1.4 (AI Content Manager)",
+    page_title="🤖 Peter v.1.3 (AI Content Manager)",
     page_icon="🤖",
     layout="wide",
 )
@@ -4747,39 +4746,10 @@ def _collect_step2_output_rows() -> list[dict[str, object]]:
 
 
 def _save_specs_step2_to_magento() -> None:
-    raw_rows = st.session_state.get("step2_output_rows")
-
-    rows: list[Mapping[str, object]] = []
-    if isinstance(raw_rows, pd.DataFrame):
-        rows = raw_rows.to_dict(orient="records")
-    elif isinstance(raw_rows, Mapping):
-        rows = [raw_rows]
-    elif isinstance(raw_rows, Iterable):
-        rows = [row for row in raw_rows if isinstance(row, Mapping)]
-
+    rows = st.session_state.get("step2_output_rows")
+    if not isinstance(rows, list) or not rows:
+        rows = _collect_step2_output_rows()
     if not rows:
-        st.info("No specs to save.")
-        return
-
-    payload_rows: list[dict[str, object]] = []
-    for row in rows:
-        sku = _normalize_text(row.get("sku"))
-        attr_code = _normalize_text(row.get("attribute_code"))
-        value = row.get("value")
-        if not sku or not attr_code:
-            continue
-        if _is_blank_value(value):
-            continue
-        payload_rows.append(
-            {
-                "sku": sku,
-                "attribute_code": attr_code,
-                "value": value,
-                "store_view_code": "en",
-            }
-        )
-
-    if not payload_rows:
         st.info("No specs to save.")
         return
 
@@ -4792,29 +4762,73 @@ def _save_specs_step2_to_magento() -> None:
     api_base = st.session_state.get("ai_api_base") or get_api_base(base_url)
     st.session_state["ai_api_base"] = api_base
 
-    df_payload = pd.DataFrame(
-        payload_rows, columns=["sku", "attribute_code", "value", "store_view_code"]
-    )
-    csv_buffer = io.StringIO()
-    df_payload.to_csv(csv_buffer, index=False)
-    csv_bytes = csv_buffer.getvalue().encode("utf-8")
+    step2_state = _ensure_step2_state()
+    meta_cache = step2_state.get("meta_cache")
+    wide_meta_map: dict[int, dict[str, dict]] = step2_state.get("wide_meta", {})
+    attr_set_by_sku: dict[str, object] = step2_state.get("attr_set_by_sku", {})
 
-    url = f"{api_base.rstrip('/')}/import/csv"
-    headers = build_magento_headers(session=session)
-    headers["Content-Type"] = "text/csv"
+    meta_by_code: dict[str, dict[str, object]] = {}
 
-    try:
-        resp = session.post(url, data=csv_bytes, headers=headers, timeout=60)
-    except Exception as exc:  # pragma: no cover - network interaction
-        st.error(f"❌ Failed to save specs: {exc}")
+    if isinstance(meta_cache, AttributeMetaCache):
+        meta_cache.build_and_set_static_for(["country_of_manufacture"], store_id=0)
+
+    for set_meta in (wide_meta_map or {}).values():
+        if not isinstance(set_meta, dict):
+            continue
+        for key, meta in set_meta.items():
+            attr_code = (meta.get("attribute_code") if isinstance(meta, dict) else None) or key
+            if not attr_code:
+                continue
+            if attr_code not in meta_by_code:
+                meta_by_code[attr_code] = meta if isinstance(meta, dict) else {}
+
+    payload_by_sku: dict[str, dict[str, object]] = {}
+
+    for row in rows:
+        sku = _normalize_text(row.get("sku"))
+        attr_code = _normalize_text(row.get("attribute_code"))
+        if not sku or not attr_code:
+            continue
+        entry = payload_by_sku.setdefault(
+            sku,
+            {
+                "attribute_set_id": attr_set_by_sku.get(sku),
+                "values": {},
+                "meta": {},
+            },
+        )
+        entry["values"][attr_code] = row.get("value")
+        meta_for_attr = meta_by_code.get(attr_code) or {}
+        if isinstance(meta_cache, AttributeMetaCache):
+            cache_meta = meta_cache.get(attr_code)
+            if isinstance(cache_meta, dict):
+                meta_for_attr = cache_meta
+        if meta_for_attr:
+            entry["meta"][attr_code] = meta_for_attr
+
+    processed_rows = 0
+    errors: list[str] = []
+
+    for sku, entry in payload_by_sku.items():
+        values_map = entry.get("values") if isinstance(entry, dict) else {}
+        meta_map = entry.get("meta") if isinstance(entry, dict) else {}
+        if not isinstance(values_map, dict):
+            continue
+        attributes_payload: dict[str, object] = {}
+        if entry.get("attribute_set_id") is not None:
+            attributes_payload["attribute_set_id"] = entry.get("attribute_set_id")
+        attributes_payload.update(values_map)
+        try:
+            apply_product_update(session, api_base, sku, attributes_payload, meta_map)
+            processed_rows += len(values_map)
+        except Exception as exc:  # pragma: no cover - network interaction
+            errors.append(f"{sku}: {exc}")
+
+    if errors:
+        st.error("❌ Failed to save specs: " + "; ".join(errors))
         return
 
-    if not resp.ok:
-        snippet = resp.text[:200] if hasattr(resp, "text") else str(resp)
-        st.error(f"❌ Failed to save specs: {resp.status_code} {snippet}")
-        return
-
-    st.success(f"✅ Specs saved to Magento ({len(payload_rows)} rows)")
+    st.success(f"✅ Specs saved to Magento ({processed_rows} rows)")
 
 
 def save_step2_to_magento():
@@ -7595,21 +7609,6 @@ if df_original_key in st.session_state:
                                                 )
                                             else:
                                                 st.caption("Payload еще не собирался.")
-
-                                    if not st.session_state.get("step2_output_rows"):
-                                        st.session_state["step2_output_rows"] = (
-                                            _collect_step2_output_rows()
-                                        )
-
-                                    edited_rows = st.data_editor(
-                                        st.session_state.get(
-                                            "step2_output_rows", []
-                                        ),
-                                        use_container_width=True,
-                                        num_rows="dynamic",
-                                        key="step2_editor",
-                                    )
-                                    st.session_state["step2_output_rows"] = edited_rows
 
                                     st.markdown("---")
                                     c1, c2, c3 = st.columns([1, 1, 1])
