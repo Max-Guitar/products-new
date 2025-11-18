@@ -37,15 +37,16 @@ st.session_state.setdefault("descriptions", {})
 st.session_state.setdefault("step3", {})
 st.session_state.setdefault("step3_generation_pending", False)
 st.session_state.setdefault("step3_output_rows", [])
+st.session_state.setdefault("step2_output_rows", [])
 
 header_ph = st.session_state.setdefault("_header_ph", st.empty())
 if not st.session_state.get("_header_rendered", False):
     with header_ph:
-        st.title("🤖 Peter v.1.2 (AI Content Manager)")
+        st.title("🤖 Peter v.1.3 (AI Content Manager)")
     st.session_state["_header_rendered"] = True
 
 st.set_page_config(
-    page_title="🤖 Peter v.1.2 (AI Content Manager)",
+    page_title="🤖 Peter v.1.3 (AI Content Manager)",
     page_icon="🤖",
     layout="wide",
 )
@@ -4695,6 +4696,141 @@ def apply_product_update(
         )
 
 
+def _collect_step2_output_rows() -> list[dict[str, object]]:
+    step2_state = _ensure_step2_state()
+    _commit_step2_staged(step2_state)
+
+    wide_map: dict[int, pd.DataFrame] = step2_state.get("wide", {})
+    wide_meta_map: dict[int, dict[str, dict]] = step2_state.get("wide_meta", {})
+
+    rows: list[dict[str, object]] = []
+    attr_set_by_sku: dict[str, object] = {}
+
+    for set_id, wide_df in (wide_map or {}).items():
+        if not isinstance(wide_df, pd.DataFrame) or wide_df.empty:
+            continue
+
+        meta_for_set = wide_meta_map.get(set_id, {}) if isinstance(wide_meta_map, dict) else {}
+        attr_cols = [
+            col
+            for col in wide_df.columns
+            if col not in {"sku", "name", "attribute_set_id", GENERATE_DESCRIPTION_COLUMN}
+        ]
+
+        for _, row in wide_df.iterrows():
+            sku = _normalize_text(row.get("sku"))
+            if not sku:
+                continue
+
+            attr_set_raw = row.get("attribute_set_id", set_id)
+            if attr_set_raw in (None, ""):
+                attr_set_by_sku.setdefault(sku, set_id)
+            else:
+                attr_set_by_sku.setdefault(sku, attr_set_raw)
+
+            for col in attr_cols:
+                meta = meta_for_set.get(col) or {}
+                attr_code = meta.get("attribute_code") or col
+                rows.append(
+                    {
+                        "sku": sku,
+                        "store_view_code": "all",
+                        "attribute_code": attr_code,
+                        "value": row.get(col),
+                    }
+                )
+
+    st.session_state["step2_output_rows"] = rows
+    step2_state.setdefault("attr_set_by_sku", {}).update(attr_set_by_sku)
+    return rows
+
+
+def _save_specs_step2_to_magento() -> None:
+    rows = st.session_state.get("step2_output_rows")
+    if not isinstance(rows, list) or not rows:
+        rows = _collect_step2_output_rows()
+    if not rows:
+        st.info("No specs to save.")
+        return
+
+    session = st.session_state.get("mg_session")
+    base_url = st.session_state.get("mg_base_url")
+    if not session or not base_url:
+        st.error("Magento session is not initialized")
+        return
+
+    api_base = st.session_state.get("ai_api_base") or get_api_base(base_url)
+    st.session_state["ai_api_base"] = api_base
+
+    step2_state = _ensure_step2_state()
+    meta_cache = step2_state.get("meta_cache")
+    wide_meta_map: dict[int, dict[str, dict]] = step2_state.get("wide_meta", {})
+    attr_set_by_sku: dict[str, object] = step2_state.get("attr_set_by_sku", {})
+
+    meta_by_code: dict[str, dict[str, object]] = {}
+
+    if isinstance(meta_cache, AttributeMetaCache):
+        meta_cache.build_and_set_static_for(["country_of_manufacture"], store_id=0)
+
+    for set_meta in (wide_meta_map or {}).values():
+        if not isinstance(set_meta, dict):
+            continue
+        for key, meta in set_meta.items():
+            attr_code = (meta.get("attribute_code") if isinstance(meta, dict) else None) or key
+            if not attr_code:
+                continue
+            if attr_code not in meta_by_code:
+                meta_by_code[attr_code] = meta if isinstance(meta, dict) else {}
+
+    payload_by_sku: dict[str, dict[str, object]] = {}
+
+    for row in rows:
+        sku = _normalize_text(row.get("sku"))
+        attr_code = _normalize_text(row.get("attribute_code"))
+        if not sku or not attr_code:
+            continue
+        entry = payload_by_sku.setdefault(
+            sku,
+            {
+                "attribute_set_id": attr_set_by_sku.get(sku),
+                "values": {},
+                "meta": {},
+            },
+        )
+        entry["values"][attr_code] = row.get("value")
+        meta_for_attr = meta_by_code.get(attr_code) or {}
+        if isinstance(meta_cache, AttributeMetaCache):
+            cache_meta = meta_cache.get(attr_code)
+            if isinstance(cache_meta, dict):
+                meta_for_attr = cache_meta
+        if meta_for_attr:
+            entry["meta"][attr_code] = meta_for_attr
+
+    processed_rows = 0
+    errors: list[str] = []
+
+    for sku, entry in payload_by_sku.items():
+        values_map = entry.get("values") if isinstance(entry, dict) else {}
+        meta_map = entry.get("meta") if isinstance(entry, dict) else {}
+        if not isinstance(values_map, dict):
+            continue
+        attributes_payload: dict[str, object] = {}
+        if entry.get("attribute_set_id") is not None:
+            attributes_payload["attribute_set_id"] = entry.get("attribute_set_id")
+        attributes_payload.update(values_map)
+        try:
+            apply_product_update(session, api_base, sku, attributes_payload, meta_map)
+            processed_rows += len(values_map)
+        except Exception as exc:  # pragma: no cover - network interaction
+            errors.append(f"{sku}: {exc}")
+
+    if errors:
+        st.error("❌ Failed to save specs: " + "; ".join(errors))
+        return
+
+    st.success(f"✅ Specs saved to Magento ({processed_rows} rows)")
+
+
 def save_step2_to_magento():
     step2_state = st.session_state.get("step2")
     if not isinstance(step2_state, dict):
@@ -7475,12 +7611,16 @@ if df_original_key in st.session_state:
                                                 st.caption("Payload еще не собирался.")
 
                                     st.markdown("---")
-                                    c1, c2 = st.columns([1, 1])
+                                    c1, c2, c3 = st.columns([1, 1, 1])
                                     btn_generate = c1.button(
                                         "🌐 Generate Descriptions/Translation",
                                         key="btn_step2_generate_bottom",
                                     )
-                                    btn_reset = c2.button(
+                                    btn_save_specs = c2.button(
+                                        "💾 Save specs to Magento",
+                                        key="btn_step2_save_specs_bottom",
+                                    )
+                                    btn_reset = c3.button(
                                         "🔄 Reset all",
                                         key="btn_step2_reset_bottom",
                                     )
@@ -7494,6 +7634,9 @@ if df_original_key in st.session_state:
                                         st.session_state["step3_active"] = True
                                         st.session_state["step3_generation_pending"] = True
                                         st.rerun()
+
+                                    if btn_save_specs:
+                                        _save_specs_step2_to_magento()
 
                                     if btn_reset:
                                         _reset_step2_state()
