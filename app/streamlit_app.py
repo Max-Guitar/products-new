@@ -4027,6 +4027,7 @@ def build_attributes_df(
     *,
     ai_api_key: str | None = None,
     ai_model: str | None = None,
+    progress_callback=None,  # 👈 new parameter to update progress
 ):
     core_codes = ["brand", "condition"]
     rows_by_set: dict[int, list[dict]] = defaultdict(list)
@@ -4104,16 +4105,28 @@ def build_attributes_df(
     ai_model_name = resolved_model or DEFAULT_OPENAI_MODEL
     ai_conv = get_ai_conversation(ai_model_name) if ai_enabled else None
 
+    total_rows = len(df_changed.index)
+    processed = 0
+
     for _, row in df_changed.iterrows():
+        processed += 1
         sku_value = str(row.get("sku", "")).strip()
         if not sku_value:
             continue
 
+        # 👇 update outer progress bar per SKU
+        if callable(progress_callback):
+            progress_callback(
+                processed,
+                max(total_rows, 1),
+                f"🔄 {sku_value}: loading attributes…",
+            )
+
         name_value = row.get("name")
         attr_set_value = row.get("attribute set")
         try:
-            with st.spinner(f"🔄 {sku_value}: loading attributes…"):
-                product = get_product_by_sku(session, api_base, sku_value)
+            # remove nested spinner to avoid noisy UX
+            product = get_product_by_sku(session, api_base, sku_value)
         except Exception as exc:  # pragma: no cover - UI interaction
             st.warning(f"{sku_value}: failed to fetch attributes ({exc})")
             continue
@@ -4366,6 +4379,14 @@ def build_attributes_df(
                 hints_payload,
             ) in ai_requests:
                 try:
+                    # 👇 progress during AI specs generation
+                    if callable(progress_callback):
+                        progress_callback(
+                            processed,
+                            max(total_rows, 1),
+                            f"🤖 {sku_value}: AI suggestions…",
+                        )
+
                     ai_df = infer_missing(
                         product_data,
                         df_full,
@@ -6460,6 +6481,11 @@ if df_original_key in st.session_state:
                                         ai_model=(
                                             st.session_state.get("ai_model_resolved")
                                             or st.session_state.get("ai_model")
+                                        ),
+                                        # 👇 bind SKU progress to the shared Step 2 progress bar
+                                        progress_callback=lambda idx, total, msg: _pupdate(
+                                            20 + int(15 * idx / max(total, 1)),
+                                            msg,
                                         ),
                                     )
                                     step2_state["ai_suggestions"] = (
