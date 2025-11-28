@@ -4804,6 +4804,21 @@ def _collect_step2_products_rows() -> list[dict[str, object]]:
         step2_state = _ensure_step2_state()
         step2_state.setdefault("attr_set_by_sku", {}).update(attr_set_by_sku)
 
+    # 👇 Явная обработка категории, если колонка есть
+    if "categories" in df.columns:
+        for _, row in df.iterrows():
+            sku = row.get("sku", "").strip()
+            if not sku:
+                continue
+            value = row.get("categories")
+            if _is_blank_value(value):
+                continue
+            rows.append({
+                "sku": sku,
+                "attribute_code": "categories",
+                "value": value,
+            })
+
     return rows
 
 
