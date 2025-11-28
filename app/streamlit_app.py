@@ -9,7 +9,6 @@ from pathlib import Path
 import os
 import traceback
 from string import Template
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -551,26 +550,36 @@ def _convert_df_for_storage(
         return pd.DataFrame()
     storage = df.copy(deep=True)
 
+    step2_state = _ensure_step2_state()
+
     columns_to_process = set(multiselect_columns or [])
     for column in columns_to_process:
         if column in storage.columns and column != "categories":
             storage[column] = storage[column].apply(_split_multiselect_input)
 
     if "categories" in storage.columns:
-        options_map: dict[str, int] = {}
-        for key, value in (label_to_id or {}).items():
-            try:
-                options_map[key] = int(value)
-                options_map[key.casefold()] = int(value)
-            except (AttributeError, TypeError, ValueError):
-                continue
+        from app.state.step2 import _labels_to_ids
 
-        storage["categories"] = storage["categories"].apply(
-            lambda labels: _labels_to_ids(
-                list(labels) if isinstance(labels, (list, tuple, set)) else _split_multiselect_input(labels),
-                options_map,
-            )
-        )
+        categories_meta = step2_state.get("categories_meta", {})
+        label_to_id = {
+            (opt.get("label") or "").strip().lower(): opt.get("value")
+            for cat_id, meta in categories_meta.items()
+            for opt in meta.get("options") or []
+            if opt.get("label") and opt.get("value") is not None
+        }
+
+        def _convert_category_cell(cell):
+            if isinstance(cell, str):
+                parts = [p.strip() for p in cell.split(",") if p.strip()]
+            elif isinstance(cell, (list, tuple)):
+                parts = cell
+            else:
+                return []
+
+            ids = _labels_to_ids(parts, label_to_id)
+            return [int(x) for x in ids if str(x).isdigit()]
+
+        storage["categories"] = storage["categories"].map(_convert_category_cell)
     return storage
 
 
@@ -2031,76 +2040,64 @@ def _ensure_descriptions_initialized(products: Sequence[Step3Product]) -> None:
 
     st.session_state["descriptions"] = descriptions
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-def _generate_descriptions_for_products(
-    products: Sequence[Step3Product],
-) -> tuple[dict[str, dict[str, str]], list[str]]:
+
+def _generate_descriptions_for_products(products: Sequence[Step3Product]) -> tuple[dict[str, dict[str, str]], list[str]]:
     results: dict[str, dict[str, str]] = {}
     errors: list[str] = []
-    stored = st.session_state.get("descriptions")
-    if not isinstance(stored, dict):
-        stored = {}
-
     total = len(products)
-    progress = None
+    progress = st.progress(0.0, text=f"Generating descriptions and translations… {total} remaining") if total else None
+
+    def _translate_existing(product: Step3Product):
+        sku = product.sku
+        embed, body = _extract_video_embed(product.short_description)
+        base_text = body or product.short_description
+        nl, de, es, fr = _translate_description(base_text)
+        if es:
+            es = _prepend_embed_if_valid(embed, es)
+        if fr:
+            fr = _prepend_embed_if_valid(embed, fr)
+        return sku, {"en": product.short_description, "nl": nl, "de": de, "es": es, "fr": fr}
+
+    def _generate_all(product: Step3Product):
+        sku = product.sku
+        en, nl, de, es, fr = _generate_description_for_product(product)
+        return sku, {"en": en, "nl": nl, "de": de, "es": es, "fr": fr}
+
     if total:
-        progress = st.progress(
-            0.0,
-            text=f"Generating descriptions and translations… {total} remaining",
-        )
+        max_workers = min(5, total)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_product = {}
+            for product in products:
+                func = _generate_all if product.generate else _translate_existing
+                future = executor.submit(func, product)
+                future_to_product[future] = product
 
-    for index, product in enumerate(products, start=1):
-        previous_entry = stored.get(product.sku, {})
-        if not product.generate:
-            results[product.sku] = {
-                "en": product.short_description,
-                "nl": _clean_description_value(previous_entry.get("nl")),
-                "de": _clean_description_value(previous_entry.get("de")),
-                "es": _clean_description_value(previous_entry.get("es")),
-                "fr": _clean_description_value(previous_entry.get("fr")),
-            }
-        else:
-            trace({"where": "step3:generate:start", "sku": product.sku})
-            try:
-                en, nl, de, es, fr = _generate_description_for_product(product)
-                results[product.sku] = {
-                    "en": en,
-                    "nl": nl,
-                    "de": de,
-                    "es": es,
-                    "fr": fr,
-                }
-                trace({"where": "step3:generate:ok", "sku": product.sku})
-            except Exception as exc:
-                fallback_en = "AI FAILED TO GENERATE"
-                results[product.sku] = {
-                    "en": _clean_description_value(fallback_en),
-                    "nl": "",
-                    "de": "",
-                    "es": "",
-                    "fr": "",
-                }
-                errors.append(f"{product.sku}: {exc}")
-                trace({
-                    "where": "step3:generate:error",
-                    "sku": product.sku,
-                    "err": str(exc)[:200],
-                })
+            done = 0
+            for future in as_completed(future_to_product):
+                prod = future_to_product[future]
+                sku = prod.sku
+                try:
+                    sku, result = future.result()
+                    results[sku] = result
+                except Exception as exc:
+                    errors.append(f"{sku}: {exc}")
+                    fallback = {
+                        "en": _clean_description_value("AI FAILED TO GENERATE"),
+                        "nl": "", "de": "", "es": "", "fr": ""
+                    }
+                    results[sku] = fallback
+                finally:
+                    done += 1
+                    if progress:
+                        remaining = total - done
+                        frac = done / total
+                        msg = "Generation completed" if remaining <= 0 else f"Generating descriptions… {remaining} remaining"
+                        progress.progress(frac, text=msg)
 
-        if progress:
-            remaining = total - index
-            fraction = index / total
-            if remaining <= 0:
-                progress.progress(1.0, text="Generation completed")
-            else:
-                progress.progress(
-                    fraction,
-                    text=f"Generating descriptions and translations… {remaining} remaining",
-                )
-
-    if progress and total:
+    if progress:
         progress.progress(1.0, text="Generation completed")
-
     return results, errors
 
 
