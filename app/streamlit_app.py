@@ -9,6 +9,7 @@ from pathlib import Path
 import os
 import traceback
 from string import Template
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -4369,133 +4370,168 @@ def build_attributes_df(
         disabled[set_id] = ["sku", "name", "attribute_code"]
 
     if ai_enabled and ai_requests:
-        with st.spinner("🤖 Generating AI suggestions…"):
-            for (
+        # Ограничиваем кол-во потоков, чтобы не убить ни OpenAI, ни Magento
+        max_workers = min(4, len(ai_requests))
+
+        def _run_ai_task(args):
+            (
                 set_id,
                 sku_value,
                 product_data,
                 df_full,
                 editor_codes,
                 hints_payload,
-            ) in ai_requests:
-                try:
-                    # 👇 progress during AI specs generation
-                    if callable(progress_callback):
-                        progress_callback(
-                            processed,
-                            max(total_rows, 1),
-                            f"🤖 {sku_value}: AI suggestions…",
-                        )
+            ) = args
+            # Важно: здесь только тяжёлый вызов infer_missing,
+            # никакого Streamlit UI внутри потока.
+            ai_df = infer_missing(
+                product_data,
+                df_full,
+                session,
+                api_base,
+                editor_codes,
+                ai_api_key,
+                conv=ai_conv,
+                hints=hints_payload,
+                model=ai_model_name,
+            )
+            return set_id, sku_value, ai_df, hints_payload
 
-                    ai_df = infer_missing(
+        with st.spinner("🤖 Generating AI suggestions…"):
+            # Параллельно запускаем infer_missing по всем SKU
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_args = {
+                    executor.submit(_run_ai_task, args): args
+                    for args in ai_requests
+                }
+
+                total = len(future_to_args)
+                done_count = 0
+
+                for future in as_completed(future_to_args):
+                    (
+                        set_id,
+                        sku_value,
                         product_data,
                         df_full,
-                        session,
-                        api_base,
                         editor_codes,
-                        ai_api_key,
-                        conv=ai_conv,
-                        hints=hints_payload,
-                        model=ai_model_name,
-                    )
-                except Exception as exc:  # pragma: no cover - network error handling
-                    raw_preview_source = (
-                        getattr(exc, "raw_response", None)
-                        or getattr(exc, "raw_response_retry", None)
-                        or getattr(exc, "raw_response_sanitized", None)
-                        or ""
-                    )
-                    trace(
-                        {
-                            "where": "ai:json_error",
-                            "sku": sku_value,
-                            "err": str(exc),
-                            "raw_preview": str(raw_preview_source)[:400],
-                            "tb": traceback.format_exc()[-600:],
-                        }
-                    )
-                    if "json" in str(exc).lower():
-                        ai_log_data.setdefault("errors", []).append(
+                        hints_payload,
+                    ) = future_to_args[future]
+
+                    try:
+                        set_id, sku_value, ai_df, hints_payload = future.result()
+                    except Exception as exc:  # pragma: no cover - network error handling
+                        raw_preview_source = (
+                            getattr(exc, "raw_response", None)
+                            or getattr(exc, "raw_response_retry", None)
+                            or getattr(exc, "raw_response_sanitized", None)
+                            or ""
+                        )
+                        try:
+                            raw_preview_source = str(raw_preview_source)[:1000]
+                        except Exception:
+                            raw_preview_source = ""
+                        trace(
                             {
+                                "where": "ai:error",
                                 "sku": sku_value,
-                                "reason": "json-parse-failed",
-                                "model": ai_model_name,
+                                "set_id": set_id,
+                                "err": str(exc),
+                                "raw_preview": raw_preview_source,
+                                "tb": traceback.format_exc()[-600:],
                             }
                         )
-                    error_message = f"AI suggestion failed for {sku_value}: {exc}"
-                    st.warning(error_message)
-                    ai_errors.append(error_message)
-                    continue
+                        if "json" in str(exc).lower():
+                            ai_log_data.setdefault("errors", []).append(
+                                {
+                                    "sku": sku_value,
+                                    "reason": "json-parse-failed",
+                                    "model": ai_model_name,
+                                }
+                            )
+                        error_message = f"AI suggestion failed for {sku_value}: {exc}"
+                        st.warning(error_message)
+                        ai_errors.append(error_message)
+                        continue
 
-                if isinstance(ai_df, pd.DataFrame):
-                    preview_df = ai_df.head(50)
-                    if {"code", "value"} <= set(preview_df.columns):
-                        suggested_records = preview_df[["code", "value"]].to_dict(
-                            orient="records"
-                        )
+                    # Лёгкая часть — уже в основном потоке
+                    if isinstance(ai_df, pd.DataFrame):
+                        preview_df = ai_df.head(50)
+                        if {"code", "value"} <= set(preview_df.columns):
+                            suggested_records = preview_df[["code", "value"]].to_dict(
+                                orient="records"
+                            )
+                        else:
+                            suggested_records = preview_df.to_dict(orient="records")
+                    elif hasattr(ai_df, "to_dict"):
+                        try:
+                            suggested_records = list(ai_df.to_dict().items())
+                        except Exception:
+                            suggested_records = []
                     else:
-                        suggested_records = preview_df.to_dict(orient="records")
-                elif hasattr(ai_df, "to_dict"):
-                    try:
-                        suggested_records = list(ai_df.to_dict().items())
-                    except Exception:
                         suggested_records = []
-                else:
-                    suggested_records = []
-                trace(
-                    {
-                        "where": "ai:raw",
-                        "sku": sku_value,
-                        "set_id": set_id,
-                        "suggested": suggested_records,
-                    }
-                )
 
-                categories_meta_for_ai = step2_state.get("categories_meta")
-                if not isinstance(categories_meta_for_ai, Mapping):
-                    categories_meta_for_ai = {}
-                attribute_set_label = set_names.get(set_id, "")
-                ai_df = enrich_ai_suggestions(
-                    ai_df,
-                    hints_payload,
-                    categories_meta_for_ai,
-                    attribute_set_label,
-                    set_id,
-                )
+                    trace(
+                        {
+                            "where": "ai:raw",
+                            "sku": sku_value,
+                            "set_id": set_id,
+                            "suggested": suggested_records,
+                        }
+                    )
 
-                sku_key = str(sku_value)
-                per_sku = ai_results.setdefault(set_id, {}).setdefault(sku_key, {})
+                    categories_meta_for_ai = step2_state.get("categories_meta")
+                    if not isinstance(categories_meta_for_ai, Mapping):
+                        categories_meta_for_ai = {}
+                    attribute_set_label = set_names.get(set_id, "")
+                    ai_df = enrich_ai_suggestions(
+                        ai_df,
+                        hints_payload,
+                        categories_meta_for_ai,
+                        attribute_set_label,
+                        set_id,
+                    )
 
-                metadata = getattr(ai_df, "attrs", {}).get("meta") if hasattr(ai_df, "attrs") else None
-                if isinstance(metadata, dict) and metadata:
-                    per_sku["__meta__"] = metadata
+                    sku_key = str(sku_value)
+                    per_sku = ai_results.setdefault(set_id, {}).setdefault(sku_key, {})
 
-                trace(
-                    {
-                        "where": "ai:enriched",
-                        "sku": sku_value,
-                        "set_id": set_id,
-                        "keys": list(per_sku.keys()),
-                    }
-                )
+                    metadata = getattr(ai_df, "attrs", {}).get("meta") if hasattr(ai_df, "attrs") else None
+                    if isinstance(metadata, dict) and metadata:
+                        per_sku["__meta__"] = metadata
 
-                if not isinstance(ai_df, pd.DataFrame) or ai_df.empty:
-                    continue
+                    trace(
+                        {
+                            "where": "ai:enriched",
+                            "sku": sku_value,
+                            "set_id": set_id,
+                            "keys": list(per_sku.keys()),
+                        }
+                    )
 
-                for _, suggestion in ai_df.iterrows():
-                    code = suggestion.get("code")
-                    if not code:
-                        continue
-                    value = suggestion.get("value")
-                    if value is None:
-                        continue
-                    if isinstance(value, str) and not value.strip():
-                        continue
-                    reason = suggestion.get("reason")
-                    per_sku[str(code)] = {
-                        "value": value,
-                        "reason": reason,
-                    }
+                    if isinstance(ai_df, pd.DataFrame) and not ai_df.empty:
+                        for _, suggestion in ai_df.iterrows():
+                            code = suggestion.get("code")
+                            if not code:
+                                continue
+                            value = suggestion.get("value")
+                            if value is None:
+                                continue
+                            if isinstance(value, str) and not value.strip():
+                                continue
+                            reason = suggestion.get("reason")
+                            per_sku[str(code)] = {
+                                "value": value,
+                                "reason": reason,
+                            }
+
+                    # Можно чуть-чуть обновлять прогресс (необязательно)
+                    done_count += 1
+                    try:
+                        progress_value = 35 + int(15 * done_count / max(total, 1))
+                        # Если есть pbar/_pupdate — здесь можно дергать их
+                        # Но если не хочешь — этот блок можно убрать.
+                    except Exception:
+                        pass
 
     return (
         dfs,
