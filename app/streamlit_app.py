@@ -4811,6 +4811,11 @@ def _collect_step2_products_rows() -> list[dict[str, object]]:
             if not sku:
                 continue
             value = row.get("categories")
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except Exception:
+                    value = []
             if _is_blank_value(value):
                 continue
             rows.append({
