@@ -4850,7 +4850,9 @@ def _collect_step2_products_rows(
     return rows
 
 
-def _collect_step2_output_rows() -> list[dict[str, object]]:
+def _collect_step2_output_rows(
+    df_filtered: pd.DataFrame | None = None,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
     step2_state = _ensure_step2_state()
     _commit_step2_staged(step2_state)
 
@@ -4860,11 +4862,21 @@ def _collect_step2_output_rows() -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     attr_set_by_sku: dict[str, object] = {}
 
-    for set_id, wide_df in (wide_map or {}).items():
+    datasets: list[tuple[int | None, pd.DataFrame]] = []
+    if isinstance(df_filtered, pd.DataFrame):
+        datasets.append((None, df_filtered))
+    else:
+        datasets.extend((wide_map or {}).items())
+
+    for set_id, wide_df in datasets:
         if not isinstance(wide_df, pd.DataFrame) or wide_df.empty:
             continue
 
-        meta_for_set = wide_meta_map.get(set_id, {}) if isinstance(wide_meta_map, dict) else {}
+        meta_for_set = (
+            wide_meta_map.get(set_id, {})
+            if isinstance(wide_meta_map, dict)
+            else {}
+        )
         attr_cols = [
             col
             for col in wide_df.columns
@@ -4882,8 +4894,12 @@ def _collect_step2_output_rows() -> list[dict[str, object]]:
             else:
                 attr_set_by_sku.setdefault(sku, attr_set_raw)
 
+            meta_for_row = meta_for_set
+            if attr_set_raw not in (None, "") and isinstance(wide_meta_map, dict):
+                meta_for_row = wide_meta_map.get(attr_set_raw, meta_for_row) or {}
+
             for col in attr_cols:
-                meta = meta_for_set.get(col) or {}
+                meta = meta_for_row.get(col) or {}
                 attr_code = meta.get("attribute_code") or col
                 rows.append(
                     {
@@ -4896,11 +4912,12 @@ def _collect_step2_output_rows() -> list[dict[str, object]]:
 
     st.session_state["step2_output_rows"] = rows
     step2_state.setdefault("attr_set_by_sku", {}).update(attr_set_by_sku)
-    return rows
+    return rows, attr_set_by_sku
 
 
 def _save_specs_step2_to_magento(
     rows: Sequence[Mapping[str, object]] | None = None,
+    attr_set_by_sku: Mapping[str, object] | None = None,
 ) -> None:
     if rows is None:
         rows = st.session_state.get("step2_output_rows")
@@ -4908,11 +4925,22 @@ def _save_specs_step2_to_magento(
     if isinstance(rows, pd.DataFrame):
         rows = rows.to_dict(orient="records")
 
+    collected_attr_sets: Mapping[str, object] | None = None
     if not isinstance(rows, list) or not rows:
-        rows = _collect_step2_products_rows() or _collect_step2_output_rows()
+        rows_or_tuple = _collect_step2_products_rows() or _collect_step2_output_rows()
+        if isinstance(rows_or_tuple, tuple):
+            rows, collected_attr_sets = rows_or_tuple
+        else:
+            rows = rows_or_tuple
     if not rows:
         st.info("No specs to save.")
         return
+
+    attr_set_map: Mapping[str, object] = {}
+    if isinstance(attr_set_by_sku, Mapping):
+        attr_set_map = attr_set_by_sku
+    elif isinstance(collected_attr_sets, Mapping):
+        attr_set_map = collected_attr_sets
 
     session = st.session_state.get("mg_session")
     base_url = st.session_state.get("mg_base_url")
@@ -4926,7 +4954,10 @@ def _save_specs_step2_to_magento(
     step2_state = _ensure_step2_state()
     meta_cache = step2_state.get("meta_cache")
     wide_meta_map: dict[int, dict[str, dict]] = step2_state.get("wide_meta", {})
-    attr_set_by_sku: dict[str, object] = step2_state.get("attr_set_by_sku", {})
+    if not isinstance(attr_set_map, Mapping) or not attr_set_map:
+        attr_set_map = step2_state.get("attr_set_by_sku", {})
+    if isinstance(attr_set_map, Mapping):
+        step2_state.setdefault("attr_set_by_sku", {}).update(attr_set_map)
 
     meta_by_code: dict[str, dict[str, object]] = {}
 
@@ -4953,11 +4984,12 @@ def _save_specs_step2_to_magento(
         entry = payload_by_sku.setdefault(
             sku,
             {
-                "attribute_set_id": attr_set_by_sku.get(sku),
+                "attribute_set_id": (attr_set_map or {}).get(sku),
                 "values": {},
                 "meta": {},
             },
         )
+        entry["attribute_set_id"] = (attr_set_map or {}).get(sku)
         entry["values"][attr_code] = row.get("value")
         meta_for_attr = meta_by_code.get(attr_code) or {}
         if isinstance(meta_cache, AttributeMetaCache):
@@ -4998,8 +5030,9 @@ def _save_rows_to_magento(
     session=None,
     trace=None,
     is_dry_run: bool | None = None,
+    attr_set_by_sku: Mapping[str, object] | None = None,
 ) -> None:
-    _save_specs_step2_to_magento(rows)
+    _save_specs_step2_to_magento(rows, attr_set_by_sku=attr_set_by_sku)
 
 
 def save_rows_to_magento(
@@ -5008,8 +5041,15 @@ def save_rows_to_magento(
     session=None,
     trace=None,
     is_dry_run: bool | None = None,
+    attr_set_by_sku: Mapping[str, object] | None = None,
 ) -> None:
-    _save_rows_to_magento(rows, session=session, trace=trace, is_dry_run=is_dry_run)
+    _save_rows_to_magento(
+        rows,
+        session=session,
+        trace=trace,
+        is_dry_run=is_dry_run,
+        attr_set_by_sku=attr_set_by_sku,
+    )
 
 
 def save_step2_to_magento():
@@ -7868,15 +7908,9 @@ if df_original_key in st.session_state:
                                             df_filtered = st.session_state.get(
                                                 "step2_products"
                                             )
-                                            df_initial = step2_state.get("wide_orig")
 
-                                            rows_to_save = _collect_step2_products_rows(
-                                                df_filtered,
-                                                df_original=df_initial,
-                                                row_meta_map=step2_state.get(
-                                                    "row_meta_map"
-                                                ),
-                                                step2_state=step2_state,
+                                            rows_to_save, attr_set_by_sku = _collect_step2_output_rows(
+                                                df_filtered
                                             )
 
                                             try:
@@ -7885,6 +7919,7 @@ if df_original_key in st.session_state:
                                                     session=session,
                                                     trace=trace,
                                                     is_dry_run=False,
+                                                    attr_set_by_sku=attr_set_by_sku,
                                                 )
                                                 st.success(
                                                     "✅ Saved successfully to Magento"
