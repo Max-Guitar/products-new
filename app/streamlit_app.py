@@ -4750,7 +4750,12 @@ def apply_product_update(
         )
 
 
-def _collect_step2_products_rows() -> list[dict[str, object]]:
+def _collect_step2_products_rows(
+    df_filtered: pd.DataFrame | None = None,
+    df_original: pd.DataFrame | None = None,
+    row_meta_map: dict[int, dict[str, dict]] | None = None,
+    step2_state: dict[str, object] | None = None,
+) -> list[dict[str, object]]:
     products = st.session_state.get("step2_output_rows", [])
     df: pd.DataFrame
 
@@ -4969,12 +4974,24 @@ def _save_specs_step2_to_magento(
     st.success(f"✅ Specs saved to Magento ({processed_rows} rows)")
 
 
-def _save_rows_to_magento(rows: Sequence[Mapping[str, object]] | None = None) -> None:
+def _save_rows_to_magento(
+    rows: Sequence[Mapping[str, object]] | None = None,
+    *,
+    session=None,
+    trace=None,
+    is_dry_run: bool | None = None,
+) -> None:
     _save_specs_step2_to_magento(rows)
 
 
-def save_rows_to_magento(rows: Sequence[Mapping[str, object]] | None = None) -> None:
-    _save_rows_to_magento(rows)
+def save_rows_to_magento(
+    rows: Sequence[Mapping[str, object]] | None = None,
+    *,
+    session=None,
+    trace=None,
+    is_dry_run: bool | None = None,
+) -> None:
+    _save_rows_to_magento(rows, session=session, trace=trace, is_dry_run=is_dry_run)
 
 
 def save_step2_to_magento():
@@ -7770,10 +7787,6 @@ if df_original_key in st.session_state:
                                         "🌐 Generate Descriptions/Translation",
                                         key="btn_step2_generate_bottom",
                                     )
-                                    btn_save_specs = c2.button(
-                                        "💾 Save specs to Magento",
-                                        key="btn_step2_save_specs_bottom",
-                                    )
                                     btn_reset = c3.button(
                                         "🔄 Reset all",
                                         key="btn_step2_reset_bottom",
@@ -7789,10 +7802,50 @@ if df_original_key in st.session_state:
                                         st.session_state["step3_generation_pending"] = True
                                         st.rerun()
 
-                                    if btn_save_specs:
-                                        save_rows_to_magento(
-                                            _collect_step2_products_rows()
-                                        )
+                                    with c2:
+                                        if st.button(
+                                            "💾 Save changes to Magento",
+                                            key="btn_step2_save_specs_bottom",
+                                        ):
+                                            st.toast(
+                                                "⏳ Saving changes to Magento…",
+                                                icon="⏳",
+                                            )
+
+                                            df_filtered = st.session_state.get(
+                                                "step2_products"
+                                            )
+                                            df_initial = step2_state.get("wide_orig")
+
+                                            rows_to_save = _collect_step2_products_rows(
+                                                df_filtered,
+                                                df_original=df_initial,
+                                                row_meta_map=step2_state.get(
+                                                    "row_meta_map"
+                                                ),
+                                                step2_state=step2_state,
+                                            )
+
+                                            try:
+                                                save_rows_to_magento(
+                                                    rows_to_save,
+                                                    session=session,
+                                                    trace=trace,
+                                                    is_dry_run=False,
+                                                )
+                                                st.success(
+                                                    "✅ Saved successfully to Magento"
+                                                )
+                                            except Exception as exc:
+                                                st.error(
+                                                    f"❌ Failed to save to Magento: {exc}"
+                                                )
+                                                trace(
+                                                    {
+                                                        "where": "save:error",
+                                                        "err": str(exc),
+                                                    }
+                                                )
 
                                     if btn_reset:
                                         _reset_step2_state()
