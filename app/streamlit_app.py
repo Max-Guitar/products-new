@@ -4756,7 +4756,7 @@ def _collect_step2_products_rows(
     row_meta_map: dict[int, dict[str, dict]] | None = None,
     step2_state: dict[str, object] | None = None,
 ) -> list[dict[str, object]]:
-    SYSTEM_COLS = {"sku", "name", "categories"}
+    SYSTEM_COLS = {"sku", "name", "categories"}  # убираем attribute_set_id
 
     if isinstance(df_filtered, pd.DataFrame):
         df = df_filtered.copy()
@@ -4831,6 +4831,21 @@ def _collect_step2_products_rows(
                 "attribute_code": col,
                 "value": value,
             })
+
+            # Добавляем attribute_set_id отдельно, если есть
+            attr_set_id = row.get("attribute_set_id")
+            if attr_set_id is not None and attr_set_id != "":
+                try:
+                    attr_set_id = int(attr_set_id)
+                    rows.append(
+                        {
+                            "sku": sku,
+                            "attribute_code": "attribute_set_id",
+                            "value": attr_set_id,
+                        }
+                    )
+                except:
+                    pass  # пропускаем некорректные значения
 
     return rows
 
