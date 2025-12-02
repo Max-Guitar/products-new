@@ -4794,7 +4794,13 @@ def _collect_step2_products_rows(
                         value = []
                 if not isinstance(value, list):
                     value = [value]
-                value = [int(x) for x in value if str(x).isdigit()]
+                cleaned_list = []
+                for cat in value:
+                    try:
+                        cleaned_list.append(int(cat))
+                    except Exception:
+                        continue
+                value = cleaned_list
                 if not value:
                     continue
 
