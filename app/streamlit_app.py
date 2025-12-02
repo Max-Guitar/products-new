@@ -4774,58 +4774,32 @@ def _collect_step2_products_rows(
     else:
         return []
 
-    attr_cols = [
-        col
-        for col in df.columns
-        if col not in {"sku", "name", "attribute_set_id", GENERATE_DESCRIPTION_COLUMN}
-    ]
-
     rows: list[dict[str, object]] = []
-    attr_set_by_sku: dict[str, object] = {}
-
     for _, row in df.iterrows():
-        sku = _normalize_text(row.get("sku"))
+        sku = row.get("sku", "").strip()
         if not sku:
             continue
-
-        attr_set_value = row.get("attribute_set_id")
-        if not _is_blank_value(attr_set_value):
-            attr_set_by_sku[sku] = attr_set_value
-
-        for col in attr_cols:
+        for col in df.columns:
+            if col == "sku":
+                continue
             value = row.get(col)
             if _is_blank_value(value):
                 continue
-            rows.append(
-                {
-                    "sku": sku,
-                    "store_view_code": "all",
-                    "attribute_code": col,
-                    "value": value,
-                }
-            )
 
-    if attr_set_by_sku:
-        step2_state = _ensure_step2_state()
-        step2_state.setdefault("attr_set_by_sku", {}).update(attr_set_by_sku)
+            if col == "categories":
+                if isinstance(value, str):
+                    try:
+                        value = json.loads(value)
+                    except Exception:
+                        value = []
+                if not isinstance(value, list):
+                    value = [value]
+                if not value:
+                    continue
 
-    # 👇 Явная обработка категории, если колонка есть
-    if "categories" in df.columns:
-        for _, row in df.iterrows():
-            sku = row.get("sku", "").strip()
-            if not sku:
-                continue
-            value = row.get("categories")
-            if isinstance(value, str):
-                try:
-                    value = json.loads(value)
-                except Exception:
-                    value = []
-            if _is_blank_value(value):
-                continue
             rows.append({
                 "sku": sku,
-                "attribute_code": "categories",
+                "attribute_code": col,
                 "value": value,
             })
 
