@@ -4756,23 +4756,14 @@ def _collect_step2_products_rows(
     row_meta_map: dict[int, dict[str, dict]] | None = None,
     step2_state: dict[str, object] | None = None,
 ) -> list[dict[str, object]]:
-    products = st.session_state.get("step2_output_rows", [])
-    df: pd.DataFrame
-
-    if isinstance(products, pd.DataFrame):
-        df = products
-    elif isinstance(products, (list, tuple)):
-        try:
-            df = pd.DataFrame(products)
-        except Exception:
-            return []
-    elif isinstance(products, Mapping):
-        try:
-            df = pd.DataFrame([products])
-        except Exception:
-            return []
+    if isinstance(df_filtered, pd.DataFrame):
+        df = df_filtered.copy()
     else:
-        return []
+        # fallback
+        products = st.session_state.get("step2_output_rows", [])
+        if not products:
+            return []
+        df = pd.DataFrame(products)
 
     rows: list[dict[str, object]] = []
     for _, row in df.iterrows():
