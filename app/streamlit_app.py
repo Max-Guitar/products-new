@@ -6255,6 +6255,24 @@ if df_original_key in st.session_state:
                 updated_df = df_base.copy()
                 for column in edited_df.columns:
                     updated_df[column] = edited_df[column]
+                # --- BEGIN: обновление attribute_set_id на основе названия ---
+                if "attribute set" in edited_df.columns and "attribute_set_id" in updated_df.columns:
+                    name_to_id = st.session_state.get(attribute_sets_key, {})  # словарь: имя -> ID
+                    for idx, set_name in edited_df["attribute set"].items():
+                        if pd.notna(set_name) and str(set_name).strip():
+                            name = str(set_name).strip()
+                            if name.casefold() == "default":
+                                new_id = 4
+                            else:
+                                new_id = name_to_id.get(name)
+                            if new_id is None:
+                                try:
+                                    new_id = int(name)
+                                except:
+                                    new_id = None
+                            if new_id is not None:
+                                updated_df.loc[idx, "attribute_set_id"] = int(new_id)
+                # --- END ---
                 if "attribute_set_id" in edited_df.columns and "attribute set" in updated_df.columns:
                     id_lookup: dict[int, str] = {}
                     for name, attr_id in attribute_sets.items():
