@@ -4787,19 +4787,37 @@ def _collect_step2_products_rows(
                 continue
 
             if col == "categories":
+                # Map category labels to IDs using categories_meta
+                cats_meta = step2_state.get("categories_meta", {}) if step2_state else {}
+                options_map = cats_meta.get("options_map", {}) if isinstance(cats_meta, dict) else {}
+                # Ensure value is a list (e.g. split comma-separated strings or wrap single value)
                 if isinstance(value, str):
                     try:
                         value = json.loads(value)
                     except Exception:
-                        value = []
+                        # Split by comma for multiple labels, or treat as single label
+                        labels = [v.strip() for v in value.split(",") if v.strip()]
+                        value = labels or []
                 if not isinstance(value, list):
                     value = [value]
                 cleaned_list = []
                 for cat in value:
-                    try:
-                        cleaned_list.append(int(cat))
-                    except Exception:
-                        continue
+                    if isinstance(cat, str):
+                        label = cat.strip()
+                        if not label:
+                            continue
+                        # Lookup label (case-insensitive) in options_map to get ID
+                        mapped_id = options_map.get(label) or options_map.get(label.casefold())
+                        if mapped_id:
+                            try:
+                                cleaned_list.append(int(mapped_id))
+                            except Exception:
+                                continue
+                    else:
+                        try:
+                            cleaned_list.append(int(cat))
+                        except Exception:
+                            continue
                 value = cleaned_list
                 if not value:
                     continue
