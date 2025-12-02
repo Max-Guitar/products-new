@@ -7627,10 +7627,27 @@ if df_original_key in st.session_state:
                                                             "Нет данных DF BEFORE AI"
                                                         )
                                                     if isinstance(after_ai, pd.DataFrame):
-                                                        st.write(
-                                                            "DF AFTER AI",
-                                                            after_ai.head(10),
-                                                        )
+                                                        for col in after_ai.columns:
+                                                            if after_ai[col].apply(
+                                                                lambda x: isinstance(
+                                                                    x, (list, dict)
+                                                                )
+                                                            ).any():
+                                                                after_ai[col] = after_ai[
+                                                                    col
+                                                                ].astype(str)
+                                                        try:
+                                                            st.write(
+                                                                "DF AFTER AI",
+                                                                after_ai.head(10),
+                                                            )
+                                                        except Exception as e:
+                                                            st.error(
+                                                                f"Could not render dataframe: {e}"
+                                                            )
+                                                            st.text(
+                                                                after_ai.head(10).to_string()
+                                                            )
                                                     else:
                                                         st.caption(
                                                             "Нет данных DF AFTER AI"
