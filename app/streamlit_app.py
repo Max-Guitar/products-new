@@ -4756,6 +4756,8 @@ def _collect_step2_products_rows(
     row_meta_map: dict[int, dict[str, dict]] | None = None,
     step2_state: dict[str, object] | None = None,
 ) -> list[dict[str, object]]:
+    SYSTEM_COLS = {"sku", "name", "categories"}
+
     if isinstance(df_filtered, pd.DataFrame):
         df = df_filtered.copy()
     else:
@@ -4812,6 +4814,17 @@ def _collect_step2_products_rows(
                 value = cleaned_list
                 if not value:
                     continue
+
+                rows.append({
+                    "sku": sku,
+                    "attribute_code": col,
+                    "value": value,
+                })
+
+                continue
+
+            if col in SYSTEM_COLS:
+                continue
 
             rows.append({
                 "sku": sku,
