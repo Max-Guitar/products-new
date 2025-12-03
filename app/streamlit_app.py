@@ -4111,9 +4111,18 @@ def build_attributes_df(
 
     total_rows = len(df_changed.index)
     processed = 0
+    eta_est = ETAEstimator()
 
     for _, row in df_changed.iterrows():
         processed += 1
+        fraction_done = processed / max(total_rows, 1)
+        eta_est.update(fraction_done)
+        eta_minutes = eta_est.estimate_minutes()
+        eta_text = (
+            f"   ETA: ~{eta_minutes} minute{'s' if eta_minutes != 1 else ''}"
+            if eta_minutes >= 0
+            else ""
+        )
         sku_value = str(row.get("sku", "")).strip()
         if not sku_value:
             continue
@@ -4123,7 +4132,7 @@ def build_attributes_df(
             progress_callback(
                 processed,
                 max(total_rows, 1),
-                f"🔄 {sku_value}: loading attributes…",
+                f"🔄 {sku_value}: loading attributes…{eta_text}",
             )
 
         name_value = row.get("name")
