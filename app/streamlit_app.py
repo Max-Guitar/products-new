@@ -27,6 +27,7 @@ import pandas as pd
 import streamlit as st
 import random
 
+from helpers.eta import ETAEstimator
 from utils.json_parse import extract_json_object, short_preview_of
 
 st.session_state.setdefault("allow_ai_overwrite_text", False)
@@ -2048,6 +2049,7 @@ def _generate_descriptions_for_products(products: Sequence[Step3Product]) -> tup
     errors: list[str] = []
     total = len(products)
     progress = st.progress(0.0, text=f"Generating descriptions and translations… {total} remaining") if total else None
+    eta_est = ETAEstimator() if total else None
 
     def _translate_existing(product: Step3Product):
         sku = product.sku
@@ -2095,9 +2097,13 @@ def _generate_descriptions_for_products(products: Sequence[Step3Product]) -> tup
                         frac = done / total
                         msg = "Generation completed" if remaining <= 0 else f"Generating descriptions… {remaining} remaining"
                         progress.progress(frac, text=msg)
+                    if eta_est:
+                        eta_est.update(done / total)
 
     if progress:
         progress.progress(1.0, text="Generation completed")
+    if eta_est:
+        eta_est.close()
     return results, errors
 
 
@@ -6495,11 +6501,15 @@ if df_original_key in st.session_state:
                                     "Building attribute editor…", expanded=True
                                 )
                                 progress = st.progress(0)
+                                eta_est = ETAEstimator()
 
                                 def _pupdate(pct: int, msg: str) -> None:
                                     clamped = max(0, min(int(pct), 100))
                                     progress.progress(clamped)
                                     status2.update(label=msg)
+                                    eta_est.update(clamped / 100.0)
+                                    if clamped >= 100:
+                                        eta_est.close()
 
                                 _pupdate(5, "Collecting selected sets…")
                                 selected_set_ids: list[int] = []
