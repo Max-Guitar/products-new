@@ -6089,7 +6089,7 @@ if requested_run_mode:
             st.success(f"Loaded {len(data or [])} test item(s).")
 
     else:
-        limit = 50 if run_mode == "fast50" else None
+        limit = 50 if run_mode == "fast50" else 300
         enabled_only = None
         minimal_fields = run_mode == "fast50"
         extra_params: dict[str, str] = {}

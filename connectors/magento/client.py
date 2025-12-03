@@ -366,6 +366,15 @@ def get_default_products(
     if kwargs:
         base_params.update(kwargs)
 
+    if limit is not None:
+        base_params.setdefault("searchCriteria[pageSize]", limit)
+        has_sorting = any(
+            key.startswith("searchCriteria[sortOrders]") for key in base_params
+        )
+        if not has_sorting:
+            base_params["searchCriteria[sortOrders][0][field]"] = "created_at"
+            base_params["searchCriteria[sortOrders][0][direction]"] = "DESC"
+
     if minimal_fields:
         base_params[
             "fields"
