@@ -4894,6 +4894,19 @@ def _collect_step2_output_rows(
             else:
                 attr_set_by_sku.setdefault(sku, attr_set_raw)
 
+            # ВОССТАНОВЛЕНИЕ attribute_set_id КАК ОТДЕЛЬНОГО АТРИБУТА, КАК В ВЕРСИИ 7
+            if attr_set_raw not in (None, ""):
+                try:
+                    val = int(attr_set_raw)
+                except:
+                    val = attr_set_raw
+                rows.append({
+                    "sku": sku,
+                    "store_view_code": "all",
+                    "attribute_code": "attribute_set_id",
+                    "value": val
+                })
+
             meta_for_row = meta_for_set
             if attr_set_raw not in (None, "") and isinstance(wide_meta_map, dict):
                 meta_for_row = wide_meta_map.get(attr_set_raw, meta_for_row) or {}
