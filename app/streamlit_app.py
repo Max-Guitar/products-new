@@ -5414,8 +5414,6 @@ def save_step2_to_magento():
 
             entry = payload_by_sku.get(sku_value)
             values_map = entry.get("values") if isinstance(entry, dict) else None
-            if entry and (not values_map or not values_map.keys()):
-                payload_by_sku.pop(sku_value, None)
 
     if not payload_by_sku and not errors:
         st.info("No changes to save.")
@@ -7917,36 +7915,7 @@ if df_original_key in st.session_state:
                                                 "⏳ Saving changes to Magento…",
                                                 icon="⏳",
                                             )
-
-                                            df_filtered = st.session_state.get(
-                                                "step2_products"
-                                            )
-
-                                            rows_to_save, attr_set_by_sku = _collect_step2_output_rows(
-                                                df_filtered
-                                            )
-
-                                            try:
-                                                save_rows_to_magento(
-                                                    rows_to_save,
-                                                    session=session,
-                                                    trace=trace,
-                                                    is_dry_run=False,
-                                                    attr_set_by_sku=attr_set_by_sku,
-                                                )
-                                                st.success(
-                                                    "✅ Saved successfully to Magento"
-                                                )
-                                            except Exception as exc:
-                                                st.error(
-                                                    f"❌ Failed to save to Magento: {exc}"
-                                                )
-                                                trace(
-                                                    {
-                                                        "where": "save:error",
-                                                        "err": str(exc),
-                                                    }
-                                                )
+                                            save_step2_to_magento()
 
                                     if btn_reset:
                                         _reset_step2_state()
