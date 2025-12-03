@@ -1041,7 +1041,7 @@ def _clean_description_value(value: object) -> str:
 
 def _strip_truncation_warning(value: object) -> str:
     text = _clean_description_value(value)
-    prefix = "⚠️ "
+    prefix = ""
     if text.startswith(prefix):
         return text[len(prefix) :]
     return text
@@ -1061,7 +1061,7 @@ def _is_translation_truncated(text: str) -> bool:
 def _decorate_truncated_translation(value: object) -> str:
     text = _strip_truncation_warning(value)
     if _is_translation_truncated(text):
-        return f"⚠️ {text}"
+        return f" {text}"
     return text
 
 
@@ -5551,7 +5551,7 @@ def save_step2_to_magento():
         if any(err.get("attribute") == "categories" for err in errors):
             st.warning("Some categories are not saved because they do not exist in Magento.")
 
-        st.warning("Some rows failed; review and fix:")
+        st.warning("Import table:")
         st.dataframe(
             _pd.DataFrame(
                 errors,
