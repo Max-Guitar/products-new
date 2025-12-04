@@ -2098,6 +2098,7 @@ def _generate_descriptions_for_products(products: Sequence[Step3Product]) -> tup
                         msg = "Generation completed" if remaining <= 0 else f"Generating descriptions… {remaining} remaining"
                         progress.progress(frac, text=msg)
                     if eta_est:
+                        print(f"[ETA DEBUG] done={done}, total={total}, fraction={done / total}")
                         eta_est.update(done / total)
 
     if progress:
@@ -4116,6 +4117,7 @@ def build_attributes_df(
     for _, row in df_changed.iterrows():
         processed += 1
         fraction_done = processed / max(total_rows, 1)
+        print(f"[ETA DEBUG] fraction={fraction_done}")
         eta_est.update(fraction_done)
         eta_minutes = eta_est.estimate_minutes()
         eta_text = (
