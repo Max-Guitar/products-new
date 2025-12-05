@@ -2155,7 +2155,7 @@ def _store_specific_url(base_url: str, store_code: str, sku: str) -> str:
 def _save_translations(
     descriptions_map: Mapping[str, Mapping[str, object]],
     *,
-    store_codes: Sequence[str] = ("nl", "de"),
+    store_codes: Sequence[str] = ("nl", "de", "es", "fr"),
 ) -> tuple[set[str], list[str]]:
     session = st.session_state.get("mg_session")
     base_url = st.session_state.get("mg_base_url")
