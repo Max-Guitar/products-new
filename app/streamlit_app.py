@@ -52,6 +52,16 @@ st.set_page_config(
     layout="wide",
 )
 
+HIDE_CSS = """
+<style>
+/* Скрыть кнопку Reset all (по тексту) */
+button:has(span:contains('Reset all')) { display: none !important; }
+/* Скрыть кнопки скачивания trace.json и payload.json (по атрибуту download) */
+a[download="trace.json"], a[download="payload.json"] { display: none !important; }
+</style>
+"""
+st.markdown(HIDE_CSS, unsafe_allow_html=True)
+
 # --- DEBUG UI PANEL ---
 if "_trace_events" not in st.session_state:
     st.session_state["_trace_events"] = []
@@ -7908,7 +7918,18 @@ if df_original_key in st.session_state:
 
                                     st.markdown("---")
                                     c1, c2, c3 = st.columns([1, 1, 1])
-                                    btn_generate = c1.button(
+                                    with c1:
+                                        if st.button(
+                                            "💾 Save changes to Magento",
+                                            key="btn_step2_save_specs_bottom",
+                                        ):
+                                            st.toast(
+                                                "⏳ Saving changes to Magento…",
+                                                icon="⏳",
+                                            )
+                                            save_step2_to_magento()
+
+                                    btn_generate = c2.button(
                                         "🌐 Generate Descriptions/Translation",
                                         key="btn_step2_generate_bottom",
                                     )
@@ -7926,17 +7947,6 @@ if df_original_key in st.session_state:
                                         st.session_state["step3_active"] = True
                                         st.session_state["step3_generation_pending"] = True
                                         st.rerun()
-
-                                    with c2:
-                                        if st.button(
-                                            "💾 Save changes to Magento",
-                                            key="btn_step2_save_specs_bottom",
-                                        ):
-                                            st.toast(
-                                                "⏳ Saving changes to Magento…",
-                                                icon="⏳",
-                                            )
-                                            save_step2_to_magento()
 
                                     if btn_reset:
                                         _reset_step2_state()
