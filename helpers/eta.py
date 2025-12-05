@@ -12,7 +12,9 @@ class ETAEstimator:
         now = time.time()
         elapsed = now - self.start_time
         if self.last_fraction and self.last_fraction > 0:
-            remaining = (elapsed / self.last_fraction) - elapsed
+            base_remaining = (elapsed / self.last_fraction) - elapsed
+            buffer = max(20, elapsed * 0.1)  # буфер: 10% от прошедшего времени, минимум 20 сек
+            remaining = base_remaining + buffer
             if remaining < 60:
                 return f"ETA: ~{int(remaining)} sec"
             else:
