@@ -7933,10 +7933,10 @@ if df_original_key in st.session_state:
                                         "🌐 Generate Descriptions/Translation",
                                         key="btn_step2_generate_bottom",
                                     )
-                                    btn_reset = c3.button(
-                                        "🔄 Reset all",
-                                        key="btn_step2_reset_bottom",
-                                    )
+                                 #   btn_reset = c3.button(
+                                  #      "🔄 Reset all",
+                                  #      key="btn_step2_reset_bottom",
+                                  #  )
 
                                     if btn_generate:
                                         products = _build_step3_products()
@@ -7948,9 +7948,9 @@ if df_original_key in st.session_state:
                                         st.session_state["step3_generation_pending"] = True
                                         st.rerun()
 
-                                    if btn_reset:
-                                        _reset_step2_state()
-                                        st.rerun()
+                                  #  if btn_reset:
+                                  #      _reset_step2_state()
+                                  #      st.rerun()
 
                                     trace_json = json.dumps(
                                         trace_events,
@@ -7964,18 +7964,18 @@ if df_original_key in st.session_state:
                                         indent=2,
                                         default=str,
                                     )
-                                    st.download_button(
-                                        "⬇️ Download trace.json",
-                                        data=trace_json,
-                                        file_name="trace.json",
-                                        mime="application/json",
-                                    )
-                                    st.download_button(
-                                        "⬇️ Download payload.json",
-                                        data=payload_json,
-                                        file_name="payload.json",
-                                        mime="application/json",
-                                    )
+                                   # st.download_button(
+                                   #     "⬇️ Download trace.json",
+                                  #      data=trace_json,
+                                  #      file_name="trace.json",
+                                  #      mime="application/json",
+                                  #  )
+                                  #  st.download_button(
+                                  #      "⬇️ Download payload.json",
+                                  #      data=payload_json,
+                                  #      file_name="payload.json",
+                                   #     mime="application/json",
+                                  #  )
 
         if st.session_state.get("step3_active"):
             st.markdown("---")
