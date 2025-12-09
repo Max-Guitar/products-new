@@ -4245,6 +4245,42 @@ def build_attributes_df(
             for c in editor_codes
             if (meta_cache.get(c) or {}).get("frontend_input") == "boolean"
         }
+        # 🔍 Заполнение attr_rows данными из файла поставщика (если есть)
+        supplier_data = st.session_state.get("supplier_file_data", {})
+        product_name_str = str(product.get("name", "")).strip()
+        if supplier_data and product_name_str:
+            # Если для данного товара есть данные из файла
+            if product_name_str in supplier_data:
+                file_attrs = supplier_data[product_name_str]
+                for attr_key, attr_val in file_attrs.items():
+                    # attr_key может быть именем атрибута или кодом атрибута
+                    code = None
+                    # Проверяем, совпадает ли ключ с кодом атрибута из editor_codes
+                    if attr_key in editor_codes:
+                        code = attr_key
+                    else:
+                        # Пытаемся сопоставить имя атрибута (из файла) с кодом через метаданные
+                        for c in editor_codes:
+                            meta = meta_cache.get(c) or {}
+                            label = (
+                                meta.get("frontend_label")
+                                or meta.get("default_frontend_label")
+                                or ""
+                            ).strip()
+                            if label and attr_key.strip().lower() == label.lower():
+                                code = c
+                                break
+                    if code:
+                        # Если атрибут присутствует среди требуемых и пуст в текущих данных, заполняем его
+                        current_val = attr_rows.get(code, {}).get("label") or attr_rows.get(
+                            code, {}
+                        ).get("raw_value")
+                        if _is_blank_value(current_val):
+                            # Записываем значение из файла как и label, и raw_value
+                            attr_rows[code] = {
+                                "label": attr_val,
+                                "raw_value": attr_val,
+                            }
         missing_codes = {
             c
             for c in editor_codes
@@ -6088,14 +6124,11 @@ if requested_run_mode:
                     attribute_sets = {}
                 st.session_state[attribute_sets_key] = attribute_sets
                 df_for_edit = df_ui.copy()
-                if "hint" not in df_for_edit.columns:
-                    df_for_edit["hint"] = ""
                 cols_order = [
                     "sku",
                     "name",
                     "attribute set",
                     "attribute_set_id",
-                    "hint",
                     "created_at",
                 ]
                 column_order = [
@@ -6223,14 +6256,11 @@ if df_original_key in st.session_state:
     else:
         if df_edited_key not in st.session_state:
             df_init = df_ui.copy()
-            if "hint" not in df_init.columns:
-                df_init["hint"] = ""
             cols_order = [
                 "sku",
                 "name",
                 "attribute set",
                 "attribute_set_id",
-                "hint",
                 "created_at",
             ]
             column_order = [col for col in cols_order if col in df_init.columns]
@@ -6241,9 +6271,6 @@ if df_original_key in st.session_state:
             st.session_state[df_edited_key] = df_init.copy()
 
         df_base = st.session_state[df_edited_key].copy()
-
-        if "hint" not in df_base.columns:
-            df_base["hint"] = ""
 
         df_view = df_base.copy()
 
@@ -6295,7 +6322,6 @@ if df_original_key in st.session_state:
                     help="Change attribute set identifier",
                     step=1,
                 ),
-                "hint": st.column_config.TextColumn("Hint"),
                 "created_at": st.column_config.DatetimeColumn("Created At", disabled=True),
             }
             st.session_state["step1_column_config_cache"] = step1_column_config
@@ -6351,6 +6377,87 @@ if df_original_key in st.session_state:
                 num_rows="fixed",
                 key=editor_key,
             )
+
+            # \ud83d\udcc1 \u0417\u0430\u0433\u0440\u0443\u0437\u043a\u0430 \u0444\u0430\u0439\u043b\u0430 \u043e\u0442 \u043f\u043e\u0441\u0442\u0430\u0432\u0449\u0438\u043a\u0430 (Excel, PDF, DOC, DOCX)
+            uploaded_file = st.file_uploader(
+                "\u0417\u0430\u0433\u0440\u0443\u0437\u0438\u0442\u044c \u0444\u0430\u0439\u043b \u043e\u0442 \u043f\u043e\u0441\u0442\u0430\u0432\u0449\u0438\u043a\u0430 (\u0444\u043e\u0440\u043c\u0430\u0442\u044b: Excel (.xlsx), PDF, Word (.doc/.docx))",
+                type=["xlsx", "pdf", "doc", "docx"],
+                key="supplier_file",
+            )
+            supplier_data = {}
+            if uploaded_file:
+                file_name = uploaded_file.name.lower()
+                # \ud83d\udcc4 \u041e\u0431\u0440\u0430\u0431\u043e\u0442\u043a\u0430 Excel-\u0444\u0430\u0439\u043b\u0430 (.xlsx)
+                if file_name.endswith(".xlsx"):
+                    try:
+                        supplier_df = pd.read_excel(uploaded_file)
+                    except Exception as e:
+                        st.error(f"\u041e\u0448\u0438\u0431\u043a\u0430 \u0447\u0442\u0435\u043d\u0438\u044f Excel: {e}")
+                    else:
+                        # \u041f\u0440\u0435\u0434\u043f\u043e\u043b\u0430\u0433\u0430\u0435\u043c, \u0447\u0442\u043e \u0432 \u0442\u0430\u0431\u043b\u0438\u0446\u0435 \u0435\u0441\u0442\u044c \u043a\u043e\u043b\u043e\u043d\u043a\u0430 "name" \u0434\u043b\u044f \u043d\u0430\u0437\u0432\u0430\u043d\u0438\u044f \u0442\u043e\u0432\u0430\u0440\u0430
+                        for _, row in supplier_df.iterrows():
+                            product_name = str(row.get("name") or "").strip()
+                            if product_name:
+                                # \u0421\u043e\u0445\u0440\u0430\u043d\u044f\u0435\u043c \u0432\u0441\u0435 \u043e\u0441\u0442\u0430\u043b\u044c\u043d\u044b\u0435 \u0441\u0442\u043e\u043b\u0431\u0446\u044b \u044d\u0442\u043e\u0439 \u0441\u0442\u0440\u043e\u043a\u0438 \u043a\u0430\u043a \u0445\u0430\u0440\u0430\u043a\u0442\u0435\u0440\u0438\u0441\u0442\u0438\u043a\u0438
+                                supplier_data[product_name] = {
+                                    col: row[col]
+                                    for col in supplier_df.columns
+                                    if col.lower() != "name"
+                                }
+                # \ud83d\udcc4 \u041e\u0431\u0440\u0430\u0431\u043e\u0442\u043a\u0430 PDF-\u0444\u0430\u0439\u043b\u0430
+                elif file_name.endswith(".pdf"):
+                    try:
+                        import PyPDF2
+
+                        reader = PyPDF2.PdfReader(uploaded_file)
+                        full_text = ""
+                        for page in reader.pages:
+                            text = page.extract_text()
+                            if text:
+                                full_text += text + "\n"
+                    except Exception as e:
+                        st.error(f"\u041e\u0448\u0438\u0431\u043a\u0430 \u0447\u0442\u0435\u043d\u0438\u044f PDF: {e}")
+                    else:
+                        # \u041f\u0430\u0440\u0441\u0438\u043c \u0442\u0435\u043a\u0441\u0442 PDF: \u0438\u0449\u0435\u043c \u0441\u0435\u0433\u043c\u0435\u043d\u0442\u044b \u0434\u043b\u044f \u043a\u0430\u0436\u0434\u043e\u0433\u043e \u0442\u043e\u0432\u0430\u0440\u0430
+                        for product_name in list(df_view["name"]):
+                            if isinstance(product_name, str) and product_name in full_text:
+                                # \u0418\u0437\u0432\u043b\u0435\u043a\u0430\u0435\u043c \u0442\u0435\u043a\u0441\u0442\u043e\u0432\u044b\u0439 \u0444\u0440\u0430\u0433\u043c\u0435\u043d\u0442, \u043e\u0442\u043d\u043e\u0441\u044f\u0449\u0438\u0439\u0441\u044f \u043a \u0434\u0430\u043d\u043d\u043e\u043c\u0443 \u0442\u043e\u0432\u0430\u0440\u0443
+                                segment = full_text.split(product_name, 1)
+                                if len(segment) > 1:
+                                    segment_text = segment[1].split("\n\n")[0]  # \u0431\u0435\u0440\u0435\u043c \u0442\u0435\u043a\u0441\u0442 \u0434\u043e \u0441\u043b\u0435\u0434\u0443\u044e\u0449\u0435\u0433\u043e \u043f\u0443\u0441\u0442\u043e\u0433\u043e \u0430\u0431\u0437\u0430\u0446\u0430
+                                    # \u0418\u0437\u0432\u043b\u0435\u043a\u0430\u0435\u043c \u043f\u0430\u0440\u044b "\u0430\u0442\u0440\u0438\u0431\u0443\u0442: \u0437\u043d\u0430\u0447\u0435\u043d\u0438\u0435" \u0438\u0437 \u0441\u0435\u0433\u043c\u0435\u043d\u0442\u0430
+                                    attributes = {}
+                                    for line in segment_text.splitlines():
+                                        if ":" in line:
+                                            key, val = line.split(":", 1)
+                                            attributes[key.strip()] = val.strip()
+                                    if attributes:
+                                        supplier_data[product_name] = attributes
+                # \ud83d\udcc4 \u041e\u0431\u0440\u0430\u0431\u043e\u0442\u043a\u0430 \u0444\u0430\u0439\u043b\u043e\u0432 Word (.docx \u0438 .doc)
+                elif file_name.endswith(".docx") or file_name.endswith(".doc"):
+                    try:
+                        import docx2txt
+
+                        text = docx2txt.process(uploaded_file)
+                    except Exception as e:
+                        st.error(f"\u041e\u0448\u0438\u0431\u043a\u0430 \u0447\u0442\u0435\u043d\u0438\u044f \u0434\u043e\u043a\u0443\u043c\u0435\u043d\u0442\u0430 Word: {e}")
+                    else:
+                        # \u041f\u0430\u0440\u0441\u0438\u043c \u0442\u0435\u043a\u0441\u0442 \u0434\u043e\u043a\u0443\u043c\u0435\u043d\u0442\u0430 \u0430\u043d\u0430\u043b\u043e\u0433\u0438\u0447\u043d\u043e PDF
+                        full_text = str(text)
+                        for product_name in list(df_view["name"]):
+                            if isinstance(product_name, str) and product_name in full_text:
+                                segment = full_text.split(product_name, 1)
+                                if len(segment) > 1:
+                                    segment_text = segment[1].split("\n\n")[0]
+                                    attributes = {}
+                                    for line in segment_text.splitlines():
+                                        if ":" in line:
+                                            key, val = line.split(":", 1)
+                                            attributes[key.strip()] = val.strip()
+                                    if attributes:
+                                        supplier_data[product_name] = attributes
+            # \u0421\u043e\u0445\u0440\u0430\u043d\u044f\u0435\u043c \u0438\u0437\u0432\u043b\u0435\u0447\u0435\u043d\u043d\u044b\u0435 \u0434\u0430\u043d\u043d\u044b\u0435 \u0432 \u0441\u0435\u0441\u0441\u0438\u044e
+            st.session_state["supplier_file_data"] = supplier_data
 
             go_attrs = st.button(
                 "🔎 Show attributes",
