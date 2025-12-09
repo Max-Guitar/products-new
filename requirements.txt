@@ -5,3 +5,4 @@ urllib3
 openai>=1.0.0
 PyPDF2
 docx2txt
+openpyxl>=3.0.0

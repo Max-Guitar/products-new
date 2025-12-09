@@ -6390,7 +6390,7 @@ if df_original_key in st.session_state:
                 # \ud83d\udcc4 \u041e\u0431\u0440\u0430\u0431\u043e\u0442\u043a\u0430 Excel-\u0444\u0430\u0439\u043b\u0430 (.xlsx)
                 if file_name.endswith(".xlsx"):
                     try:
-                        supplier_df = pd.read_excel(uploaded_file)
+                        supplier_df = pd.read_excel(uploaded_file, engine="openpyxl")
                     except Exception as e:
                         st.error(f"\u041e\u0448\u0438\u0431\u043a\u0430 \u0447\u0442\u0435\u043d\u0438\u044f Excel: {e}")
                     else:
